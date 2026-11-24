@@ -1,10 +1,20 @@
-use crate::ir::{PassBindingRef, PassRef, PipelineIr, PipelineMode, SchedulePlan};
+use crate::ir::{
+    PassBindingRef, PassDispatch, PassKind, PassNode, PassRef, PipelineIr, PipelineMode,
+    SchedulePlan,
+};
 use indexmap::map::Entry;
 use indexmap::{IndexMap, IndexSet};
 use smol_str::SmolStr;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use vsl_mc::{CANONICAL_PASSES, CanonicalPass};
+use vsl_mc::{
+    BuiltinResourceId, CANONICAL_PASSES, CanonicalPass, CompiledShaderUnit,
+    DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS, DescriptorAccess, DescriptorBinding,
+    DescriptorKind, TextureDim,
+};
+
+/// Highest Set 0 binding index reserved for per-pass targets (`bindings 1..=14`).
+const MAX_PASS_TARGET_BINDING: u32 = 14;
 
 /// Returns `true` when a pass binding key represents a write output target.
 pub(crate) fn is_write_binding_key(key: &str) -> bool {
@@ -34,10 +44,13 @@ fn is_reachable(adj: &[Vec<usize>], start: usize, target: usize) -> bool {
 /// Validates pass declarations and computes a deterministic topological execution schedule.
 ///
 /// Validation invariants:
-/// - Every pass has a non-empty `entry_fn`.
+/// - Every non-`Transfer` pass has a non-empty `entry_fn` (`PassKind::Transfer` passes may leave
+///   `entry_fn` empty for built-in transfer/blit/mip operations).
 /// - No duplicate pass names (including collisions with active canonical passes in `Extend` mode).
 /// - No two custom passes `.replaces(...)` the same [`CanonicalPass`].
-/// - Every `dispatch_target` exists in `ir.targets`.
+/// - Every `dispatch_target` / `PassDispatch::ForTarget` target exists in `ir.targets`,
+///   `PassDispatch::Explicit([x, y, z])` has all dimensions `> 0`, and `PassDispatch::Indirect`
+///   has a non-empty buffer/target name.
 /// - Every `CustomTarget` referenced in `bindings` exists in `ir.targets`, and `history: true`
 ///   bindings reference a target declared with `temporal == true`.
 /// - Every `PassRef` in `after` / `before` resolves to an active canonical or declared custom pass.
@@ -50,13 +63,13 @@ fn is_reachable(adj: &[Vec<usize>], start: usize, target: usize) -> bool {
 pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String>> {
     let mut errors = Vec::new();
 
-    // (a) Non-empty entry_fn, duplicate custom pass names, duplicate `.replaces(...)`,
-    //     dispatch targets, and custom target binding checks.
+    // (a) Non-empty entry_fn (except Transfer passes), duplicate custom pass names, duplicate
+    //     `.replaces(...)`, dispatch configuration, and custom target binding checks.
     let mut seen_custom_names: IndexSet<&str> = IndexSet::new();
     let mut replaced_by: IndexMap<CanonicalPass, usize> = IndexMap::new();
 
     for (idx, pass) in ir.passes.iter().enumerate() {
-        if pass.entry_fn.trim().is_empty() {
+        if pass.kind != PassKind::Transfer && pass.entry_fn.trim().is_empty() {
             errors.push(format!("pass `{}` has an empty `entry_fn`", pass.name));
         }
 
@@ -81,7 +94,39 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
             }
         }
 
+        let mut checked_for_target: Option<&str> = None;
+        if let Some(ref dispatch) = pass.dispatch {
+            match dispatch {
+                PassDispatch::ForTarget(target) => {
+                    checked_for_target = Some(target.as_str());
+                    if !ir.targets.contains_key(target) {
+                        errors.push(format!(
+                            "pass `{}` references undeclared dispatch target `{target}`",
+                            pass.name
+                        ));
+                    }
+                }
+                PassDispatch::Explicit([x, y, z]) => {
+                    if *x == 0 || *y == 0 || *z == 0 {
+                        errors.push(format!(
+                            "pass `{}` has invalid explicit dispatch dimensions [{x}, {y}, {z}]: all dimensions must be > 0",
+                            pass.name
+                        ));
+                    }
+                }
+                PassDispatch::Indirect(buf) => {
+                    if buf.trim().is_empty() {
+                        errors.push(format!(
+                            "pass `{}` has an empty indirect dispatch buffer/target name",
+                            pass.name
+                        ));
+                    }
+                }
+            }
+        }
+
         if let Some(ref target) = pass.dispatch_target
+            && checked_for_target != Some(target.as_str())
             && !ir.targets.contains_key(target)
         {
             errors.push(format!(
@@ -336,4 +381,194 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
         ordered_passes,
         replaced_canonical,
     })
+}
+
+fn is_pass_local_descriptor(desc: &DescriptorBinding, unit: &CompiledShaderUnit) -> bool {
+    let is_debug_channel = unit
+        .debug_channels
+        .iter()
+        .any(|dc| dc.set == desc.set && dc.binding == desc.binding);
+    if is_debug_channel {
+        return false;
+    }
+    (desc.set == DESCRIPTOR_SET_PER_PASS && (1..=MAX_PASS_TARGET_BINDING).contains(&desc.binding))
+        || desc.set == DESCRIPTOR_SET_PACK_RESOURCES
+}
+
+fn builtin_resource_compatible_kind(resource: BuiltinResourceId, kind: DescriptorKind) -> bool {
+    match resource {
+        BuiltinResourceId::ResTlas => kind == DescriptorKind::AccelerationStructure,
+        BuiltinResourceId::ResSharcHashTable
+        | BuiltinResourceId::ResEmissiveLights
+        | BuiltinResourceId::ResRestirReservoirs => kind == DescriptorKind::StorageBuffer,
+        _ => matches!(
+            kind,
+            DescriptorKind::SampledImage
+                | DescriptorKind::StorageImage
+                | DescriptorKind::CombinedImageSampler
+        ),
+    }
+}
+
+/// Cross-validates a [`PassNode`]'s declared `bindings` against the pass-local descriptors
+/// reflected in a compiled shader unit (`Set 0` bindings `1..=14` and `Set 3` pack resources).
+///
+/// Returns a list of human-readable diagnostic messages; an empty vector indicates full ABI
+/// compatibility.
+pub fn validate_pass_bindings_against_shader(
+    pass: &PassNode,
+    unit: &CompiledShaderUnit,
+    pipeline: &PipelineIr,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let mut pass_local_descs: IndexMap<&str, &DescriptorBinding> = IndexMap::new();
+    for desc in &unit.descriptors {
+        if is_pass_local_descriptor(desc, unit) {
+            pass_local_descs.insert(desc.name.as_str(), desc);
+        }
+    }
+
+    // Every shader-declared Set 0 pass target (`binding >= 1`) must be satisfied by `pass.bindings`.
+    for desc in pass_local_descs.values() {
+        if desc.set == DESCRIPTOR_SET_PER_PASS
+            && desc.binding >= 1
+            && !pass.bindings.contains_key(desc.name.as_str())
+        {
+            errors.push(format!(
+                "pass `{}` is missing binding `{}` required by shader `{}` (set {}, binding {})",
+                pass.name, desc.name, unit.entry_point, desc.set, desc.binding
+            ));
+        }
+    }
+
+    // Validate every binding declared on the pass against the reflected descriptor table.
+    for (bind_key, binding_ref) in &pass.bindings {
+        let Some(&desc) = pass_local_descs.get(bind_key.as_str()) else {
+            if let Some(other) = unit.descriptors.iter().find(|d| d.name == *bind_key) {
+                errors.push(format!(
+                    "pass `{}` binding `{bind_key}` targets engine-managed descriptor (set {}, binding {}) in shader `{}`",
+                    pass.name, other.set, other.binding, unit.entry_point
+                ));
+            } else {
+                errors.push(format!(
+                    "pass `{}` declares unknown binding `{bind_key}` not present in shader `{}`",
+                    pass.name, unit.entry_point
+                ));
+            }
+            continue;
+        };
+
+        match binding_ref {
+            PassBindingRef::ResourceTexture { slot } => {
+                if desc.set != DESCRIPTOR_SET_PACK_RESOURCES {
+                    errors.push(format!(
+                        "pass `{}` resource texture binding `{bind_key}` (slot {slot}) must target Set {DESCRIPTOR_SET_PACK_RESOURCES}, but shader `{}` declares set {}",
+                        pass.name, unit.entry_point, desc.set
+                    ));
+                }
+                if !matches!(
+                    desc.kind,
+                    DescriptorKind::SampledImage | DescriptorKind::CombinedImageSampler
+                ) {
+                    errors.push(format!(
+                        "pass `{}` resource texture binding `{bind_key}` (slot {slot}) requires a sampled image descriptor, but shader `{}` declares `{:?}`",
+                        pass.name, unit.entry_point, desc.kind
+                    ));
+                }
+                if *slot != desc.binding {
+                    errors.push(format!(
+                        "pass `{}` resource texture binding `{bind_key}` uses slot {slot}, but shader `{}` declares Set {} binding {}",
+                        pass.name, unit.entry_point, desc.set, desc.binding
+                    ));
+                }
+            }
+            PassBindingRef::BuiltinTarget { resource } => {
+                if desc.set != DESCRIPTOR_SET_PER_PASS {
+                    errors.push(format!(
+                        "pass `{}` builtin target binding `{bind_key}` ({resource:?}) must target Set {DESCRIPTOR_SET_PER_PASS}, but shader `{}` declares set {}",
+                        pass.name, unit.entry_point, desc.set
+                    ));
+                }
+                if !builtin_resource_compatible_kind(*resource, desc.kind) {
+                    errors.push(format!(
+                        "pass `{}` builtin target binding `{bind_key}` ({resource:?}) is incompatible with descriptor kind `{:?}` in shader `{}`",
+                        pass.name, desc.kind, unit.entry_point
+                    ));
+                }
+            }
+            PassBindingRef::CustomTarget {
+                name, is_write, ..
+            } => {
+                if desc.set != DESCRIPTOR_SET_PER_PASS {
+                    errors.push(format!(
+                        "pass `{}` custom target binding `{bind_key}` (target `{name}`) must target Set {DESCRIPTOR_SET_PER_PASS}, but shader `{}` declares set {}",
+                        pass.name, unit.entry_point, desc.set
+                    ));
+                }
+                if !matches!(
+                    desc.kind,
+                    DescriptorKind::SampledImage
+                        | DescriptorKind::StorageImage
+                        | DescriptorKind::CombinedImageSampler
+                ) {
+                    errors.push(format!(
+                        "pass `{}` custom target binding `{bind_key}` (target `{name}`) requires an image descriptor, but shader `{}` declares `{:?}`",
+                        pass.name, unit.entry_point, desc.kind
+                    ));
+                }
+
+                if *is_write && desc.access == DescriptorAccess::ReadOnly {
+                    errors.push(format!(
+                        "pass `{}` write binding `{bind_key}` (target `{name}`) cannot bind to `ReadOnly` descriptor in shader `{}`",
+                        pass.name, unit.entry_point
+                    ));
+                }
+                if !*is_write && desc.access == DescriptorAccess::WriteOnly {
+                    errors.push(format!(
+                        "pass `{}` read binding `{bind_key}` (target `{name}`) cannot bind to `WriteOnly` descriptor in shader `{}`",
+                        pass.name, unit.entry_point
+                    ));
+                }
+
+                if let Some(target) = pipeline.targets.get(name) {
+                    if desc.kind == DescriptorKind::StorageImage
+                        && let Some(shader_fmt) = desc.image_format
+                        && target.format != shader_fmt
+                    {
+                        errors.push(format!(
+                            "pass `{}` binding `{bind_key}` target `{name}` has format `{}`, but shader `{}` storage image expects `{}`",
+                            pass.name,
+                            target.format.as_str(),
+                            unit.entry_point,
+                            shader_fmt.as_str()
+                        ));
+                    }
+
+                    if let Some(dim) = desc.dim {
+                        if target.layers > 1 {
+                            if !matches!(dim, TextureDim::Dim2DArray | TextureDim::Dim3D) {
+                                errors.push(format!(
+                                    "pass `{}` binding `{bind_key}` multi-layer target `{name}` ({} layers) requires `Dim2DArray` or `Dim3D`, but shader `{}` declares `{dim:?}`",
+                                    pass.name, target.layers, unit.entry_point
+                                ));
+                            }
+                        } else if dim != TextureDim::Dim2D {
+                            errors.push(format!(
+                                "pass `{}` binding `{bind_key}` single-layer target `{name}` requires `Dim2D`, but shader `{}` declares `{dim:?}`",
+                                pass.name, unit.entry_point
+                            ));
+                        }
+                    }
+                } else {
+                    errors.push(format!(
+                        "pass `{}` binding `{bind_key}` references undeclared target `{name}`",
+                        pass.name
+                    ));
+                }
+            }
+        }
+    }
+
+    errors
 }

@@ -1,6 +1,7 @@
 use crate::ir::{
-    HookRegistration, PackMetadata, PassBindingRef, PassKind, PassMeta, PassNode, PassRef,
-    PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SettingIr, SettingValueIr, TargetDecl,
+    HookRegistration, PackMetadata, PassBindingRef, PassDispatch, PassKind, PassMeta, PassNode,
+    PassRef, PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SettingIr, SettingValueIr,
+    TargetDecl,
 };
 use crate::schedule::is_write_binding_key;
 use indexmap::IndexMap;
@@ -214,6 +215,7 @@ struct LegacyPass {
     name: String,
     #[serde(default = "default_compute")]
     kind: PassKind,
+    #[serde(default)]
     shader: String,
     #[serde(default)]
     replaces: Option<String>,
@@ -235,6 +237,10 @@ struct LegacyPass {
     bindings: IndexMap<String, String>,
     #[serde(default, alias = "dispatch_target")]
     dispatch: Option<String>,
+    #[serde(default)]
+    dispatch_xyz: Option<[u32; 3]>,
+    #[serde(default)]
+    dispatch_indirect: Option<String>,
 }
 
 const fn default_compute() -> PassKind {
@@ -611,6 +617,14 @@ pub fn desugar_pack_toml(source: &str) -> Result<PipelineIr, TomlDesugarError> {
             let binding_ref = parse_binding_ref(&bind_key, &bind_val, &ir.resource_textures)?;
             bindings.insert(SmolStr::new(bind_key), binding_ref);
         }
+        let dispatch_target = pass.dispatch.as_ref().map(SmolStr::new);
+        let dispatch = if let Some(xyz) = pass.dispatch_xyz {
+            Some(PassDispatch::Explicit(xyz))
+        } else if let Some(indirect) = pass.dispatch_indirect {
+            Some(PassDispatch::Indirect(SmolStr::new(indirect)))
+        } else {
+            pass.dispatch.map(|t| PassDispatch::ForTarget(t.into()))
+        };
         ir.passes.push(PassNode {
             name: SmolStr::new(pass.name),
             kind: pass.kind,
@@ -629,7 +643,8 @@ pub fn desugar_pack_toml(source: &str) -> Result<PipelineIr, TomlDesugarError> {
                     Some((pass.min_tier.unwrap_or(0), pass.max_tier.unwrap_or(3)))
                 },
             },
-            dispatch_target: pass.dispatch.map(SmolStr::new),
+            dispatch_target,
+            dispatch,
         });
     }
 

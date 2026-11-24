@@ -97,6 +97,15 @@ pub enum PassKind {
     Transfer,
 }
 
+/// Dispatch sizing mode for a compute or transfer render-graph pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PassDispatch {
+    ForTarget(SmolStr),
+    Explicit([u32; 3]),
+    Indirect(SmolStr),
+}
+
 /// Reference to either a canonical Hyaloclast render-graph pass or a pack-defined custom pass.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -154,6 +163,8 @@ pub struct PassNode {
     #[serde(default)]
     pub meta: PassMeta,
     pub dispatch_target: Option<SmolStr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<PassDispatch>,
 }
 
 /// Deterministic topological pass execution schedule produced from a [`PipelineIr`].

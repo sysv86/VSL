@@ -7,11 +7,11 @@ pub mod toml_desugar;
 
 pub use eval::{EvalConfig, MAX_EVAL_STEPS, MAX_LOOP_ITERS, evaluate_pack_vsl};
 pub use ir::{
-    HookRegistration, PackMetadata, PassBindingRef, PassKind, PassMeta, PassNode, PassRef,
-    PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SchedulePlan, SettingIr,
+    HookRegistration, PackMetadata, PassBindingRef, PassDispatch, PassKind, PassMeta, PassNode,
+    PassRef, PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SchedulePlan, SettingIr,
     SettingValueIr, TargetDecl,
 };
-pub use schedule::validate_and_schedule;
+pub use schedule::{validate_and_schedule, validate_pass_bindings_against_shader};
 pub use toml_desugar::{TomlDesugarError, desugar_pack_toml};
 
 #[cfg(test)]
@@ -356,6 +356,7 @@ mod tests {
             bindings: IndexMap::new(),
             meta: PassMeta::default(),
             dispatch_target: None,
+            dispatch: None,
         });
         ir.passes.push(PassNode {
             name: SmolStr::new_static("consumer_pass"),
@@ -367,6 +368,7 @@ mod tests {
             bindings: consumer_bindings,
             meta: PassMeta::default(),
             dispatch_target: None,
+            dispatch: None,
         });
         ir.passes.push(PassNode {
             name: SmolStr::new_static("producer_pass"),
@@ -378,6 +380,7 @@ mod tests {
             bindings: producer_bindings,
             meta: PassMeta::default(),
             dispatch_target: Some(SmolStr::new_static("buf_a")),
+            dispatch: None,
         });
 
         let plan = validate_and_schedule(&ir).expect("valid custom schedule");
@@ -407,6 +410,7 @@ mod tests {
             bindings: IndexMap::new(),
             meta: PassMeta::default(),
             dispatch_target: None,
+            dispatch: None,
         });
 
         let plan = validate_and_schedule(&ir).expect("valid anchored replace schedule");
@@ -465,6 +469,7 @@ mod tests {
             bindings,
             meta: PassMeta::default(),
             dispatch_target: None,
+            dispatch: None,
         });
 
         let errs = validate_and_schedule(&ir).expect_err("expected validation errors");
@@ -487,6 +492,7 @@ mod tests {
             bindings: IndexMap::new(),
             meta: PassMeta::default(),
             dispatch_target: None,
+            dispatch: None,
         });
 
         let err = validate_and_schedule(&ir).expect_err("expected cycle error");
@@ -512,6 +518,7 @@ mod tests {
             bindings: IndexMap::new(),
             meta: PassMeta::default(),
             dispatch_target: Some(SmolStr::new_static("missing_target")),
+            dispatch: None,
         });
         ir.passes.push(PassNode {
             name: SmolStr::new_static("dup_pass"),
@@ -523,6 +530,7 @@ mod tests {
             bindings: IndexMap::new(),
             meta: PassMeta::default(),
             dispatch_target: None,
+            dispatch: None,
         });
 
         let errs = validate_and_schedule(&ir).expect_err("expected validation errors");
@@ -1109,5 +1117,608 @@ gamma = 2.25
         let ir = desugar_pack_toml(src).expect("v1 manifest must deserialize");
         assert_eq!(ir.settings["gated"].range, Some((1.0, 3.0)));
         assert_eq!(ir.passes[0].meta.tiers, Some((1, 3)));
+    }
+
+    #[test]
+    fn evaluates_and_schedules_transfer_and_mip_passes_with_dispatch_modes() {
+        let src = r#"
+            pack "transfer-dispatch" { name: "Transfer & Dispatch", version: "1.0.0" }
+            pipeline custom(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+                let src_tex = g.target::<rgba16f>("src_tex", mip_levels = 4);
+                let dst_tex = g.target::<rgba16f>("dst_tex");
+                let indirect_buf = g.target::<r32ui>("indirect_buf");
+
+                let p_explicit = g.compute_pass("fill_src", pack::fill::run)
+                    .bind(out_src = src_tex.write())
+                    .dispatch(16, 16, 1);
+
+                let p_mip = g.mip_pass("gen_mips")
+                    .after(p_explicit)
+                    .bind(in_src = src_tex);
+
+                let p_transfer = g.transfer_pass("copy_to_dst")
+                    .after(p_mip)
+                    .bind(in_src = src_tex, out_dst = dst_tex.write())
+                    .dispatch_for(dst_tex);
+
+                let _p_custom_transfer = g.transfer_pass("custom_blit", pack::blit::run)
+                    .after(p_transfer)
+                    .bind(in_dst = dst_tex)
+                    .dispatch_indirect(indirect_buf);
+
+                let _p_indirect_str = g.compute_pass("indirect_str", pack::ind::run)
+                    .after(p_transfer)
+                    .dispatch_indirect("args_ssbo");
+            }
+        "#;
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (ir, diags) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
+        assert!(!diags.has_errors(), "{:?}", diags.as_slice());
+        assert_eq!(ir.passes.len(), 5);
+
+        assert_eq!(ir.passes[0].kind, PassKind::Compute);
+        assert_eq!(ir.passes[0].dispatch_target, None);
+        assert_eq!(ir.passes[0].dispatch, Some(PassDispatch::Explicit([16, 16, 1])));
+
+        assert_eq!(ir.passes[1].kind, PassKind::Transfer);
+        assert!(ir.passes[1].entry_fn.is_empty());
+
+        assert_eq!(ir.passes[2].kind, PassKind::Transfer);
+        assert!(ir.passes[2].entry_fn.is_empty());
+        assert_eq!(ir.passes[2].dispatch_target.as_deref(), Some("dst_tex"));
+        assert_eq!(
+            ir.passes[2].dispatch,
+            Some(PassDispatch::ForTarget(SmolStr::new_static("dst_tex")))
+        );
+
+        assert_eq!(ir.passes[3].kind, PassKind::Transfer);
+        assert_eq!(ir.passes[3].entry_fn, "pack::blit::run");
+        assert_eq!(
+            ir.passes[3].dispatch,
+            Some(PassDispatch::Indirect(SmolStr::new_static("indirect_buf")))
+        );
+
+        assert_eq!(
+            ir.passes[4].dispatch,
+            Some(PassDispatch::Indirect(SmolStr::new_static("args_ssbo")))
+        );
+
+        let plan =
+            validate_and_schedule(&ir).expect("transfer passes with empty entry_fn should schedule");
+        let pos = |name: &str| {
+            plan.ordered_passes
+                .iter()
+                .position(|p| p == name)
+                .unwrap_or_else(|| panic!("pass `{name}` missing from schedule"))
+        };
+        assert!(pos("fill_src") < pos("gen_mips"));
+        assert!(pos("gen_mips") < pos("copy_to_dst"));
+        assert!(pos("copy_to_dst") < pos("custom_blit"));
+    }
+
+    #[test]
+    fn rejects_invalid_dispatch_arguments_in_eval_and_schedule() {
+        let src = r#"
+            pack "bad-dispatch" { name: "Bad Dispatch", version: "1.0.0" }
+            pipeline custom(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+                g.compute_pass("p1", pack::a::run).dispatch(0, 8, 1);
+                g.compute_pass("p2", pack::b::run).dispatch(8, 8);
+                g.compute_pass("p3", pack::c::run).dispatch_indirect("");
+            }
+        "#;
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (_, diags) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
+        let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
+        assert_eq!(
+            codes.iter().filter(|&&c| c == "E0428").count(),
+            2,
+            "expected 2 E0428 diagnostics, got: {codes:?}"
+        );
+        assert!(
+            codes.contains(&"E0415"),
+            "expected E0415 for empty indirect dispatch, got: {codes:?}"
+        );
+
+        let mut ir = PipelineIr {
+            mode: PipelineMode::Custom,
+            ..PipelineIr::default()
+        };
+        ir.passes.push(PassNode {
+            name: SmolStr::new_static("zero_xyz"),
+            kind: PassKind::Compute,
+            entry_fn: SmolStr::new_static("pack::a::run"),
+            replaces: None,
+            after: Vec::new(),
+            before: Vec::new(),
+            bindings: IndexMap::new(),
+            meta: PassMeta::default(),
+            dispatch_target: None,
+            dispatch: Some(PassDispatch::Explicit([4, 0, 1])),
+        });
+        ir.passes.push(PassNode {
+            name: SmolStr::new_static("empty_indirect"),
+            kind: PassKind::Compute,
+            entry_fn: SmolStr::new_static("pack::b::run"),
+            replaces: None,
+            after: Vec::new(),
+            before: Vec::new(),
+            bindings: IndexMap::new(),
+            meta: PassMeta::default(),
+            dispatch_target: None,
+            dispatch: Some(PassDispatch::Indirect(SmolStr::new_static("   "))),
+        });
+        ir.passes.push(PassNode {
+            name: SmolStr::new_static("missing_for_target"),
+            kind: PassKind::Compute,
+            entry_fn: SmolStr::new_static("pack::c::run"),
+            replaces: None,
+            after: Vec::new(),
+            before: Vec::new(),
+            bindings: IndexMap::new(),
+            meta: PassMeta::default(),
+            dispatch_target: None,
+            dispatch: Some(PassDispatch::ForTarget(SmolStr::new_static("no_target"))),
+        });
+
+        let errs = validate_and_schedule(&ir).expect_err("expected dispatch validation errors");
+        assert_eq!(errs.len(), 3, "expected 3 errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn desugars_pack_toml_dispatch_variants_and_transfer_pass() {
+        let toml_src = r#"
+[pack]
+id = "dispatch-toml"
+name = "Dispatch TOML"
+
+[pipeline]
+mode = "custom"
+
+[targets.vol]
+format = "rgba16f"
+
+[[passes]]
+name = "p_for_target"
+kind = "compute"
+shader = "pack::a::run"
+dispatch = "vol"
+
+[[passes]]
+name = "p_explicit"
+kind = "compute"
+shader = "pack::b::run"
+dispatch_xyz = [8, 4, 2]
+
+[[passes]]
+name = "p_indirect"
+kind = "compute"
+shader = "pack::c::run"
+dispatch_indirect = "indirect_args"
+
+[[passes]]
+name = "p_transfer"
+kind = "transfer"
+"#;
+        let ir = desugar_pack_toml(toml_src).expect("valid pack.toml with dispatch variants");
+        assert_eq!(ir.passes.len(), 4);
+        assert_eq!(ir.passes[0].dispatch_target.as_deref(), Some("vol"));
+        assert_eq!(
+            ir.passes[0].dispatch,
+            Some(PassDispatch::ForTarget(SmolStr::new_static("vol")))
+        );
+        assert_eq!(
+            ir.passes[1].dispatch,
+            Some(PassDispatch::Explicit([8, 4, 2]))
+        );
+        assert_eq!(
+            ir.passes[2].dispatch,
+            Some(PassDispatch::Indirect(SmolStr::new_static("indirect_args")))
+        );
+        assert_eq!(ir.passes[3].kind, PassKind::Transfer);
+        assert!(ir.passes[3].entry_fn.is_empty());
+
+        let plan = validate_and_schedule(&ir).expect("valid schedule");
+        assert_eq!(plan.ordered_passes.len(), 4);
+    }
+
+    fn make_test_shader_unit(
+        entry_point: &str,
+        descriptors: Vec<vsl_mc::DescriptorBinding>,
+    ) -> vsl_mc::CompiledShaderUnit {
+        vsl_mc::CompiledShaderUnit {
+            entry_point: SmolStr::new(entry_point),
+            stage: vsl_mc::ShaderStage::Compute,
+            spirv: Vec::new(),
+            descriptors,
+            push_constants: Vec::new(),
+            push_constant_size: 0,
+            workgroup_size: Some([8, 8, 1]),
+            required_caps: vsl_mc::HardwareCaps::empty(),
+            used_specs: Vec::new(),
+            used_params: Vec::new(),
+            debug_channels: Vec::new(),
+            cache_key: [0u8; 32],
+        }
+    }
+
+    fn make_desc(
+        name: &str,
+        set: u32,
+        binding: u32,
+        kind: vsl_mc::DescriptorKind,
+        dim: Option<vsl_mc::TextureDim>,
+        image_format: Option<ImageFormat>,
+        access: vsl_mc::DescriptorAccess,
+    ) -> vsl_mc::DescriptorBinding {
+        vsl_mc::DescriptorBinding {
+            name: SmolStr::new(name),
+            set,
+            binding,
+            kind,
+            dim,
+            sample_scalar: None,
+            image_format,
+            access,
+            is_unsized: false,
+            count: None,
+        }
+    }
+
+    #[test]
+    fn validates_matching_pass_bindings_against_compiled_shader_unit() {
+        use vsl_mc::{
+            DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS, DESCRIPTOR_SET_SCENE_GLOBALS,
+            DescriptorAccess, DescriptorKind, TextureDim,
+        };
+
+        let mut ir = PipelineIr {
+            mode: PipelineMode::Custom,
+            ..PipelineIr::default()
+        };
+        ir.targets.insert(
+            SmolStr::new_static("color_in"),
+            TargetDecl {
+                name: SmolStr::new_static("color_in"),
+                format: ImageFormat::Rgba16f,
+                scale: 1.0,
+                layers: 1,
+                mip_levels: 1,
+                temporal: false,
+                clear_color: None,
+            },
+        );
+        ir.targets.insert(
+            SmolStr::new_static("fog_arr"),
+            TargetDecl {
+                name: SmolStr::new_static("fog_arr"),
+                format: ImageFormat::Rgba16f,
+                scale: 0.5,
+                layers: 8,
+                mip_levels: 1,
+                temporal: false,
+                clear_color: None,
+            },
+        );
+
+        let mut bindings = IndexMap::new();
+        bindings.insert(
+            SmolStr::new_static("in_color"),
+            PassBindingRef::CustomTarget {
+                name: SmolStr::new_static("color_in"),
+                history: false,
+                is_write: false,
+            },
+        );
+        bindings.insert(
+            SmolStr::new_static("out_fog"),
+            PassBindingRef::CustomTarget {
+                name: SmolStr::new_static("fog_arr"),
+                history: false,
+                is_write: true,
+            },
+        );
+        bindings.insert(
+            SmolStr::new_static("depth"),
+            PassBindingRef::BuiltinTarget {
+                resource: BuiltinResourceId::ResMcMainDepth,
+            },
+        );
+        bindings.insert(
+            SmolStr::new_static("tlas"),
+            PassBindingRef::BuiltinTarget {
+                resource: BuiltinResourceId::ResTlas,
+            },
+        );
+        bindings.insert(
+            SmolStr::new_static("lights"),
+            PassBindingRef::BuiltinTarget {
+                resource: BuiltinResourceId::ResEmissiveLights,
+            },
+        );
+        bindings.insert(
+            SmolStr::new_static("blue_noise"),
+            PassBindingRef::ResourceTexture { slot: 2 },
+        );
+
+        let pass = PassNode {
+            name: SmolStr::new_static("fog_pass"),
+            kind: PassKind::Compute,
+            entry_fn: SmolStr::new_static("pack::fog::run"),
+            replaces: None,
+            after: Vec::new(),
+            before: Vec::new(),
+            bindings,
+            meta: PassMeta::default(),
+            dispatch_target: Some(SmolStr::new_static("fog_arr")),
+            dispatch: Some(PassDispatch::ForTarget(SmolStr::new_static("fog_arr"))),
+        };
+
+        let unit = make_test_shader_unit(
+            "pack::fog::run",
+            vec![
+                // Engine-managed Set 0 binding 0 and Set 1 scene global must be ignored.
+                make_desc(
+                    "world_ubo",
+                    DESCRIPTOR_SET_PER_PASS,
+                    0,
+                    DescriptorKind::UniformBuffer,
+                    None,
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "scene_tlas",
+                    DESCRIPTOR_SET_SCENE_GLOBALS,
+                    0,
+                    DescriptorKind::AccelerationStructure,
+                    None,
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "in_color",
+                    DESCRIPTOR_SET_PER_PASS,
+                    1,
+                    DescriptorKind::SampledImage,
+                    Some(TextureDim::Dim2D),
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "out_fog",
+                    DESCRIPTOR_SET_PER_PASS,
+                    2,
+                    DescriptorKind::StorageImage,
+                    Some(TextureDim::Dim2DArray),
+                    Some(ImageFormat::Rgba16f),
+                    DescriptorAccess::WriteOnly,
+                ),
+                make_desc(
+                    "depth",
+                    DESCRIPTOR_SET_PER_PASS,
+                    3,
+                    DescriptorKind::SampledImage,
+                    Some(TextureDim::Dim2D),
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "tlas",
+                    DESCRIPTOR_SET_PER_PASS,
+                    4,
+                    DescriptorKind::AccelerationStructure,
+                    None,
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "lights",
+                    DESCRIPTOR_SET_PER_PASS,
+                    5,
+                    DescriptorKind::StorageBuffer,
+                    None,
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "blue_noise",
+                    DESCRIPTOR_SET_PACK_RESOURCES,
+                    2,
+                    DescriptorKind::CombinedImageSampler,
+                    Some(TextureDim::Dim2D),
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+            ],
+        );
+
+        let errs = validate_pass_bindings_against_shader(&pass, &unit, &ir);
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn reports_format_access_dim_kind_missing_and_unknown_shader_binding_errors() {
+        use vsl_mc::{
+            DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS, DescriptorAccess,
+            DescriptorKind, TextureDim,
+        };
+
+        let mut ir = PipelineIr {
+            mode: PipelineMode::Custom,
+            ..PipelineIr::default()
+        };
+        ir.targets.insert(
+            SmolStr::new_static("t2d"),
+            TargetDecl {
+                name: SmolStr::new_static("t2d"),
+                format: ImageFormat::Rgba8,
+                scale: 1.0,
+                layers: 1,
+                mip_levels: 1,
+                temporal: false,
+                clear_color: None,
+            },
+        );
+        ir.targets.insert(
+            SmolStr::new_static("tarr"),
+            TargetDecl {
+                name: SmolStr::new_static("tarr"),
+                format: ImageFormat::Rgba16f,
+                scale: 1.0,
+                layers: 4,
+                mip_levels: 1,
+                temporal: false,
+                clear_color: None,
+            },
+        );
+
+        let mut bindings = IndexMap::new();
+        // Format mismatch (Rgba8 vs Rgba16f) + access mismatch (is_write: false vs WriteOnly)
+        // + dim mismatch (single-layer vs Dim2DArray).
+        bindings.insert(
+            SmolStr::new_static("bad_storage"),
+            PassBindingRef::CustomTarget {
+                name: SmolStr::new_static("t2d"),
+                history: false,
+                is_write: false,
+            },
+        );
+        // Access mismatch (is_write: true vs ReadOnly) + dim mismatch (4 layers vs Dim2D).
+        bindings.insert(
+            SmolStr::new_static("bad_read"),
+            PassBindingRef::CustomTarget {
+                name: SmolStr::new_static("tarr"),
+                history: false,
+                is_write: true,
+            },
+        );
+        // DescriptorKind mismatch (CustomTarget -> StorageBuffer).
+        bindings.insert(
+            SmolStr::new_static("bad_kind"),
+            PassBindingRef::CustomTarget {
+                name: SmolStr::new_static("t2d"),
+                history: false,
+                is_write: false,
+            },
+        );
+        // ResourceTexture wrong slot (slot 1 vs Set 3 binding 3).
+        bindings.insert(
+            SmolStr::new_static("bad_res"),
+            PassBindingRef::ResourceTexture { slot: 1 },
+        );
+        // Unknown binding not in shader descriptors.
+        bindings.insert(
+            SmolStr::new_static("extra_binding"),
+            PassBindingRef::BuiltinTarget {
+                resource: BuiltinResourceId::ResGbufferAlbedo,
+            },
+        );
+
+        let pass = PassNode {
+            name: SmolStr::new_static("broken_shader_pass"),
+            kind: PassKind::Compute,
+            entry_fn: SmolStr::new_static("pack::broken::run"),
+            replaces: None,
+            after: Vec::new(),
+            before: Vec::new(),
+            bindings,
+            meta: PassMeta::default(),
+            dispatch_target: None,
+            dispatch: None,
+        };
+
+        let unit = make_test_shader_unit(
+            "pack::broken::run",
+            vec![
+                make_desc(
+                    "bad_storage",
+                    DESCRIPTOR_SET_PER_PASS,
+                    1,
+                    DescriptorKind::StorageImage,
+                    Some(TextureDim::Dim2DArray),
+                    Some(ImageFormat::Rgba16f),
+                    DescriptorAccess::WriteOnly,
+                ),
+                make_desc(
+                    "bad_read",
+                    DESCRIPTOR_SET_PER_PASS,
+                    2,
+                    DescriptorKind::SampledImage,
+                    Some(TextureDim::Dim2D),
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "bad_kind",
+                    DESCRIPTOR_SET_PER_PASS,
+                    3,
+                    DescriptorKind::StorageBuffer,
+                    None,
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                // Missing binding in `pass.bindings`.
+                make_desc(
+                    "required_missing",
+                    DESCRIPTOR_SET_PER_PASS,
+                    4,
+                    DescriptorKind::SampledImage,
+                    Some(TextureDim::Dim2D),
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "bad_res",
+                    DESCRIPTOR_SET_PACK_RESOURCES,
+                    3,
+                    DescriptorKind::SampledImage,
+                    Some(TextureDim::Dim2D),
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+            ],
+        );
+
+        let errs = validate_pass_bindings_against_shader(&pass, &unit, &ir);
+        assert!(
+            errs.iter().any(|e| e.contains("required_missing")),
+            "expected missing binding error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("extra_binding")),
+            "expected unknown binding error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("rgba8") && e.contains("rgba16f")),
+            "expected ImageFormat mismatch error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("WriteOnly")),
+            "expected WriteOnly access error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("ReadOnly")),
+            "expected ReadOnly access error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("single-layer")),
+            "expected single-layer TextureDim error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("multi-layer")),
+            "expected multi-layer TextureDim error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("StorageBuffer")),
+            "expected DescriptorKind error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("slot 1") && e.contains("binding 3")),
+            "expected ResourceTexture slot mismatch error, got: {errs:?}"
+        );
     }
 }

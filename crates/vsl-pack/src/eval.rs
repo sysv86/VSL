@@ -1,6 +1,7 @@
 use crate::ir::{
-    HookRegistration, PackMetadata, PassBindingRef, PassKind, PassMeta, PassNode, PassRef,
-    PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SettingIr, SettingValueIr, TargetDecl,
+    HookRegistration, PackMetadata, PassBindingRef, PassDispatch, PassKind, PassMeta, PassNode,
+    PassRef, PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SettingIr, SettingValueIr,
+    TargetDecl,
 };
 use crate::schedule::is_write_binding_key;
 use indexmap::IndexMap;
@@ -1433,19 +1434,28 @@ impl Sandbox<'_> {
                 }
                 HandleValue::Unit
             }
-            "compute_pass" | "raster_pass" => {
-                let kind = if method == "compute_pass" {
-                    PassKind::Compute
-                } else {
-                    PassKind::Raster
+            "compute_pass" | "raster_pass" | "transfer_pass" | "mip_pass" => {
+                let kind = match method {
+                    "compute_pass" => PassKind::Compute,
+                    "raster_pass" => PassKind::Raster,
+                    _ => PassKind::Transfer,
                 };
                 let name = match args.first().map(|a| &a.value) {
                     Some(Expr::StringLit(s, _)) => s.clone(),
                     _ => SmolStr::new_static("unnamed_pass"),
                 };
                 let entry_fn = match args.get(1).map(|a| &a.value) {
-                    Some(Expr::Path { path, .. }) => SmolStr::new(path.joined()),
-                    _ => SmolStr::new_static(""),
+                    Some(Expr::Path { path, .. }) => {
+                        let is_local_handle = kind == PassKind::Transfer
+                            && path.segments.len() == 1
+                            && self.env.contains_key(&path.segments[0].name);
+                        if is_local_handle {
+                            SmolStr::default()
+                        } else {
+                            SmolStr::new(path.joined())
+                        }
+                    }
+                    _ => SmolStr::default(),
                 };
                 let idx = self.ir.passes.len();
                 self.ir.passes.push(PassNode {
@@ -1458,6 +1468,7 @@ impl Sandbox<'_> {
                     bindings: IndexMap::new(),
                     meta: PassMeta::default(),
                     dispatch_target: None,
+                    dispatch: None,
                 });
                 HandleValue::PassIndex(idx)
             }
@@ -1596,7 +1607,8 @@ impl Sandbox<'_> {
                         if let HandleValue::Target { name, .. }
                         | HandleValue::TargetWrite { name } = val
                         {
-                            self.ir.passes[idx].dispatch_target = Some(name);
+                            self.ir.passes[idx].dispatch_target = Some(name.clone());
+                            self.ir.passes[idx].dispatch = Some(PassDispatch::ForTarget(name));
                         } else {
                             self.diags.push(Diagnostic::error(
                                 "E0415",
@@ -1604,6 +1616,102 @@ impl Sandbox<'_> {
                                 arg.span,
                             ));
                         }
+                    }
+                    return ControlFlow::Normal(HandleValue::PassIndex(idx));
+                }
+                recv_val
+            }
+            "dispatch" => {
+                if let HandleValue::PassIndex(idx) = recv_val {
+                    if args.len() != 3 {
+                        self.diags.push(Diagnostic::error(
+                            "E0428",
+                            "`dispatch(x, y, z)` requires exactly 3 positive integer arguments",
+                            span,
+                        ));
+                        return ControlFlow::Normal(HandleValue::PassIndex(idx));
+                    }
+                    let mut dims = [0u32; 3];
+                    let mut valid = true;
+                    for (dim_idx, arg) in args.iter().enumerate() {
+                        let val = match self.eval_expr(&arg.value) {
+                            ControlFlow::Normal(v) => v,
+                            other => return other,
+                        };
+                        match val {
+                            HandleValue::Int(v) if v > 0 => {
+                                if let Ok(d) = u32::try_from(v) {
+                                    dims[dim_idx] = d;
+                                } else {
+                                    valid = false;
+                                    self.diags.push(Diagnostic::error(
+                                        "E0428",
+                                        format!(
+                                            "`dispatch(x, y, z)` argument {} exceeds `u32::MAX`",
+                                            dim_idx + 1
+                                        ),
+                                        arg.span,
+                                    ));
+                                }
+                            }
+                            _ => {
+                                valid = false;
+                                self.diags.push(Diagnostic::error(
+                                    "E0428",
+                                    format!(
+                                        "`dispatch(x, y, z)` argument {} must be a positive integer",
+                                        dim_idx + 1
+                                    ),
+                                    arg.span,
+                                ));
+                            }
+                        }
+                    }
+                    if valid {
+                        self.ir.passes[idx].dispatch_target = None;
+                        self.ir.passes[idx].dispatch = Some(PassDispatch::Explicit(dims));
+                    }
+                    return ControlFlow::Normal(HandleValue::PassIndex(idx));
+                }
+                recv_val
+            }
+            "dispatch_indirect" => {
+                if let HandleValue::PassIndex(idx) = recv_val {
+                    let Some(arg) = args.first() else {
+                        self.diags.push(Diagnostic::error(
+                            "E0428",
+                            "`dispatch_indirect(...)` requires a target or buffer handle or name",
+                            span,
+                        ));
+                        return ControlFlow::Normal(HandleValue::PassIndex(idx));
+                    };
+                    let resolved = if let Expr::StringLit(s, _) = &arg.value {
+                        if s.trim().is_empty() {
+                            None
+                        } else {
+                            Some(s.clone())
+                        }
+                    } else {
+                        let val = match self.eval_expr(&arg.value) {
+                            ControlFlow::Normal(v) => v,
+                            other => return other,
+                        };
+                        match val {
+                            HandleValue::Target { name, .. }
+                            | HandleValue::TargetWrite { name }
+                            | HandleValue::TargetHistory { name } => Some(name),
+                            _ => None,
+                        }
+                    };
+                    if let Some(name) = resolved {
+                        self.ir.passes[idx].dispatch_target = None;
+                        self.ir.passes[idx].dispatch = Some(PassDispatch::Indirect(name));
+                    } else {
+                        self.diags.push(Diagnostic::error(
+                            "E0415",
+                            "unresolved target or buffer handle passed to `dispatch_indirect(...)`",
+                            arg.span,
+                        ));
                     }
                     return ControlFlow::Normal(HandleValue::PassIndex(idx));
                 }
