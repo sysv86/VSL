@@ -755,8 +755,11 @@ fn lower_unit_internal(
             Item::Trait(decl) => {
                 let mut methods_map = IndexMap::new();
                 for method in &decl.methods {
-                    let method_generics: IndexSet<SmolStr> =
-                        method.generics.iter().map(|g| g.name.name.clone()).collect();
+                    let method_generics: IndexSet<SmolStr> = method
+                        .generics
+                        .iter()
+                        .map(|g| g.name.name.clone())
+                        .collect();
                     let mut sig_params = Vec::with_capacity(method.params.len());
                     for param in &method.params {
                         let ty = param.ty.as_ref().and_then(|ty_expr| {
@@ -801,7 +804,12 @@ fn lower_unit_internal(
                     let gp = func
                         .generics
                         .iter()
-                        .map(|g| (g.name.name.clone(), g.bound.as_ref().map(|b| SmolStr::new(b.joined()))))
+                        .map(|g| {
+                            (
+                                g.name.name.clone(),
+                                g.bound.as_ref().map(|b| SmolStr::new(b.joined())),
+                            )
+                        })
                         .collect();
                     generic_fn_templates.insert(
                         func.name.name.clone(),
@@ -860,7 +868,12 @@ fn lower_unit_internal(
                     let gp = imp
                         .generics
                         .iter()
-                        .map(|g| (g.name.name.clone(), g.bound.as_ref().map(|b| SmolStr::new(b.joined()))))
+                        .map(|g| {
+                            (
+                                g.name.name.clone(),
+                                g.bound.as_ref().map(|b| SmolStr::new(b.joined())),
+                            )
+                        })
                         .collect();
                     let mut methods_map = IndexMap::new();
                     for method in &imp.methods {
@@ -1237,17 +1250,19 @@ impl LowerCtx<'_> {
         )
     }
 
-    fn get_or_alloc_mc_symbol(&mut self, name: &str, ty: TypeId, is_mut: bool, span: Span) -> SymbolId {
+    fn get_or_alloc_mc_symbol(
+        &mut self,
+        name: &str,
+        ty: TypeId,
+        is_mut: bool,
+        span: Span,
+    ) -> SymbolId {
         if let Some(&id) = self.mc_descriptor_symbols.get(name) {
             return id;
         }
-        let id = self.module.alloc_symbol(
-            SmolStr::new(name),
-            SymbolKind::Descriptor,
-            ty,
-            is_mut,
-            span,
-        );
+        let id =
+            self.module
+                .alloc_symbol(SmolStr::new(name), SymbolKind::Descriptor, ty, is_mut, span);
         self.mc_descriptor_symbols.insert(SmolStr::new(name), id);
         id
     }
@@ -1526,8 +1541,11 @@ impl LowerCtx<'_> {
     }
 
     fn lower_trait_method(&mut self, method: &FnDecl) -> HirTraitMethod {
-        let method_generics: IndexSet<SmolStr> =
-            method.generics.iter().map(|g| g.name.name.clone()).collect();
+        let method_generics: IndexSet<SmolStr> = method
+            .generics
+            .iter()
+            .map(|g| g.name.name.clone())
+            .collect();
         let empty_subst = IndexMap::new();
         let mut params = Vec::with_capacity(method.params.len());
         for param in &method.params {
@@ -2998,7 +3016,9 @@ impl BodyScanner<'_, '_> {
                 let res_name = format_type_name(&self.ctx.module.types, res_ty);
                 self.ctx.diags.push(Diagnostic::error(
                     "E0270",
-                    format!("compound assignment result `{res_name}` is incompatible with `{lhs_name}`"),
+                    format!(
+                        "compound assignment result `{res_name}` is incompatible with `{lhs_name}`"
+                    ),
                     span,
                 ));
             }
@@ -3045,8 +3065,14 @@ impl BodyScanner<'_, '_> {
                         Some(lt)
                     }
                     (
-                        Type::Vector { scalar: sa, len: la },
-                        Type::Vector { scalar: sb, len: lb },
+                        Type::Vector {
+                            scalar: sa,
+                            len: la,
+                        },
+                        Type::Vector {
+                            scalar: sb,
+                            len: lb,
+                        },
                     ) if sa == sb && la == lb && is_numeric_scalar(*sa) => Some(lt),
                     (Type::Vector { scalar: sa, .. }, Type::Scalar(sb))
                         if sa == sb && is_numeric_scalar(*sa) =>
@@ -3134,9 +3160,7 @@ impl BodyScanner<'_, '_> {
                         Some(lt)
                     }
                     (Type::Scalar(sa), Type::Matrix { scalar: sb, .. })
-                        if matches!(op, BinaryOp::Mul)
-                            && sa == sb
-                            && is_numeric_scalar(*sa) =>
+                        if matches!(op, BinaryOp::Mul) && sa == sb && is_numeric_scalar(*sa) =>
                     {
                         Some(rt)
                     }
@@ -3155,8 +3179,14 @@ impl BodyScanner<'_, '_> {
             BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => match (&lhs_t, &rhs_t) {
                 (Type::Scalar(a), Type::Scalar(b)) if a == b && is_integer_scalar(*a) => Some(lt),
                 (
-                    Type::Vector { scalar: sa, len: la },
-                    Type::Vector { scalar: sb, len: lb },
+                    Type::Vector {
+                        scalar: sa,
+                        len: la,
+                    },
+                    Type::Vector {
+                        scalar: sb,
+                        len: lb,
+                    },
                 ) if sa == sb && la == lb && is_integer_scalar(*sa) => Some(lt),
                 (Type::Vector { scalar: sa, .. }, Type::Scalar(sb))
                     if sa == sb && is_integer_scalar(*sa) =>
@@ -3186,8 +3216,14 @@ impl BodyScanner<'_, '_> {
                     Some(lt)
                 }
                 (
-                    Type::Vector { scalar: sa, len: la },
-                    Type::Vector { scalar: sb, len: lb },
+                    Type::Vector {
+                        scalar: sa,
+                        len: la,
+                    },
+                    Type::Vector {
+                        scalar: sb,
+                        len: lb,
+                    },
                 ) if is_integer_scalar(*sa) && is_integer_scalar(*sb) && la == lb => Some(lt),
                 (Type::Vector { scalar: sa, .. }, Type::Scalar(sb))
                     if is_integer_scalar(*sa) && is_integer_scalar(*sb) =>
@@ -3236,8 +3272,14 @@ impl BodyScanner<'_, '_> {
                     Some(bool_ty)
                 }
                 (
-                    Type::Vector { scalar: sa, len: la },
-                    Type::Vector { scalar: sb, len: lb },
+                    Type::Vector {
+                        scalar: sa,
+                        len: la,
+                    },
+                    Type::Vector {
+                        scalar: sb,
+                        len: lb,
+                    },
                 ) if sa == sb && la == lb && is_numeric_scalar(*sa) => {
                     Some(self.ctx.module.types.alloc(Type::Vector {
                         scalar: ScalarKind::Bool,
@@ -3262,7 +3304,9 @@ impl BodyScanner<'_, '_> {
                     let rn = format_type_name(&self.ctx.module.types, rt);
                     self.ctx.diags.push(Diagnostic::error(
                         "E0270",
-                        format!("range bounds must have matching integer types, found `{ln}` and `{rn}`"),
+                        format!(
+                            "range bounds must have matching integer types, found `{ln}` and `{rn}`"
+                        ),
                         span,
                     ));
                     Some(lt)
@@ -3468,7 +3512,9 @@ impl BodyScanner<'_, '_> {
                         let act_name = format_type_name(&self.ctx.module.types, actual_ty);
                         self.ctx.diags.push(Diagnostic::error(
                             "E0275",
-                            format!("cannot return a value of type `{act_name}` from a void function"),
+                            format!(
+                                "cannot return a value of type `{act_name}` from a void function"
+                            ),
                             *span,
                         ));
                     }
@@ -3732,8 +3778,12 @@ impl BodyScanner<'_, '_> {
                         self.scan.set(FLAG_WORLD);
                         if let Some(&ty) = self.ctx.builtin_struct_types.get("WorldUBO") {
                             resolved_ty = Some(ty);
-                            resolved_sym =
-                                Some(self.ctx.get_or_alloc_mc_symbol("mc::world", ty, false, *span));
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::world",
+                                ty,
+                                false,
+                                *span,
+                            ));
                         }
                     }
                     "world"
@@ -3742,23 +3792,31 @@ impl BodyScanner<'_, '_> {
                         self.scan.set(FLAG_WORLD);
                         if let Some(&ty) = self.ctx.builtin_struct_types.get("WorldUBO") {
                             resolved_ty = Some(ty);
-                            resolved_sym =
-                                Some(self.ctx.get_or_alloc_mc_symbol("mc::world", ty, false, *span));
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::world",
+                                ty,
+                                false,
+                                *span,
+                            ));
                         }
                     }
                     "mc::tlas" => {
                         self.scan.set(FLAG_TLAS);
                         let ty = self.ctx.module.types.alloc(Type::AccelStruct);
                         resolved_ty = Some(ty);
-                        resolved_sym =
-                            Some(self.ctx.get_or_alloc_mc_symbol("mc::tlas", ty, false, *span));
+                        resolved_sym = Some(
+                            self.ctx
+                                .get_or_alloc_mc_symbol("mc::tlas", ty, false, *span),
+                        );
                     }
                     "tlas" if self.ctx.mc_imports.contains("tlas") && !self.is_shadowed("tlas") => {
                         self.scan.set(FLAG_TLAS);
                         let ty = self.ctx.module.types.alloc(Type::AccelStruct);
                         resolved_ty = Some(ty);
-                        resolved_sym =
-                            Some(self.ctx.get_or_alloc_mc_symbol("mc::tlas", ty, false, *span));
+                        resolved_sym = Some(
+                            self.ctx
+                                .get_or_alloc_mc_symbol("mc::tlas", ty, false, *span),
+                        );
                     }
                     "mc::instances" => {
                         self.scan.set(FLAG_INSTANCES);
@@ -3842,8 +3900,7 @@ impl BodyScanner<'_, '_> {
                     }
                     "mc::reservoirs" => {
                         self.scan.set(FLAG_RESERVOIRS);
-                        if let Some(&ty) =
-                            self.ctx.builtin_struct_types.get("RestirReservoirSSBO")
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("RestirReservoirSSBO")
                         {
                             resolved_ty = Some(ty);
                             resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
@@ -3859,8 +3916,7 @@ impl BodyScanner<'_, '_> {
                             && !self.is_shadowed("reservoirs") =>
                     {
                         self.scan.set(FLAG_RESERVOIRS);
-                        if let Some(&ty) =
-                            self.ctx.builtin_struct_types.get("RestirReservoirSSBO")
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("RestirReservoirSSBO")
                         {
                             resolved_ty = Some(ty);
                             resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
@@ -3878,12 +3934,11 @@ impl BodyScanner<'_, '_> {
                             unsized_array: true,
                         });
                         resolved_ty = Some(ty);
-                        resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
-                            "mc::bindless",
-                            ty,
-                            false,
-                            *span,
-                        ));
+                        resolved_sym =
+                            Some(
+                                self.ctx
+                                    .get_or_alloc_mc_symbol("mc::bindless", ty, false, *span),
+                            );
                     }
                     "bindless"
                         if self.ctx.mc_imports.contains("bindless")
@@ -3895,12 +3950,11 @@ impl BodyScanner<'_, '_> {
                             unsized_array: true,
                         });
                         resolved_ty = Some(ty);
-                        resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
-                            "mc::bindless",
-                            ty,
-                            false,
-                            *span,
-                        ));
+                        resolved_sym =
+                            Some(
+                                self.ctx
+                                    .get_or_alloc_mc_symbol("mc::bindless", ty, false, *span),
+                            );
                     }
                     _ => {}
                 }
@@ -4296,11 +4350,7 @@ impl BodyScanner<'_, '_> {
                                     );
                                 } else {
                                     self.check_call_against_sig(
-                                        &label,
-                                        &fn_params,
-                                        &hir_args,
-                                        &arg_types,
-                                        *span,
+                                        &label, &fn_params, &hir_args, &arg_types, *span,
                                     );
                                 }
                                 ret_ty = fn_ret;
@@ -4353,15 +4403,12 @@ impl BodyScanner<'_, '_> {
                                 && let Some(sig) = methods.get(method.name.as_str()).cloned()
                             {
                                 let label = format!("{bound_trait}::{}", method.name);
-                                let check_params = if sig
-                                    .params
-                                    .first()
-                                    .is_some_and(|(n, _, _)| n == "self")
-                                {
-                                    &sig.params[1..]
-                                } else {
-                                    &sig.params[..]
-                                };
+                                let check_params =
+                                    if sig.params.first().is_some_and(|(n, _, _)| n == "self") {
+                                        &sig.params[1..]
+                                    } else {
+                                        &sig.params[..]
+                                    };
                                 self.check_call_against_sig(
                                     &label,
                                     check_params,
@@ -4620,7 +4667,9 @@ impl BodyScanner<'_, '_> {
                                     let tname = format_type_name(&self.ctx.module.types, it);
                                     self.ctx.diags.push(Diagnostic::error(
                                         "E0270",
-                                        format!("logical `!` requires `bool` operand, found `{tname}`"),
+                                        format!(
+                                            "logical `!` requires `bool` operand, found `{tname}`"
+                                        ),
                                         *span,
                                     ));
                                 }
@@ -4661,7 +4710,9 @@ impl BodyScanner<'_, '_> {
                                 let tname = format_type_name(&self.ctx.module.types, it);
                                 self.ctx.diags.push(Diagnostic::error(
                                     "E0270",
-                                    format!("bitwise `~` requires integer operand, found `{tname}`"),
+                                    format!(
+                                        "bitwise `~` requires integer operand, found `{tname}`"
+                                    ),
                                     *span,
                                 ));
                             }
@@ -4739,8 +4790,8 @@ impl BodyScanner<'_, '_> {
             } => {
                 let (hir_recv, recv_ty) = self.lower_expr(receiver, false);
                 let (hir_idx, _) = self.lower_expr(index, false);
-                let elem_ty = recv_ty.and_then(|ty_id| {
-                    match self.ctx.module.types.get(ty_id).clone() {
+                let elem_ty =
+                    recv_ty.and_then(|ty_id| match self.ctx.module.types.get(ty_id).clone() {
                         Type::Array { element, .. }
                         | Type::Buffer { element }
                         | Type::RwBuffer { element } => Some(element),
@@ -4754,13 +4805,15 @@ impl BodyScanner<'_, '_> {
                         Type::Vector { scalar, .. } => {
                             Some(self.ctx.module.types.alloc(Type::Scalar(scalar)))
                         }
-                        Type::Matrix { scalar, rows, .. } => {
-                            Some(self.ctx.module.types.alloc(Type::Vector {
-                                scalar,
-                                len: rows,
-                            }))
-                        }
-                        Type::Struct { fields, .. } if fields.len() == 1 && fields[0].0 == "items" => {
+                        Type::Matrix { scalar, rows, .. } => Some(
+                            self.ctx
+                                .module
+                                .types
+                                .alloc(Type::Vector { scalar, len: rows }),
+                        ),
+                        Type::Struct { fields, .. }
+                            if fields.len() == 1 && fields[0].0 == "items" =>
+                        {
                             match self.ctx.module.types.get(fields[0].1) {
                                 Type::Buffer { element } | Type::RwBuffer { element } => {
                                     Some(*element)
@@ -4769,8 +4822,7 @@ impl BodyScanner<'_, '_> {
                             }
                         }
                         _ => None,
-                    }
-                });
+                    });
                 let ty = elem_ty.unwrap_or_else(|| self.void_ty());
                 (
                     HirExpr {
@@ -5753,7 +5805,9 @@ fn lower_type_expr(
                     let pointee = args
                         .iter()
                         .find_map(|arg| match arg {
-                            TypeArg::Type(inner) => lower_type_expr(inner, ctx, generic_params, type_subst),
+                            TypeArg::Type(inner) => {
+                                lower_type_expr(inner, ctx, generic_params, type_subst)
+                            }
                             TypeArg::NamedExpr { .. } => None,
                         })
                         .unwrap_or_else(|| ctx.types.alloc(Type::Void));
@@ -5794,7 +5848,9 @@ fn lower_type_expr(
                     let element = args
                         .iter()
                         .find_map(|arg| match arg {
-                            TypeArg::Type(inner) => lower_type_expr(inner, ctx, generic_params, type_subst),
+                            TypeArg::Type(inner) => {
+                                lower_type_expr(inner, ctx, generic_params, type_subst)
+                            }
                             TypeArg::NamedExpr { .. } => None,
                         })
                         .unwrap_or_else(|| ctx.types.alloc(Type::Void));
@@ -5804,7 +5860,9 @@ fn lower_type_expr(
                     let element = args
                         .iter()
                         .find_map(|arg| match arg {
-                            TypeArg::Type(inner) => lower_type_expr(inner, ctx, generic_params, type_subst),
+                            TypeArg::Type(inner) => {
+                                lower_type_expr(inner, ctx, generic_params, type_subst)
+                            }
                             TypeArg::NamedExpr { .. } => None,
                         })
                         .unwrap_or_else(|| ctx.types.alloc(Type::Void));
@@ -7039,12 +7097,18 @@ mod tests {
 
         let (_, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
         let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
-        assert!(codes.contains(&"E0270"), "expected E0270 binary mismatch: {codes:?}");
+        assert!(
+            codes.contains(&"E0270"),
+            "expected E0270 binary mismatch: {codes:?}"
+        );
         assert!(
             codes.iter().filter(|&&c| c == "E0271").count() >= 2,
             "expected E0271 for immutable let & ParamMode::In: {codes:?}"
         );
-        assert!(codes.contains(&"E0272"), "expected E0272 inout immutable arg: {codes:?}");
+        assert!(
+            codes.contains(&"E0272"),
+            "expected E0272 inout immutable arg: {codes:?}"
+        );
         assert!(
             codes.iter().filter(|&&c| c == "E0273").count() >= 2,
             "expected E0273 for write-swizzle dup & out-of-range: {codes:?}"
@@ -7053,7 +7117,10 @@ mod tests {
             codes.iter().filter(|&&c| c == "E0274").count() >= 2,
             "expected E0274 for call arg type & arity mismatch: {codes:?}"
         );
-        assert!(codes.contains(&"E0275"), "expected E0275 return mismatch: {codes:?}");
+        assert!(
+            codes.contains(&"E0275"),
+            "expected E0275 return mismatch: {codes:?}"
+        );
     }
 
     #[test]
@@ -7138,8 +7205,8 @@ mod tests {
                         ..
                     } => {
                         assert_eq!(method, "target_pdf");
-                        let target_fn_id = resolved_fn
-                            .expect("trait method target_pdf resolved to concrete impl");
+                        let target_fn_id =
+                            resolved_fn.expect("trait method target_pdf resolved to concrete impl");
                         assert_eq!(hir.functions[target_fn_id].name, "target_pdf");
                     }
                     other => panic!("expected MethodCall, got {other:?}"),

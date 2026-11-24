@@ -130,7 +130,9 @@ mod tests {
         );
         assert!(!glsl.contains("\"custom_reflections\""));
 
-        assert!(glsl.contains("textureLod(bindless[nonuniformEXT(inst.albedo_slot)], uv, 0.0).rgb"));
+        assert!(
+            glsl.contains("textureLod(bindless[nonuniformEXT(inst.albedo_slot)], uv, 0.0).rgb")
+        );
         assert!(glsl.contains("vec3 color;"));
         assert!(glsl.contains("InstanceMeta inst = mc_instances["));
         assert!(glsl.contains("vec2 uv = rayQueryGetIntersectionBarycentricsEXT(rq, true);"));
@@ -681,7 +683,10 @@ mod tests {
         let glsl = emit_glsl_460(&parsed.unit);
         assert!(!glsl.contains("VslDefaultTarget"), "got:\n{glsl}");
         assert!(!glsl.contains("struct Reservoir {"), "got:\n{glsl}");
-        assert!(glsl.contains("struct Reservoir__LightSample {"), "got:\n{glsl}");
+        assert!(
+            glsl.contains("struct Reservoir__LightSample {"),
+            "got:\n{glsl}"
+        );
         assert!(glsl.contains("LightSample _vsl_sample;"), "got:\n{glsl}");
         assert!(
             glsl.contains("float LightSample_target_pdf(in LightSample self, in vec3 world_pos, in vec3 normal)"),
@@ -792,10 +797,25 @@ mod tests {
         assert!(glsl.contains("int fog_mode;"), "got:\n{glsl}");
         assert!(glsl.contains("float fog_strength;"), "got:\n{glsl}");
         assert!(glsl.contains("uint frame_budget;"), "got:\n{glsl}");
-        assert!(glsl.contains("vec3 tint = VsMotion.packParams.sky_tint;"), "got:\n{glsl}");
-        assert!(glsl.contains("bool enabled = VsMotion.packParams.enable_fog;"), "got:\n{glsl}");
-        assert!(glsl.contains("int mode = VsMotion.packParams.fog_mode;"), "got:\n{glsl}");
-        assert!(glsl.contains("float strength = VsMotion.packParams.fog_strength;"), "got:\n{glsl}");
-        assert!(glsl.contains("uint budget = VsMotion.packParams.frame_budget;"), "got:\n{glsl}");
+        assert!(
+            glsl.contains("vec3 tint = VsMotion.packParams.sky_tint;"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("bool enabled = VsMotion.packParams.enable_fog;"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("int mode = VsMotion.packParams.fog_mode;"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("float strength = VsMotion.packParams.fog_strength;"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("uint budget = VsMotion.packParams.frame_budget;"),
+            "got:\n{glsl}"
+        );
     }
 }

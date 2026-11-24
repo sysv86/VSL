@@ -338,15 +338,20 @@ impl IrPass for ConstFoldPass {
                         }
                         _ => None,
                     },
-                    InstData::FConvert { value, target } => match (&func.insts[value].data, target) {
+                    InstData::FConvert { value, target } => match (&func.insts[value].data, target)
+                    {
                         (InstData::ConstF32(bits), ScalarIrTy::F16) => {
                             Some(InstData::ConstF16(f32_to_f16_bits(f32::from_bits(*bits))))
                         }
                         (InstData::ConstF16(bits), ScalarIrTy::F32) => {
                             Some(InstData::ConstF32(f16_bits_to_f32(*bits).to_bits()))
                         }
-                        (InstData::ConstF32(bits), ScalarIrTy::F32) => Some(InstData::ConstF32(*bits)),
-                        (InstData::ConstF16(bits), ScalarIrTy::F16) => Some(InstData::ConstF16(*bits)),
+                        (InstData::ConstF32(bits), ScalarIrTy::F32) => {
+                            Some(InstData::ConstF32(*bits))
+                        }
+                        (InstData::ConstF16(bits), ScalarIrTy::F16) => {
+                            Some(InstData::ConstF16(*bits))
+                        }
                         _ => None,
                     },
                     InstData::VectorTimesScalar { vec, scalar } => {
@@ -3513,7 +3518,12 @@ fn sroa_step(func: &mut IrFunction) -> bool {
                 let parts = layout
                     .fields
                     .iter()
-                    .map(|f| (SmolStr::new(format!("{}.{}", var.name, f.name)), f.ty.clone()))
+                    .map(|f| {
+                        (
+                            SmolStr::new(format!("{}.{}", var.name, f.name)),
+                            f.ty.clone(),
+                        )
+                    })
                     .collect();
                 eligible.insert(local_idx, parts);
             }
@@ -3804,9 +3814,7 @@ fn emit_zero_const(func: &mut IrFunction, ty: &IrType) -> InstId {
         IrType::Scalar(ScalarIrTy::Bool) => func.emit_typed(ty.clone(), InstData::ConstBool(false)),
         IrType::Scalar(ScalarIrTy::I32) => func.emit_typed(ty.clone(), InstData::ConstI32(0)),
         IrType::Scalar(ScalarIrTy::U32) => func.emit_typed(ty.clone(), InstData::ConstU32(0)),
-        IrType::Scalar(ScalarIrTy::F32) => {
-            func.emit_typed(ty.clone(), InstData::const_f32(0.0))
-        }
+        IrType::Scalar(ScalarIrTy::F32) => func.emit_typed(ty.clone(), InstData::const_f32(0.0)),
         IrType::Scalar(ScalarIrTy::F16) => func.emit_typed(ty.clone(), InstData::ConstF16(0)),
         IrType::Scalar(ScalarIrTy::I64) => func.emit_typed(ty.clone(), InstData::ConstI64(0)),
         IrType::Scalar(ScalarIrTy::U64) => func.emit_typed(ty.clone(), InstData::ConstU64(0)),
@@ -3967,12 +3975,22 @@ fn mem2reg_stmts(
                 let pre_env = env.clone();
 
                 let mut then_env = pre_env.clone();
-                let (new_then, then_term) =
-                    mem2reg_stmts(func, then_body, &mut then_env, state, loop_ctx.as_deref_mut());
+                let (new_then, then_term) = mem2reg_stmts(
+                    func,
+                    then_body,
+                    &mut then_env,
+                    state,
+                    loop_ctx.as_deref_mut(),
+                );
 
                 let mut else_env = pre_env;
-                let (new_else, else_term) =
-                    mem2reg_stmts(func, else_body, &mut else_env, state, loop_ctx.as_deref_mut());
+                let (new_else, else_term) = mem2reg_stmts(
+                    func,
+                    else_body,
+                    &mut else_env,
+                    state,
+                    loop_ctx.as_deref_mut(),
+                );
 
                 out.push(StructuredStmt::If {
                     cond,
@@ -4239,10 +4257,7 @@ impl IrPass for CopyPropPass {
                         let rhs_len = vector_len_of(func, *rhs);
                         if let Some(l_len) = lhs_len
                             && components.len() == usize::from(l_len)
-                            && components
-                                .iter()
-                                .enumerate()
-                                .all(|(i, &c)| c == i as u32)
+                            && components.iter().enumerate().all(|(i, &c)| c == i as u32)
                         {
                             Some(*lhs)
                         } else if let (Some(l_len), Some(r_len)) = (lhs_len, rhs_len)
@@ -4899,11 +4914,15 @@ fn inline_calls_in_inst_tree(
         && callee != caller.name
         && let Some(callee_fn) = eligible.get(&callee)
     {
-        let remapped_args: Vec<InstId> = args
-            .iter()
-            .map(|&a| remap_id(a, call_remap))
-            .collect();
-        inline_call_site(caller, id, callee_fn, &remapped_args, call_remap, prefix_stmts);
+        let remapped_args: Vec<InstId> = args.iter().map(|&a| remap_id(a, call_remap)).collect();
+        inline_call_site(
+            caller,
+            id,
+            callee_fn,
+            &remapped_args,
+            call_remap,
+            prefix_stmts,
+        );
         *inlined_any = true;
     }
 }
@@ -5912,8 +5931,20 @@ mod tests {
         );
         let c1 = func.emit(None, InstData::const_f32(3.0));
         let c2 = func.emit(None, InstData::const_f32(4.0));
-        let st_a = func.emit(None, InstData::LocalStore { ptr: p_a, value: c1 });
-        let st_b = func.emit(None, InstData::LocalStore { ptr: p_b, value: c2 });
+        let st_a = func.emit(
+            None,
+            InstData::LocalStore {
+                ptr: p_a,
+                value: c1,
+            },
+        );
+        let st_b = func.emit(
+            None,
+            InstData::LocalStore {
+                ptr: p_b,
+                value: c2,
+            },
+        );
         let ld_a = func.emit(None, InstData::LocalLoad { ptr: p_a });
         let ld_b = func.emit(None, InstData::LocalLoad { ptr: p_b });
         let sum = func.emit(None, InstData::FAdd32(ld_a, ld_b));
@@ -6192,10 +6223,28 @@ mod tests {
         let c1 = func.emit(None, InstData::ConstU32(1));
         let c2 = func.emit(None, InstData::ConstU32(2));
         let c3 = func.emit(None, InstData::ConstU32(3));
-        let st1 = func.emit(None, InstData::LocalStore { ptr: addr, value: c1 });
-        let st2 = func.emit(None, InstData::LocalStore { ptr: addr, value: c2 });
+        let st1 = func.emit(
+            None,
+            InstData::LocalStore {
+                ptr: addr,
+                value: c1,
+            },
+        );
+        let st2 = func.emit(
+            None,
+            InstData::LocalStore {
+                ptr: addr,
+                value: c2,
+            },
+        );
         let ld = func.emit(None, InstData::LocalLoad { ptr: addr });
-        let st3 = func.emit(None, InstData::LocalStore { ptr: addr, value: c3 });
+        let st3 = func.emit(
+            None,
+            InstData::LocalStore {
+                ptr: addr,
+                value: c3,
+            },
+        );
 
         func.body.push(StructuredStmt::Eval(st1));
         func.body.push(StructuredStmt::Eval(st2));

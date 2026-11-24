@@ -269,7 +269,9 @@ pub(crate) fn resolve_module_imports(
                 let Some(exports) = exports_by_module.get(&full_prefix) else {
                     diagnostics.push(Diagnostic::error(
                         "E0502",
-                        format!("cannot glob-import `{full_prefix}::*`: module not found in project"),
+                        format!(
+                            "cannot glob-import `{full_prefix}::*`: module not found in project"
+                        ),
                         imp.span,
                     ));
                     continue;

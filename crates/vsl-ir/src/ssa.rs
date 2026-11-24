@@ -263,11 +263,9 @@ impl IrType {
                 align: *align,
                 storage: IrStorageClass::PhysicalStorageBuffer,
             },
-            Type::Buffer { element } | Type::RwBuffer { element } => {
-                Self::RuntimeArray(Box::new(Self::from_hir_type_inner(
-                    arena, *element, visited,
-                )))
-            }
+            Type::Buffer { element } | Type::RwBuffer { element } => Self::RuntimeArray(Box::new(
+                Self::from_hir_type_inner(arena, *element, visited),
+            )),
             Type::Struct {
                 name,
                 layout,
@@ -1704,10 +1702,8 @@ impl IrFunction {
                 }
             }
             InstData::MatrixTimesMatrix { lhs, rhs } => {
-                if let (
-                    IrType::Matrix { scalar, rows, .. },
-                    IrType::Matrix { cols, .. },
-                ) = (&self.insts[*lhs].ir_ty, &self.insts[*rhs].ir_ty)
+                if let (IrType::Matrix { scalar, rows, .. }, IrType::Matrix { cols, .. }) =
+                    (&self.insts[*lhs].ir_ty, &self.insts[*rhs].ir_ty)
                 {
                     IrType::Matrix {
                         scalar: *scalar,

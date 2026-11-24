@@ -611,9 +611,21 @@ mod tests {
             cursor = field.byte_offset + field.byte_size;
         }
         assert_eq!(cursor, WORLD_UBO_LAYOUT.total_size);
-        assert_eq!(WORLD_UBO_LAYOUT.field("pack_params_bda").unwrap().byte_offset, 0);
-        assert_eq!(WORLD_UBO_LAYOUT.field("inv_view_proj").unwrap().byte_offset, 16);
-        assert_eq!(WORLD_UBO_LAYOUT.field("camera_pos").unwrap().byte_offset, 208);
+        assert_eq!(
+            WORLD_UBO_LAYOUT
+                .field("pack_params_bda")
+                .unwrap()
+                .byte_offset,
+            0
+        );
+        assert_eq!(
+            WORLD_UBO_LAYOUT.field("inv_view_proj").unwrap().byte_offset,
+            16
+        );
+        assert_eq!(
+            WORLD_UBO_LAYOUT.field("camera_pos").unwrap().byte_offset,
+            208
+        );
         assert_eq!(WORLD_UBO_LAYOUT.field("sun_dir").unwrap().byte_offset, 224);
     }
 

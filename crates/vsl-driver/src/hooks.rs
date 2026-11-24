@@ -125,14 +125,8 @@ pub(crate) fn compile_hook_chain_sources(
     }
 
     let chain_l1 = L1ModuleHash(*chain_hasher.finalize().as_bytes());
-    build_hook_chain_unit(
-        stage,
-        &lowered_hooks,
-        chain_l1,
-        options,
-        &mut diagnostics,
-    )
-    .ok_or(diagnostics)
+    build_hook_chain_unit(stage, &lowered_hooks, chain_l1, options, &mut diagnostics)
+        .ok_or(diagnostics)
 }
 
 /// Synthesizes a native SPIR-V hook chain [`CompiledShaderUnit`] from pre-lowered
@@ -286,8 +280,10 @@ pub(crate) fn build_hook_chain_unit(
             component: Some(1),
         },
     );
-    let coord_x = dispatch_fn.emit_typed(IrType::Scalar(ScalarIrTy::I32), InstData::CastToI32(gid_x));
-    let coord_y = dispatch_fn.emit_typed(IrType::Scalar(ScalarIrTy::I32), InstData::CastToI32(gid_y));
+    let coord_x =
+        dispatch_fn.emit_typed(IrType::Scalar(ScalarIrTy::I32), InstData::CastToI32(gid_x));
+    let coord_y =
+        dispatch_fn.emit_typed(IrType::Scalar(ScalarIrTy::I32), InstData::CastToI32(gid_y));
     let coord = dispatch_fn.emit_typed(
         IrType::Vector {
             scalar: ScalarIrTy::I32,
@@ -356,10 +352,8 @@ pub(crate) fn build_hook_chain_unit(
                     indices: vec![3],
                 },
             );
-            let src_rgb = dispatch_fn.emit_typed(
-                vec3_ty.clone(),
-                InstData::MakeVec3(src_r, src_g, src_b),
-            );
+            let src_rgb =
+                dispatch_fn.emit_typed(vec3_ty.clone(), InstData::MakeVec3(src_r, src_g, src_b));
             let inv_a = dispatch_fn.emit_typed(f32_ty.clone(), InstData::FSub32(one, src_a));
             let src_premul = dispatch_fn.emit_typed(
                 vec3_ty.clone(),
@@ -375,8 +369,10 @@ pub(crate) fn build_hook_chain_unit(
                     scalar: inv_a,
                 },
             );
-            acc_rgb = dispatch_fn.emit_typed(vec3_ty.clone(), InstData::FAdd32(src_premul, acc_scaled));
-            let acc_a_scaled = dispatch_fn.emit_typed(f32_ty.clone(), InstData::FMul32(acc_a, inv_a));
+            acc_rgb =
+                dispatch_fn.emit_typed(vec3_ty.clone(), InstData::FAdd32(src_premul, acc_scaled));
+            let acc_a_scaled =
+                dispatch_fn.emit_typed(f32_ty.clone(), InstData::FMul32(acc_a, inv_a));
             acc_a = dispatch_fn.emit_typed(f32_ty.clone(), InstData::FAdd32(src_a, acc_a_scaled));
         }
 
@@ -519,7 +515,9 @@ fn emit_default_ir_value(ir_fn: &mut IrFunction, ty: &IrType) -> InstId {
         IrType::Scalar(ScalarIrTy::U32) => ir_fn.emit_typed(ty.clone(), InstData::ConstU32(0)),
         IrType::Scalar(ScalarIrTy::I64) => ir_fn.emit_typed(ty.clone(), InstData::ConstI64(0)),
         IrType::Scalar(ScalarIrTy::U64) => ir_fn.emit_typed(ty.clone(), InstData::ConstU64(0)),
-        IrType::Scalar(ScalarIrTy::Bool) => ir_fn.emit_typed(ty.clone(), InstData::ConstBool(false)),
+        IrType::Scalar(ScalarIrTy::Bool) => {
+            ir_fn.emit_typed(ty.clone(), InstData::ConstBool(false))
+        }
         IrType::Vector { scalar, len } => {
             let s = emit_default_ir_value(ir_fn, &IrType::Scalar(*scalar));
             match *len {
@@ -567,4 +565,3 @@ fn emit_default_ir_value(ir_fn: &mut IrFunction, ty: &IrType) -> InstId {
         _ => ir_fn.emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(0)),
     }
 }
-

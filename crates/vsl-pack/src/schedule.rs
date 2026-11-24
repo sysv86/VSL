@@ -497,9 +497,7 @@ pub fn validate_pass_bindings_against_shader(
                     ));
                 }
             }
-            PassBindingRef::CustomTarget {
-                name, is_write, ..
-            } => {
+            PassBindingRef::CustomTarget { name, is_write, .. } => {
                 if desc.set != DESCRIPTOR_SET_PER_PASS {
                     errors.push(format!(
                         "pass `{}` custom target binding `{bind_key}` (target `{name}`) must target Set {DESCRIPTOR_SET_PER_PASS}, but shader `{}` declares set {}",

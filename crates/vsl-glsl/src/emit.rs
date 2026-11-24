@@ -8,8 +8,8 @@ use vsl_mc::{
 };
 use vsl_syntax::ast::{
     Attribute, BinaryOp, Block, CallArg, ConstDecl, Expr, FnDecl, FnParam, GenericParam, Ident,
-    ImplBlock, ImportTree, Item, ParamMode, Path, SourceUnit, Stmt, StructDecl, TraitDecl,
-    TypeArg, TypeExpr, UnaryOp, WorkgroupVarDecl,
+    ImplBlock, ImportTree, Item, ParamMode, Path, SourceUnit, Stmt, StructDecl, TraitDecl, TypeArg,
+    TypeExpr, UnaryOp, WorkgroupVarDecl,
 };
 
 /// Lowering options controlling GLSL 460 oracle vs. raster G-Buffer hook bridge behavior.
@@ -194,8 +194,9 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
                         if let TypeExpr::Named { path, args, .. } = &f.ty
                             && path.segments.len() == 1
                             && args.is_empty()
-                            && let Some(idx) =
-                                generic_params.iter().position(|gp| gp == &path.segments[0].name)
+                            && let Some(idx) = generic_params
+                                .iter()
+                                .position(|gp| gp == &path.segments[0].name)
                         {
                             param_fields.insert(f.name.name.clone(), idx);
                         }
@@ -693,11 +694,7 @@ fn impl_target_name_with_subst(
     }
 }
 
-fn apply_impl_subst(
-    imp: &ImplBlock,
-    type_args: &[String],
-    subst: &mut IndexMap<SmolStr, String>,
-) {
+fn apply_impl_subst(imp: &ImplBlock, type_args: &[String], subst: &mut IndexMap<SmolStr, String>) {
     let mut bound_from_target = false;
     if let TypeExpr::Named { args, .. } = &imp.target {
         let target_type_args: Vec<&TypeExpr> = args
@@ -1784,7 +1781,10 @@ fn emit_call_expr_with_hoist(
 }
 
 fn is_combined_sampler_type(ty: &str) -> bool {
-    matches!(ty, "sampler2D" | "sampler3D" | "sampler2DArray" | "samplerCube")
+    matches!(
+        ty,
+        "sampler2D" | "sampler3D" | "sampler2DArray" | "samplerCube"
+    )
 }
 
 fn combined_sampler_ctor(tex_ty: &str) -> &'static str {
@@ -2028,7 +2028,9 @@ fn type_to_glsl_with_subst(
                 let resolved_args: Vec<String> = args
                     .iter()
                     .filter_map(|arg| match arg {
-                        TypeArg::Type(inner) => Some(type_to_glsl_with_subst(inner, generic_subst).0),
+                        TypeArg::Type(inner) => {
+                            Some(type_to_glsl_with_subst(inner, generic_subst).0)
+                        }
                         TypeArg::NamedExpr { .. } => None,
                     })
                     .collect();
@@ -2754,11 +2756,7 @@ fn scan_fn_into(f: &FnDecl, scan: &mut FeatureScan) {
     scan_fn_into_with_subst(f, &empty, scan);
 }
 
-fn scan_fn_into_with_subst(
-    f: &FnDecl,
-    subst: &IndexMap<SmolStr, String>,
-    scan: &mut FeatureScan,
-) {
+fn scan_fn_into_with_subst(f: &FnDecl, subst: &IndexMap<SmolStr, String>, scan: &mut FeatureScan) {
     scan_attrs(&f.attrs, scan);
     for p in &f.params {
         if let Some(ref ty) = p.ty {
@@ -2821,11 +2819,7 @@ fn scan_type(ty: &TypeExpr, scan: &mut FeatureScan) {
     scan_type_with_subst(ty, &empty, scan);
 }
 
-fn scan_type_with_subst(
-    ty: &TypeExpr,
-    subst: &IndexMap<SmolStr, String>,
-    scan: &mut FeatureScan,
-) {
+fn scan_type_with_subst(ty: &TypeExpr, subst: &IndexMap<SmolStr, String>, scan: &mut FeatureScan) {
     match ty {
         TypeExpr::Array { element, .. } => scan_type_with_subst(element, subst, scan),
         TypeExpr::Named { path, args, .. } => {
@@ -2864,11 +2858,7 @@ fn scan_type_with_subst(
     }
 }
 
-fn scan_block_with_subst(
-    block: &Block,
-    subst: &IndexMap<SmolStr, String>,
-    scan: &mut FeatureScan,
-) {
+fn scan_block_with_subst(block: &Block, subst: &IndexMap<SmolStr, String>, scan: &mut FeatureScan) {
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let { ty, init, .. } => {
@@ -2939,11 +2929,7 @@ fn scan_expr(expr: &Expr, scan: &mut FeatureScan) {
     scan_expr_with_subst(expr, &empty, scan);
 }
 
-fn scan_expr_with_subst(
-    expr: &Expr,
-    subst: &IndexMap<SmolStr, String>,
-    scan: &mut FeatureScan,
-) {
+fn scan_expr_with_subst(expr: &Expr, subst: &IndexMap<SmolStr, String>, scan: &mut FeatureScan) {
     match expr {
         Expr::IntLit(raw, _) => {
             if raw.ends_with("u64") || raw.ends_with("i64") {
@@ -3505,7 +3491,8 @@ fn infer_simple_concrete_expr_type(
         Expr::StructLit { path, fields, .. } => {
             let base = path.joined().replace("::", "_");
             if let Some(s_decl) = generic_structs.get(base.as_str()) {
-                let args = infer_generic_struct_lit_args(s_decl, fields, generic_structs, local_types)?;
+                let args =
+                    infer_generic_struct_lit_args(s_decl, fields, generic_structs, local_types)?;
                 return Some(mangle_generic_name(&base, &args));
             }
             Some(base)
@@ -3569,13 +3556,21 @@ fn collect_instantiations_in_expr(
     match expr {
         Expr::StructLit { path, fields, .. } => {
             for (_, v) in fields {
-                collect_instantiations_in_expr(v, generic_structs, active_generics, local_types, out);
+                collect_instantiations_in_expr(
+                    v,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
             }
             let base = path.joined().replace("::", "_");
             if let Some(s_decl) = generic_structs.get(base.as_str())
                 && let Some(type_args) =
                     infer_generic_struct_lit_args(s_decl, fields, generic_structs, local_types)
-                && !type_args.iter().any(|t| active_generics.contains(t.as_str()))
+                && !type_args
+                    .iter()
+                    .any(|t| active_generics.contains(t.as_str()))
             {
                 out.insert(MonomorphKey {
                     struct_name: s_decl.name.name.clone(),
@@ -3592,18 +3587,36 @@ fn collect_instantiations_in_expr(
         }
         Expr::ArrayLit { elements, .. } => {
             for e in elements {
-                collect_instantiations_in_expr(e, generic_structs, active_generics, local_types, out);
+                collect_instantiations_in_expr(
+                    e,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
             }
         }
         Expr::Unary { operand, .. } => {
-            collect_instantiations_in_expr(operand, generic_structs, active_generics, local_types, out);
+            collect_instantiations_in_expr(
+                operand,
+                generic_structs,
+                active_generics,
+                local_types,
+                out,
+            );
         }
         Expr::Binary { lhs, rhs, .. } => {
             collect_instantiations_in_expr(lhs, generic_structs, active_generics, local_types, out);
             collect_instantiations_in_expr(rhs, generic_structs, active_generics, local_types, out);
         }
         Expr::Call { callee, args, .. } => {
-            collect_instantiations_in_expr(callee, generic_structs, active_generics, local_types, out);
+            collect_instantiations_in_expr(
+                callee,
+                generic_structs,
+                active_generics,
+                local_types,
+                out,
+            );
             for a in args {
                 collect_instantiations_in_expr(
                     &a.value,
@@ -3620,7 +3633,13 @@ fn collect_instantiations_in_expr(
             args,
             ..
         } => {
-            collect_instantiations_in_expr(receiver, generic_structs, active_generics, local_types, out);
+            collect_instantiations_in_expr(
+                receiver,
+                generic_structs,
+                active_generics,
+                local_types,
+                out,
+            );
             for arg in turbofish {
                 if let TypeArg::Type(t) = arg {
                     collect_instantiations_in_type(t, generic_structs, active_generics, out);
@@ -3637,13 +3656,31 @@ fn collect_instantiations_in_expr(
             }
         }
         Expr::Field { receiver, .. } => {
-            collect_instantiations_in_expr(receiver, generic_structs, active_generics, local_types, out);
+            collect_instantiations_in_expr(
+                receiver,
+                generic_structs,
+                active_generics,
+                local_types,
+                out,
+            );
         }
         Expr::Index {
             receiver, index, ..
         } => {
-            collect_instantiations_in_expr(receiver, generic_structs, active_generics, local_types, out);
-            collect_instantiations_in_expr(index, generic_structs, active_generics, local_types, out);
+            collect_instantiations_in_expr(
+                receiver,
+                generic_structs,
+                active_generics,
+                local_types,
+                out,
+            );
+            collect_instantiations_in_expr(
+                index,
+                generic_structs,
+                active_generics,
+                local_types,
+                out,
+            );
         }
         Expr::If {
             cond,
@@ -3651,7 +3688,13 @@ fn collect_instantiations_in_expr(
             else_branch,
             ..
         } => {
-            collect_instantiations_in_expr(cond, generic_structs, active_generics, local_types, out);
+            collect_instantiations_in_expr(
+                cond,
+                generic_structs,
+                active_generics,
+                local_types,
+                out,
+            );
             collect_instantiations_in_block(
                 then_branch,
                 generic_structs,

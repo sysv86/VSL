@@ -1160,7 +1160,10 @@ gamma = 2.25
 
         assert_eq!(ir.passes[0].kind, PassKind::Compute);
         assert_eq!(ir.passes[0].dispatch_target, None);
-        assert_eq!(ir.passes[0].dispatch, Some(PassDispatch::Explicit([16, 16, 1])));
+        assert_eq!(
+            ir.passes[0].dispatch,
+            Some(PassDispatch::Explicit([16, 16, 1]))
+        );
 
         assert_eq!(ir.passes[1].kind, PassKind::Transfer);
         assert!(ir.passes[1].entry_fn.is_empty());
@@ -1185,8 +1188,8 @@ gamma = 2.25
             Some(PassDispatch::Indirect(SmolStr::new_static("args_ssbo")))
         );
 
-        let plan =
-            validate_and_schedule(&ir).expect("transfer passes with empty entry_fn should schedule");
+        let plan = validate_and_schedule(&ir)
+            .expect("transfer passes with empty entry_fn should schedule");
         let pos = |name: &str| {
             plan.ordered_passes
                 .iter()
@@ -1693,7 +1696,8 @@ kind = "transfer"
             "expected unknown binding error, got: {errs:?}"
         );
         assert!(
-            errs.iter().any(|e| e.contains("rgba8") && e.contains("rgba16f")),
+            errs.iter()
+                .any(|e| e.contains("rgba8") && e.contains("rgba16f")),
             "expected ImageFormat mismatch error, got: {errs:?}"
         );
         assert!(
@@ -1717,7 +1721,8 @@ kind = "transfer"
             "expected DescriptorKind error, got: {errs:?}"
         );
         assert!(
-            errs.iter().any(|e| e.contains("slot 1") && e.contains("binding 3")),
+            errs.iter()
+                .any(|e| e.contains("slot 1") && e.contains("binding 3")),
             "expected ResourceTexture slot mismatch error, got: {errs:?}"
         );
     }

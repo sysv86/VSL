@@ -9,9 +9,7 @@ mod hooks;
 mod lower_ir;
 mod modules;
 
-use crate::cache::{
-    L1CacheKey, hash_pack_schema, load_l2_from_disk, save_l2_to_disk,
-};
+use crate::cache::{L1CacheKey, hash_pack_schema, load_l2_from_disk, save_l2_to_disk};
 use crate::hooks::{build_hook_chain_unit, compile_hook_chain_sources};
 use crate::lower_ir::lower_entry_module_to_ir;
 use crate::modules::{ModuleExports, module_graph_dependency_path, resolve_module_imports};
@@ -95,10 +93,7 @@ fn setting_value_type_and_bits(
         SettingValueIr::Float(f) => (PackParamType::F32, f.to_bits()),
         SettingValueIr::ColorRgb(_) => (PackParamType::Vec3, 0),
         SettingValueIr::EnumVariant(variant) => {
-            let idx = enum_variants
-                .iter()
-                .position(|v| v == variant)
-                .unwrap_or(0) as u32;
+            let idx = enum_variants.iter().position(|v| v == variant).unwrap_or(0) as u32;
             (PackParamType::Enum, idx)
         }
     }
@@ -644,10 +639,7 @@ impl VslCompiler {
                             (entry_idx, cache_key, unit, diags)
                         }));
                     }
-                    handles
-                        .into_iter()
-                        .filter_map(|h| h.join().ok())
-                        .collect()
+                    handles.into_iter().filter_map(|h| h.join().ok()).collect()
                 })
             };
 
@@ -748,14 +740,8 @@ fn compile_single_entry_unit(
     workgroup_size: Option<[u32; 3]>,
     cache_key: [u8; 32],
 ) -> (CompiledShaderUnit, Vec<Diagnostic>) {
-    let mut lowered = lower_entry_module_to_ir(
-        hir,
-        func,
-        module_items,
-        pack_schema,
-        stage,
-        workgroup_size,
-    );
+    let mut lowered =
+        lower_entry_module_to_ir(hir, func, module_items, pack_schema, stage, workgroup_size);
     let pipeline = PassPipeline::default();
     pipeline.run_module(&mut lowered.ir_module);
     let spirv = emit_module_spirv(&lowered.ir_module);
@@ -1233,7 +1219,9 @@ mod tests {
     #[test]
     fn lowers_mc_builtins_subgroup_exclusive_and_typed_vec3_param_without_stubs() {
         let mut schema = PackSchema::default();
-        schema.params.insert(SmolStr::new_static("sky_tint"), (0, 12));
+        schema
+            .params
+            .insert(SmolStr::new_static("sky_tint"), (0, 12));
         schema
             .param_types
             .insert(SmolStr::new_static("sky_tint"), PackParamType::Vec3);
@@ -1312,8 +1300,14 @@ mod tests {
             }
         }
 
-        assert!(has_mat_mul, "expected MatrixTimesVector for mc::reconstruct_world_pos");
-        assert!(has_normalize, "expected GlslStd450Op::Normalize for mc::view_dir");
+        assert!(
+            has_mat_mul,
+            "expected MatrixTimesVector for mc::reconstruct_world_pos"
+        );
+        assert!(
+            has_normalize,
+            "expected GlslStd450Op::Normalize for mc::view_dir"
+        );
         assert!(has_fmix, "expected GlslStd450Op::FMix for mc::sample_sky");
         assert!(
             has_excl_bit_count,
@@ -1438,8 +1432,14 @@ mod tests {
                 default_bits: 1,
             })
         );
-        assert_eq!(schema.param_types.get("exposure"), Some(&PackParamType::F32));
-        assert_eq!(schema.param_types.get("sun_tint"), Some(&PackParamType::Vec3));
+        assert_eq!(
+            schema.param_types.get("exposure"),
+            Some(&PackParamType::F32)
+        );
+        assert_eq!(
+            schema.param_types.get("sun_tint"),
+            Some(&PackParamType::Vec3)
+        );
         // `exposure` at 0 (4B), `sun_tint` aligned to 16B (12B).
         assert_eq!(schema.params.get("exposure"), Some(&(0, 4)));
         assert_eq!(schema.params.get("sun_tint"), Some(&(16, 12)));
@@ -1529,7 +1529,10 @@ mod tests {
         assert!(!out1.has_errors(), "{:?}", out1.diagnostics);
         assert_eq!(out1.units.len(), 1);
         let expected_path = cache::l2_cache_file_path(&cache_dir, &out1.units[0].cache_key);
-        assert!(expected_path.exists(), "expected L2 disk cache file at {expected_path:?}");
+        assert!(
+            expected_path.exists(),
+            "expected L2 disk cache file at {expected_path:?}"
+        );
 
         // Second fresh compiler instance loads directly from disk L2 cache.
         let mut c2 = VslCompiler::with_l2_cache_dir(cache_dir.clone());

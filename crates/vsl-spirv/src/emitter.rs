@@ -544,12 +544,7 @@ impl SpirvEmitter {
         }
     }
 
-    fn emit_struct_type(
-        &mut self,
-        layout: &IrStructLayout,
-        as_block: bool,
-        in_block: bool,
-    ) -> u32 {
+    fn emit_struct_type(&mut self, layout: &IrStructLayout, as_block: bool, in_block: bool) -> u32 {
         let explicit = as_block || in_block;
         let cache_key = (layout.clone(), as_block, explicit);
         if let Some(&id) = self.struct_type_cache.get(&cache_key) {
@@ -563,9 +558,7 @@ impl SpirvEmitter {
                 .fields
                 .iter()
                 .map(|field| {
-                    if explicit
-                        && let IrType::RuntimeArray(elem) = &field.ty
-                    {
+                    if explicit && let IrType::RuntimeArray(elem) = &field.ty {
                         let elem_ty = self.emit_ir_type_with_layout(elem, true);
                         let stride = if field.byte_size > 0 {
                             field.byte_size
@@ -751,11 +744,7 @@ impl SpirvEmitter {
         self.emit_type_runtime_array_with_stride(element_ty, None)
     }
 
-    fn emit_type_runtime_array_with_stride(
-        &mut self,
-        element_ty: u32,
-        stride: Option<u32>,
-    ) -> u32 {
+    fn emit_type_runtime_array_with_stride(&mut self, element_ty: u32, stride: Option<u32>) -> u32 {
         let key = TypeKey::RuntimeArray(element_ty, stride);
         if let Some(&id) = self.type_cache.get(&key) {
             return id;
@@ -1127,9 +1116,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                         uses_f16_storage = true;
                     }
                 }
-                InstData::AtomicAdd {
-                    value, scope, ..
-                } => {
+                InstData::AtomicAdd { value, scope, .. } => {
                     uses_any_atomic = true;
                     if *scope == AtomicScope::Device {
                         uses_device_atomic = true;
@@ -1142,12 +1129,8 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                         uses_float_atomic = true;
                     }
                 }
-                InstData::AtomicMin {
-                    value, scope, ..
-                }
-                | InstData::AtomicMax {
-                    value, scope, ..
-                } => {
+                InstData::AtomicMin { value, scope, .. }
+                | InstData::AtomicMax { value, scope, .. } => {
                     uses_any_atomic = true;
                     if *scope == AtomicScope::Device {
                         uses_device_atomic = true;
@@ -1661,11 +1644,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                 );
             }
             if func.uses_quad_control {
-                emitter.emit_execution_mode(
-                    fn_id,
-                    spirv::ExecutionMode::QuadDerivativesKHR,
-                    &[],
-                );
+                emitter.emit_execution_mode(fn_id, spirv::ExecutionMode::QuadDerivativesKHR, &[]);
             }
         }
     }
@@ -1768,7 +1747,12 @@ fn emit_descriptor_var(emitter: &mut SpirvEmitter, desc: &IrDescriptorVar) -> Em
                 1,
                 spirv::ImageFormat::Unknown,
             );
-            (spirv::StorageClass::UniformConstant, img_ty, img_ty, sampled_ty)
+            (
+                spirv::StorageClass::UniformConstant,
+                img_ty,
+                img_ty,
+                sampled_ty,
+            )
         }
         DescriptorKind::StorageImage => {
             let sampled_ty = match desc.image_format {
@@ -1785,7 +1769,12 @@ fn emit_descriptor_var(emitter: &mut SpirvEmitter, desc: &IrDescriptorVar) -> Em
                 2,
                 map_image_format(desc.image_format),
             );
-            (spirv::StorageClass::UniformConstant, img_ty, img_ty, sampled_ty)
+            (
+                spirv::StorageClass::UniformConstant,
+                img_ty,
+                img_ty,
+                sampled_ty,
+            )
         }
         DescriptorKind::CombinedImageSampler => {
             let sampled_ty = map_sample_scalar(emitter, desc.sample_scalar);
@@ -2049,8 +2038,11 @@ fn emit_push_constant_block(
                     ),
                     n => {
                         let len_const = emitter.emit_constant_32(u32_ty, n);
-                        let arr_ty =
-                            emitter.emit_type_array_with_stride(scalar_ty, len_const, Some(elem_bytes));
+                        let arr_ty = emitter.emit_type_array_with_stride(
+                            scalar_ty,
+                            len_const,
+                            Some(elem_bytes),
+                        );
                         (arr_ty, scalar_ty, true, is_f16)
                     }
                 }
@@ -2310,10 +2302,8 @@ impl FnLowerCtx<'_> {
             for i in 0..dst_n {
                 if i < src_n {
                     let c_id = self.emitter.alloc_id();
-                    self.emitter.emit_fn_inst(
-                        spirv::Op::CompositeExtract,
-                        &[src_c, c_id, spv_id, i],
-                    );
+                    self.emitter
+                        .emit_fn_inst(spirv::Op::CompositeExtract, &[src_c, c_id, spv_id, i]);
                     elems.push(self.coerce_to_ty(c_id, src_c, dst_c));
                 } else {
                     elems.push(self.emit_zero_const(dst_c));
@@ -2842,7 +2832,9 @@ impl FnLowerCtx<'_> {
         let texel_vec_ty = self.emitter.emit_type_vector(sampled_ty, 4);
         match self.func.insts[id].ir_ty.clone() {
             IrType::Vector { scalar, len: 4 } => {
-                let target_ty = self.emitter.emit_ir_type(&IrType::Vector { scalar, len: 4 });
+                let target_ty = self
+                    .emitter
+                    .emit_ir_type(&IrType::Vector { scalar, len: 4 });
                 let coerced = self.coerce_to_ty(texel_vec_id, texel_vec_ty, target_ty);
                 (coerced, target_ty)
             }
@@ -2898,10 +2890,8 @@ impl FnLowerCtx<'_> {
                     Some(loaded)
                 } else {
                     let loaded = self.emitter.alloc_id();
-                    self.emitter.emit_fn_inst(
-                        spirv::Op::Load,
-                        &[desc.element_ty, loaded, desc.var_id],
-                    );
+                    self.emitter
+                        .emit_fn_inst(spirv::Op::Load, &[desc.element_ty, loaded, desc.var_id]);
                     Some(loaded)
                 }
             }
@@ -2911,10 +2901,8 @@ impl FnLowerCtx<'_> {
                     loaded
                 } else {
                     let loaded = self.emitter.alloc_id();
-                    self.emitter.emit_fn_inst(
-                        spirv::Op::Load,
-                        &[desc.element_ty, loaded, desc.var_id],
-                    );
+                    self.emitter
+                        .emit_fn_inst(spirv::Op::Load, &[desc.element_ty, loaded, desc.var_id]);
                     loaded
                 };
                 let sampler_ty = self.emitter.emit_type_sampler();
@@ -3520,21 +3508,17 @@ impl FnLowerCtx<'_> {
                 let res_ty = if ir_ty != IrType::Void {
                     self.emitter.emit_ir_type(&ir_ty)
                 } else if let IrType::Matrix { scalar, rows, .. } = self.func.insts[mat].ir_ty {
-                    self.emitter.emit_ir_type(&IrType::Vector { scalar, len: rows })
+                    self.emitter
+                        .emit_ir_type(&IrType::Vector { scalar, len: rows })
                 } else {
-                    self.inst_types
-                        .get(&vec)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            let f = self.f32_ty();
-                            self.emitter.emit_type_vector(f, 4)
-                        })
+                    self.inst_types.get(&vec).copied().unwrap_or_else(|| {
+                        let f = self.f32_ty();
+                        self.emitter.emit_type_vector(f, 4)
+                    })
                 };
                 let res = self.emitter.alloc_id();
-                self.emitter.emit_fn_inst(
-                    spirv::Op::MatrixTimesVector,
-                    &[res_ty, res, mat_id, vec_id],
-                );
+                self.emitter
+                    .emit_fn_inst(spirv::Op::MatrixTimesVector, &[res_ty, res, mat_id, vec_id]);
                 (res, res_ty)
             }
             InstData::MatrixTimesMatrix { lhs, rhs } => {
@@ -3551,10 +3535,8 @@ impl FnLowerCtx<'_> {
                     })
                 };
                 let res = self.emitter.alloc_id();
-                self.emitter.emit_fn_inst(
-                    spirv::Op::MatrixTimesMatrix,
-                    &[res_ty, res, lhs_id, rhs_id],
-                );
+                self.emitter
+                    .emit_fn_inst(spirv::Op::MatrixTimesMatrix, &[res_ty, res, lhs_id, rhs_id]);
                 (res, res_ty)
             }
             InstData::VectorShuffle {
@@ -3566,9 +3548,7 @@ impl FnLowerCtx<'_> {
                 let rhs_id = self.ensure_inst(rhs);
                 let f32_ty = self.f32_ty();
                 let lhs_ty = self.inst_types.get(&lhs).copied().unwrap_or(f32_ty);
-                let (comp_ty, lhs_len) = self
-                    .vector_component_info(lhs_ty)
-                    .unwrap_or((lhs_ty, 1));
+                let (comp_ty, lhs_len) = self.vector_component_info(lhs_ty).unwrap_or((lhs_ty, 1));
                 if components.len() == 1 {
                     let idx = components[0];
                     let (src_id, local_idx) = if idx < lhs_len {
@@ -3659,14 +3639,10 @@ impl FnLowerCtx<'_> {
             } => {
                 let comp_id = self.ensure_inst(composite);
                 let val_id = self.ensure_inst(value);
-                let comp_ty = self
-                    .inst_types
-                    .get(&composite)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        let ir_ty = self.func.insts[id].ir_ty.clone();
-                        self.emitter.emit_ir_type(&ir_ty)
-                    });
+                let comp_ty = self.inst_types.get(&composite).copied().unwrap_or_else(|| {
+                    let ir_ty = self.func.insts[id].ir_ty.clone();
+                    self.emitter.emit_ir_type(&ir_ty)
+                });
                 let res = self.emitter.alloc_id();
                 // SPIR-V OpCompositeInsert operand order: Result Type, Result <id>, Object, Composite, Indexes...
                 let mut ops = Vec::with_capacity(4 + indices.len());
@@ -3964,8 +3940,7 @@ impl FnLowerCtx<'_> {
                 self.emitter
                     .emit_fn_inst(spirv::Op::ConvertUToPtr, &[ty, res, addr_id]);
                 is_bda_ptr = true;
-                self.inst_ptr_storage
-                    .insert(id, self.bda_storage_class());
+                self.inst_ptr_storage.insert(id, self.bda_storage_class());
                 (res, ty)
             }
             InstData::BdaLoad { ptr, access } => {
@@ -4177,12 +4152,8 @@ impl FnLowerCtx<'_> {
                     && let Some(sampled_img_id) =
                         self.load_sampled_image(&desc, image_inst, preloaded_img)
                 {
-                    let coord_vec_id = self.emit_coord_vec(
-                        raw_coord_id,
-                        coord_ty,
-                        f32_ty,
-                        desc.coord_components,
-                    );
+                    let coord_vec_id =
+                        self.emit_coord_vec(raw_coord_id, coord_ty, f32_ty, desc.coord_components);
                     let texel_vec_ty = self.emitter.emit_type_vector(desc.sampled_ty, 4);
                     let texel_vec_id = self.emitter.alloc_id();
                     self.emitter.emit_fn_inst(
@@ -4216,12 +4187,8 @@ impl FnLowerCtx<'_> {
                     && let Some(sampled_img_id) =
                         self.load_sampled_image(&desc, image_inst, preloaded_img)
                 {
-                    let coord_vec_id = self.emit_coord_vec(
-                        raw_coord_id,
-                        coord_ty,
-                        f32_ty,
-                        desc.coord_components,
-                    );
+                    let coord_vec_id =
+                        self.emit_coord_vec(raw_coord_id, coord_ty, f32_ty, desc.coord_components);
                     let ddx_vec =
                         self.emit_coord_vec(raw_ddx, ddx_ty, f32_ty, desc.grad_components);
                     let ddy_vec =
@@ -4267,12 +4234,8 @@ impl FnLowerCtx<'_> {
                     && let Some(sampled_img_id) =
                         self.load_sampled_image(&desc, image_inst, preloaded_img)
                 {
-                    let coord_vec_id = self.emit_coord_vec(
-                        raw_coord_id,
-                        coord_ty,
-                        f32_ty,
-                        desc.coord_components,
-                    );
+                    let coord_vec_id =
+                        self.emit_coord_vec(raw_coord_id, coord_ty, f32_ty, desc.coord_components);
                     let dref_f32 = self.coerce_to_ty(raw_dref, dref_ty, f32_ty);
                     let lod_f32 = self.coerce_to_ty(raw_lod, lod_ty, f32_ty);
                     let res = self.emitter.alloc_id();
@@ -4311,12 +4274,8 @@ impl FnLowerCtx<'_> {
                     && let Some(sampled_img_id) =
                         self.load_sampled_image(&desc, image_inst, preloaded_img)
                 {
-                    let coord_vec_id = self.emit_coord_vec(
-                        raw_coord_id,
-                        coord_ty,
-                        f32_ty,
-                        desc.coord_components,
-                    );
+                    let coord_vec_id =
+                        self.emit_coord_vec(raw_coord_id, coord_ty, f32_ty, desc.coord_components);
                     let comp_const = self.emitter.emit_constant_32(u32_ty, component.min(3));
                     let texel_vec_ty = self.emitter.emit_type_vector(desc.sampled_ty, 4);
                     let texel_vec_id = self.emitter.alloc_id();
@@ -4559,26 +4518,26 @@ impl FnLowerCtx<'_> {
                 if let Some(desc) = self.descriptors.get(descriptor_index as usize).cloned() {
                     if desc.kind == DescriptorKind::StorageBuffer {
                         let u32_ty = self.u32_ty();
-                        let (member_idx, elem_ty, elem_ir_ty) =
-                            if let Some(layout) = &desc.struct_layout {
-                                if let Some((m_idx, field)) = layout
-                                    .fields
-                                    .iter()
-                                    .enumerate()
-                                    .find(|(_, f)| matches!(f.ty, IrType::RuntimeArray(_)))
-                                {
-                                    let IrType::RuntimeArray(inner) = &field.ty else {
-                                        unreachable!()
-                                    };
-                                    let spv_elem =
-                                        self.emitter.emit_ir_type_with_layout(inner, true);
-                                    (m_idx as u32, spv_elem, Some(inner.as_ref().clone()))
-                                } else {
-                                    (0, u32_ty, None)
-                                }
+                        let (member_idx, elem_ty, elem_ir_ty) = if let Some(layout) =
+                            &desc.struct_layout
+                        {
+                            if let Some((m_idx, field)) = layout
+                                .fields
+                                .iter()
+                                .enumerate()
+                                .find(|(_, f)| matches!(f.ty, IrType::RuntimeArray(_)))
+                            {
+                                let IrType::RuntimeArray(inner) = &field.ty else {
+                                    unreachable!()
+                                };
+                                let spv_elem = self.emitter.emit_ir_type_with_layout(inner, true);
+                                (m_idx as u32, spv_elem, Some(inner.as_ref().clone()))
                             } else {
                                 (0, u32_ty, None)
-                            };
+                            }
+                        } else {
+                            (0, u32_ty, None)
+                        };
                         let member_const = self.emitter.emit_constant_32(u32_ty, member_idx);
                         let zero = self.emitter.emit_constant_32(u32_ty, 0);
                         let elem_ptr_ty =
@@ -4622,7 +4581,9 @@ impl FnLowerCtx<'_> {
                             .struct_layout
                             .as_ref()
                             .and_then(|l| l.fields.first())
-                            .map_or(u32_ty, |f| self.emitter.emit_ir_type_with_layout(&f.ty, true));
+                            .map_or(u32_ty, |f| {
+                                self.emitter.emit_ir_type_with_layout(&f.ty, true)
+                            });
                         let elem_ptr_ty =
                             self.emitter.emit_type_pointer(desc.storage_class, first_ty);
                         let res = self.emitter.alloc_id();
@@ -4717,7 +4678,9 @@ impl FnLowerCtx<'_> {
                             | spirv::MemorySemantics::IMAGE_MEMORY
                     }
                 };
-                let sem_id = self.emitter.emit_constant_32(u32_ty, (ord | storage).bits());
+                let sem_id = self
+                    .emitter
+                    .emit_constant_32(u32_ty, (ord | storage).bits());
                 self.emitter
                     .emit_fn_inst(spirv::Op::MemoryBarrier, &[scope_id, sem_id]);
                 (0, self.void_ty)
@@ -4879,11 +4842,11 @@ impl FnLowerCtx<'_> {
                 let raw_cnt = self.ensure_inst(count);
                 let i32_ty = self.i32_ty();
                 let u32_ty = self.u32_ty();
-                let base_ty = self
-                    .inst_types
-                    .get(&base)
-                    .copied()
-                    .unwrap_or(if signed { i32_ty } else { u32_ty });
+                let base_ty = self.inst_types.get(&base).copied().unwrap_or(if signed {
+                    i32_ty
+                } else {
+                    u32_ty
+                });
                 let off_ty = self.inst_types.get(&offset).copied().unwrap_or(u32_ty);
                 let cnt_ty = self.inst_types.get(&count).copied().unwrap_or(u32_ty);
                 let off_id = self.coerce_to_ty(raw_off, off_ty, u32_ty);
@@ -5021,12 +4984,12 @@ impl FnLowerCtx<'_> {
                 {
                     if let Some(layout) = &desc.struct_layout {
                         let byte_off = word_index.saturating_mul(4);
-                        if let Some((member_idx, field)) = layout.fields.iter().enumerate().find(
-                            |(_, f)| {
+                        if let Some((member_idx, field)) =
+                            layout.fields.iter().enumerate().find(|(_, f)| {
                                 byte_off >= f.byte_offset
                                     && byte_off < f.byte_offset.saturating_add(f.byte_size)
-                            },
-                        ) {
+                            })
+                        {
                             let member_ty = self.emitter.emit_ir_type_with_layout(&field.ty, true);
                             let idx_const =
                                 self.emitter.emit_constant_32(u32_ty, member_idx as u32);
@@ -5094,8 +5057,7 @@ impl FnLowerCtx<'_> {
                         {
                             let u64_ty = self.u64_ty();
                             let hi_idx = self.emitter.emit_constant_32(u32_ty, word_index + 1);
-                            let ptr_ty =
-                                self.emitter.emit_type_pointer(desc.storage_class, u32_ty);
+                            let ptr_ty = self.emitter.emit_type_pointer(desc.storage_class, u32_ty);
                             let hi_ptr = self.emitter.alloc_id();
                             let hi_operands = if desc.kind == DescriptorKind::StorageBuffer {
                                 vec![ptr_ty, hi_ptr, desc.var_id, zero, hi_idx]
@@ -5136,8 +5098,7 @@ impl FnLowerCtx<'_> {
                 let ptr_ty = self.bda_ptr_ty_for(u32_ty, 4);
                 let block_ptr = self.ensure_bda_block_ptr(base_ptr, u32_ty, 4);
                 is_bda_ptr = true;
-                self.inst_ptr_storage
-                    .insert(id, self.bda_storage_class());
+                self.inst_ptr_storage.insert(id, self.bda_storage_class());
                 (block_ptr, ptr_ty)
             }
             InstData::LoadBuiltin { kind, component } => {
@@ -5164,9 +5125,9 @@ impl FnLowerCtx<'_> {
                     }
                 } else {
                     let ty = match kind {
-                        BuiltinKind::FragCoord
-                        | BuiltinKind::Position
-                        | BuiltinKind::FragDepth => self.f32_ty(),
+                        BuiltinKind::FragCoord | BuiltinKind::Position | BuiltinKind::FragDepth => {
+                            self.f32_ty()
+                        }
                         BuiltinKind::FrontFacing => self.bool_ty(),
                         _ => self.u32_ty(),
                     };
@@ -5276,7 +5237,10 @@ impl FnLowerCtx<'_> {
                 let raw_dir = self.ensure_inst(dir);
                 let raw_tmax = self.ensure_inst(t_max);
                 if let Some(&rq_var) = self.ray_query_vars.get(&ray_query_id)
-                    && let Some(desc) = self.descriptors.get(tlas_descriptor_index as usize).cloned()
+                    && let Some(desc) = self
+                        .descriptors
+                        .get(tlas_descriptor_index as usize)
+                        .cloned()
                     && desc.kind == DescriptorKind::AccelerationStructure
                     && !desc.is_unsized
                 {
@@ -5350,10 +5314,8 @@ impl FnLowerCtx<'_> {
                     let f32_ty = self.f32_ty();
                     let t_ty = self.inst_types.get(&t_hit).copied().unwrap_or(f32_ty);
                     let t_f32 = self.coerce_to_ty(raw_t, t_ty, f32_ty);
-                    self.emitter.emit_fn_inst(
-                        spirv::Op::RayQueryGenerateIntersectionKHR,
-                        &[rq_var, t_f32],
-                    );
+                    self.emitter
+                        .emit_fn_inst(spirv::Op::RayQueryGenerateIntersectionKHR, &[rq_var, t_f32]);
                 }
                 (0, self.void_ty)
             }
@@ -5377,12 +5339,10 @@ impl FnLowerCtx<'_> {
                 spirv::Op::RayQueryGetIntersectionGeometryIndexKHR,
                 1,
             ),
-            InstData::RayQueryCommittedObjectToWorld(rq_id) => {
-                self.emit_ray_query_matrix(rq_id, spirv::Op::RayQueryGetIntersectionObjectToWorldKHR)
-            }
-            InstData::RayQueryCommittedWorldToObject(rq_id) => {
-                self.emit_ray_query_matrix(rq_id, spirv::Op::RayQueryGetIntersectionWorldToObjectKHR)
-            }
+            InstData::RayQueryCommittedObjectToWorld(rq_id) => self
+                .emit_ray_query_matrix(rq_id, spirv::Op::RayQueryGetIntersectionObjectToWorldKHR),
+            InstData::RayQueryCommittedWorldToObject(rq_id) => self
+                .emit_ray_query_matrix(rq_id, spirv::Op::RayQueryGetIntersectionWorldToObjectKHR),
             InstData::RayQueryCommittedFrontFace(rq_id) => {
                 let bool_ty = self.bool_ty();
                 if let Some(&rq_var) = self.ray_query_vars.get(&rq_id) {
@@ -5633,8 +5593,11 @@ impl FnLowerCtx<'_> {
         let raw = self.ensure_inst(val);
         let u32_ty = self.u32_ty();
         let val_ty = self.inst_types.get(&val).copied().unwrap_or(u32_ty);
-        let spv_op = match (kind, self.is_float_spv_ty(val_ty), self.is_signed_int_spv_ty(val_ty))
-        {
+        let spv_op = match (
+            kind,
+            self.is_float_spv_ty(val_ty),
+            self.is_signed_int_spv_ty(val_ty),
+        ) {
             (SubgroupArithKind::Add, true, _) => spirv::Op::GroupNonUniformFAdd,
             (SubgroupArithKind::Add, false, _) => spirv::Op::GroupNonUniformIAdd,
             (SubgroupArithKind::Min, true, _) => spirv::Op::GroupNonUniformFMin,
@@ -5695,20 +5658,12 @@ impl FnLowerCtx<'_> {
             )
             && raw_ptr_id != 0
         {
-            let elem_ty = self
-                .inst_pointee_types
-                .get(&ptr)
-                .copied()
-                .unwrap_or(val_ty);
+            let elem_ty = self.inst_pointee_types.get(&ptr).copied().unwrap_or(val_ty);
             return Some((raw_ptr_id, elem_ty, sc));
         }
 
         if self.workgroup_ptr_insts.contains(&ptr) && raw_ptr_id != 0 {
-            let elem_ty = self
-                .inst_pointee_types
-                .get(&ptr)
-                .copied()
-                .unwrap_or(u32_ty);
+            let elem_ty = self.inst_pointee_types.get(&ptr).copied().unwrap_or(u32_ty);
             return Some((raw_ptr_id, elem_ty, spirv::StorageClass::Workgroup));
         }
 
@@ -5800,8 +5755,10 @@ impl FnLowerCtx<'_> {
             .emitter
             .emit_constant_32(u32_ty, map_atomic_semantics_sc(order, sc));
         let res = self.emitter.alloc_id();
-        self.emitter
-            .emit_fn_inst(spv_op, &[elem_ty, res, ptr_id, scope_const, sem_const, val_id]);
+        self.emitter.emit_fn_inst(
+            spv_op,
+            &[elem_ty, res, ptr_id, scope_const, sem_const, val_id],
+        );
         (res, elem_ty)
     }
 
@@ -6420,8 +6377,13 @@ impl FnLowerCtx<'_> {
         let lhs_ty = self.inst_types.get(&a).copied().unwrap_or(f32_ty);
         let rhs_ty = self.inst_types.get(&b).copied().unwrap_or(f32_ty);
         let scalar_ty = if f16_cached.is_some_and(|f16| {
-            self.vector_component_info(lhs_ty).map_or(lhs_ty, |(c, _)| c) == f16
-                && self.vector_component_info(rhs_ty).map_or(rhs_ty, |(c, _)| c) == f16
+            self.vector_component_info(lhs_ty)
+                .map_or(lhs_ty, |(c, _)| c)
+                == f16
+                && self
+                    .vector_component_info(rhs_ty)
+                    .map_or(rhs_ty, |(c, _)| c)
+                    == f16
         }) {
             f16_cached.unwrap_or(f32_ty)
         } else {
@@ -7462,8 +7424,7 @@ mod tests {
             .is_ok_and(|out| out.status.success());
         let require_val = std::env::var("VSL_REQUIRE_SPIRV_VAL")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            || std::env::var("CI")
-                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            || std::env::var("CI").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         if !spirv_val_available {
             assert!(
                 !require_val,
@@ -9745,7 +9706,12 @@ mod tests {
                 lod: Some(lod0),
             },
         );
-        let lvls = func.emit(None, InstData::ImageQueryLevels { descriptor_index: 0 });
+        let lvls = func.emit(
+            None,
+            InstData::ImageQueryLevels {
+                descriptor_index: 0,
+            },
+        );
         let sum = func.emit(None, InstData::FAdd32(sampled, grad));
         let sum2 = func.emit(None, InstData::FAdd32(sum, gathered));
         let c0 = func.emit(None, InstData::ConstI32(0));
