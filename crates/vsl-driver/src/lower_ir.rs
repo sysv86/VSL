@@ -566,7 +566,6 @@ struct DescriptorElemBinding {
     items_field_index: u32,
     index_val: InstId,
     elem_desc: &'static BuiltinStructDesc,
-    header_size: u32,
 }
 
 struct LowerCtx<'a, 'd> {
@@ -2459,7 +2458,6 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     items_field_index: INSTANCE_META_SSBO_LAYOUT.field_index("items").unwrap_or(0),
                     index_val: idx_val,
                     elem_desc: &INSTANCE_META_LAYOUT,
-                    header_size: INSTANCE_META_SSBO_LAYOUT.total_size,
                 })
             }
             // `mc::lights.items[i]` or `mc::reservoirs.items[i]`
@@ -2483,7 +2481,6 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                             .unwrap_or(4),
                         index_val: idx_val,
                         elem_desc: &EMISSIVE_LIGHT_LAYOUT,
-                        header_size: EMISSIVE_LIGHT_SSBO_LAYOUT.total_size,
                     })
                 } else if path == "mc::reservoirs" || path == "reservoirs" {
                     let desc_idx = self.ir_fn.descriptors.iter().position(|d| {
@@ -2497,7 +2494,6 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                             .unwrap_or(4),
                         index_val: idx_val,
                         elem_desc: &RESTIR_RESERVOIR_LAYOUT,
-                        header_size: RESTIR_RESERVOIR_SSBO_LAYOUT.total_size,
                     })
                 } else {
                     None

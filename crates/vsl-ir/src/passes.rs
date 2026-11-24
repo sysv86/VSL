@@ -5950,10 +5950,10 @@ mod tests {
 
         Mem2RegPass.run(&mut func);
         ConstFoldPass.run(&mut func);
-        let StructuredStmt::Return(Some(ret_id)) = func.body.last().copied().unwrap() else {
+        let Some(StructuredStmt::Return(Some(ret_id))) = func.body.last() else {
             panic!("expected Return");
         };
-        assert_eq!(func.insts[ret_id].data, InstData::const_f32(7.0));
+        assert_eq!(func.insts[*ret_id].data, InstData::const_f32(7.0));
     }
 
     #[test]

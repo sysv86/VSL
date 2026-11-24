@@ -103,10 +103,11 @@ pub(crate) fn compile_hook_chain_sources(
                     .iter()
                     .map(|(_, f)| f)
                     .find(|f| f.hook == Some(stage))
-            });
+            })
+            .cloned();
 
         if let Some(hook_fn) = matched {
-            lowered_hooks.push((hir, hook_fn.clone(), parsed.unit.items));
+            lowered_hooks.push((hir, hook_fn, parsed.unit.items));
         } else {
             diagnostics.push(Diagnostic::error(
                 "E0511",
