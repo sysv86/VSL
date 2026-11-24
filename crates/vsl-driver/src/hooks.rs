@@ -2,7 +2,7 @@
 //! compositing (Item 23).
 
 use crate::cache::hash_pack_schema;
-use crate::lower_ir::{build_unified_descriptors, lower_entry_module_to_ir};
+use crate::lower_ir::{build_unified_descriptors, lower_hook_callee_to_ir};
 use indexmap::IndexMap;
 use smol_str::SmolStr;
 use vsl_diagnostics::{Diagnostic, SourceDatabase, Span};
@@ -222,26 +222,20 @@ pub(crate) fn build_hook_chain_unit(
     let mut seen_helper_names: indexmap::IndexSet<SmolStr> = indexmap::IndexSet::new();
 
     for (idx, (hir, hook_fn, items)) in lowered_hooks.iter().enumerate() {
-        let mut lowered = lower_entry_module_to_ir(
+        let (mut primary, helpers, hook_diags) = lower_hook_callee_to_ir(
             hir,
             hook_fn,
             items,
             options.pack_schema.as_ref(),
-            ShaderStage::Compute,
-            workgroup_size,
+            &unified_descriptors,
         );
-        diagnostics.extend(lowered.diagnostics);
+        diagnostics.extend(hook_diags);
         if diagnostics.iter().any(Diagnostic::is_error) {
             return None;
         }
-        let mut funcs = lowered.ir_module.functions.into_iter();
-        if let Some(mut primary) = funcs.next() {
-            primary.stage = None;
-            primary.workgroup_size = None;
-            primary.name = SmolStr::new(format!("{}_{idx}", hook_fn.name));
-            callee_fns.push(primary);
-        }
-        for helper in funcs {
+        primary.name = SmolStr::new(format!("{}_{idx}", hook_fn.name));
+        callee_fns.push(primary);
+        for helper in helpers {
             if seen_helper_names.insert(helper.name.clone()) {
                 helper_fns.push(helper);
             }
@@ -538,6 +532,36 @@ fn emit_default_ir_value(ir_fn: &mut IrFunction, ty: &IrType) -> InstId {
                     },
                 ),
             }
+        }
+        IrType::Matrix { scalar, cols, rows } => {
+            let col_ty = IrType::Vector {
+                scalar: *scalar,
+                len: *rows,
+            };
+            let col = emit_default_ir_value(ir_fn, &col_ty);
+            ir_fn.emit_typed(
+                ty.clone(),
+                InstData::CompositeConstruct {
+                    elems: vec![col; usize::from(*cols)],
+                },
+            )
+        }
+        IrType::Array { element, len } => {
+            let elem = emit_default_ir_value(ir_fn, element);
+            ir_fn.emit_typed(
+                ty.clone(),
+                InstData::CompositeConstruct {
+                    elems: vec![elem; *len as usize],
+                },
+            )
+        }
+        IrType::Struct(layout) => {
+            let elems: Vec<InstId> = layout
+                .fields
+                .iter()
+                .map(|f| emit_default_ir_value(ir_fn, &f.ty))
+                .collect();
+            ir_fn.emit_typed(ty.clone(), InstData::CompositeConstruct { elems })
         }
         _ => ir_fn.emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(0)),
     }

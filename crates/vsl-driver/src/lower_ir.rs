@@ -20,7 +20,7 @@ use vsl_ir::{
     MemoryAccess, ScalarIrTy, StructuredStmt,
 };
 use vsl_mc::{
-    BuiltinFieldDesc, BuiltinStructDesc, DESCRIPTOR_SET_PACK_RESOURCES,
+    BuiltinStructDesc, DESCRIPTOR_SET_PACK_RESOURCES,
     DESCRIPTOR_SET_PER_PASS, DESCRIPTOR_SET_SCENE_GLOBALS, DescriptorAccess, DescriptorBinding,
     DescriptorKind, EMISSIVE_LIGHT_LAYOUT, EMISSIVE_LIGHT_SSBO_LAYOUT, INSTANCE_META_LAYOUT,
     INSTANCE_META_SSBO_LAYOUT, ImageFormat, PackParamLayout, PackParamType,
@@ -146,6 +146,50 @@ fn descriptor_binding_to_ir(d: &DescriptorBinding) -> IrDescriptorVar {
         count: d.count,
         struct_layout,
     }
+}
+
+/// Lowers a single `@hook` function as a callable non-entry `IrFunction` bound against
+/// the chain's unified descriptor table so `OpReturnValue` and descriptor indices match.
+pub(crate) fn lower_hook_callee_to_ir(
+    hir: &HirModule,
+    func: &HirFunction,
+    module_items: &[Item],
+    pack_schema: Option<&PackSchema>,
+    unified_descriptors: &[DescriptorBinding],
+) -> (IrFunction, Vec<IrFunction>, Vec<Diagnostic>) {
+    let mut diagnostics = Vec::new();
+    let primary = lower_single_function(
+        hir,
+        func,
+        module_items,
+        pack_schema,
+        unified_descriptors,
+        None,
+        None,
+        &mut diagnostics,
+    );
+    let mut helpers = Vec::new();
+    for (_, helper) in hir.functions.iter() {
+        if helper.name == func.name
+            || helper.stage.is_some()
+            || helper.hook.is_some()
+            || !helper.generic_params.is_empty()
+            || helper.body_hir.is_none()
+        {
+            continue;
+        }
+        helpers.push(lower_single_function(
+            hir,
+            helper,
+            module_items,
+            pack_schema,
+            unified_descriptors,
+            None,
+            None,
+            &mut diagnostics,
+        ));
+    }
+    (primary, helpers, diagnostics)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -537,6 +581,7 @@ struct LowerCtx<'a, 'd> {
     ssa_locals: IndexMap<SmolStr, InstId>,
     /// Mutable or composite locals backed by `IrLocalVar` (`name -> (local_index, IrType)`).
     local_var_slots: IndexMap<SmolStr, (u32, IrType)>,
+    ptr_param_locals: IndexMap<SmolStr, (InstId, IrType)>,
     /// Descriptor element bindings (`let inst = mc::instances[i]`).
     desc_elem_bindings: IndexMap<SmolStr, DescriptorElemBinding>,
     /// BDA pointer stride and alignment metadata (`name -> (stride_bytes, align)`).
@@ -572,6 +617,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         let mut entry_preamble = Vec::new();
         let mut ssa_locals = IndexMap::new();
         let mut local_var_slots = IndexMap::new();
+        let mut ptr_param_locals = IndexMap::new();
         let mut ptr_meta = IndexMap::new();
         let mut descriptor_indices = IndexMap::new();
         let mut storage_image_descriptors = IndexMap::new();
@@ -681,8 +727,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             let ir_ty = param
                 .ty
                 .map_or(IrType::Void, |id| IrType::from_hir_type(&hir.types, id));
-            let is_inout = matches!(param.mode, ParamMode::InOut | ParamMode::Mut);
-            let is_out = matches!(param.mode, ParamMode::Out);
+            let is_inout = stage.is_none() && matches!(param.mode, ParamMode::InOut);
+            let is_out = stage.is_none() && matches!(param.mode, ParamMode::Out);
+            let is_mut_local = matches!(param.mode, ParamMode::Mut);
             let p_idx = ir_fn.params.len() as u32;
             ir_fn.params.push(IrParam {
                 name: param.name.clone(),
@@ -690,21 +737,31 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 is_inout,
                 is_out,
             });
-            let param_val = ir_fn.emit_typed(ir_ty.clone(), InstData::Param { index: p_idx });
-            if is_inout || is_out || is_composite_ir_type(&ir_ty) {
-                let slot = alloc_local_var(ir_fn, param.name.clone(), ir_ty.clone());
-                let addr = emit_local_addr(ir_fn, slot, &ir_ty);
-                let store = ir_fn.emit_typed(
-                    IrType::Void,
-                    InstData::LocalStore {
-                        ptr: addr,
-                        value: param_val,
-                    },
-                );
-                entry_preamble.push(StructuredStmt::Eval(store));
-                local_var_slots.insert(param.name.clone(), (slot, ir_ty));
+            if is_inout || is_out {
+                let ptr_ty = IrType::Pointer {
+                    pointee: Box::new(ir_ty.clone()),
+                    align: 4,
+                    storage: IrStorageClass::Function,
+                };
+                let param_ptr = ir_fn.emit_typed(ptr_ty, InstData::Param { index: p_idx });
+                ptr_param_locals.insert(param.name.clone(), (param_ptr, ir_ty));
             } else {
-                ssa_locals.insert(param.name.clone(), param_val);
+                let param_val = ir_fn.emit_typed(ir_ty.clone(), InstData::Param { index: p_idx });
+                if is_mut_local || is_composite_ir_type(&ir_ty) {
+                    let slot = alloc_local_var(ir_fn, param.name.clone(), ir_ty.clone());
+                    let addr = emit_local_addr(ir_fn, slot, &ir_ty);
+                    let store = ir_fn.emit_typed(
+                        IrType::Void,
+                        InstData::LocalStore {
+                            ptr: addr,
+                            value: param_val,
+                        },
+                    );
+                    entry_preamble.push(StructuredStmt::Eval(store));
+                    local_var_slots.insert(param.name.clone(), (slot, ir_ty));
+                } else {
+                    ssa_locals.insert(param.name.clone(), param_val);
+                }
             }
         }
 
@@ -792,6 +849,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             entry_preamble,
             ssa_locals,
             local_var_slots,
+            ptr_param_locals,
             desc_elem_bindings: IndexMap::new(),
             ptr_meta,
             descriptor_indices,
@@ -1584,6 +1642,11 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         out: &mut Vec<StructuredStmt>,
     ) -> InstId {
         if !path.contains("::") {
+            if let Some(&(ptr, ref ty)) = self.ptr_param_locals.get(path) {
+                return self
+                    .ir_fn
+                    .emit_typed(ty.clone(), InstData::LocalLoad { ptr });
+            }
             if let Some(&(slot, ref ty)) = self.local_var_slots.get(path) {
                 let ty_cloned = ty.clone();
                 let addr = emit_local_addr(self.ir_fn, slot, &ty_cloned);
@@ -1725,6 +1788,11 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     }
                 }
                 HirExprKind::Path { path, .. }
+                    if !path.contains("::") && self.ptr_param_locals.contains_key(path) =>
+                {
+                    return self.ptr_param_locals[path].0;
+                }
+                HirExprKind::Path { path, .. }
                     if !path.contains("::") && self.local_var_slots.contains_key(path) =>
                 {
                     let (slot, ty) = self.local_var_slots[path].clone();
@@ -1810,6 +1878,17 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     out.push(StructuredStmt::Eval(store));
                     return final_val;
                 }
+                if let Some(&(ptr, _)) = self.ptr_param_locals.get(path) {
+                    let store = self.ir_fn.emit_typed(
+                        IrType::Void,
+                        InstData::LocalStore {
+                            ptr,
+                            value: final_val,
+                        },
+                    );
+                    out.push(StructuredStmt::Eval(store));
+                    return final_val;
+                }
                 if let Some(&(slot, ref ty)) = self.local_var_slots.get(path) {
                     let ty_cloned = ty.clone();
                     let addr = emit_local_addr(self.ir_fn, slot, &ty_cloned);
@@ -1876,7 +1955,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                             IrType::Scalar(ScalarIrTy::U32),
                             InstData::ConstU32(0),
                         );
-                        let _ptr = self.ir_fn.emit_typed(
+                        let ptr = self.ir_fn.emit_typed(
                             IrType::Pointer {
                                 pointee: Box::new(lhs_ir_ty.clone()),
                                 align: 4,
@@ -1977,6 +2056,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
     ) -> Option<(InstId, IrType)> {
         match &expr.kind {
             HirExprKind::Path { path, .. } if !path.contains("::") => {
+                if let Some((ptr, ty)) = self.ptr_param_locals.get(path).cloned() {
+                    return Some((ptr, ty));
+                }
                 let (slot, ty) = self.local_var_slots.get(path)?.clone();
                 let addr = emit_local_addr(self.ir_fn, slot, &ty);
                 Some((addr, ty))
@@ -2340,7 +2422,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         let idx_const = self
             .ir_fn
             .emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(field_idx));
-        let _chain = self.ir_fn.emit_typed(
+        let chain = self.ir_fn.emit_typed(
             IrType::Pointer {
                 pointee: Box::new(field_ir_ty.clone()),
                 align: 4,
@@ -2351,96 +2433,8 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 indices: vec![idx_const],
             },
         );
-        self.emit_descriptor_value_load(descriptor_index, field_desc, &field_ir_ty)
-    }
-
-    fn emit_descriptor_value_load(
-        &mut self,
-        descriptor_index: u32,
-        field_desc: &BuiltinFieldDesc,
-        field_ir_ty: &IrType,
-    ) -> InstId {
-        let base_word = field_desc.byte_offset / 4;
-        match field_ir_ty {
-            IrType::Scalar(scalar) => self.ir_fn.emit_typed(
-                IrType::Scalar(*scalar),
-                InstData::DescriptorLoad {
-                    descriptor_index,
-                    word_index: base_word,
-                    scalar: *scalar,
-                },
-            ),
-            IrType::Vector { scalar, len } => {
-                let mut lanes = Vec::with_capacity(usize::from(*len));
-                for c in 0..u32::from(*len) {
-                    lanes.push(self.ir_fn.emit_typed(
-                        IrType::Scalar(*scalar),
-                        InstData::DescriptorLoad {
-                            descriptor_index,
-                            word_index: base_word + c,
-                            scalar: *scalar,
-                        },
-                    ));
-                }
-                match lanes.as_slice() {
-                    [x, y] => self
-                        .ir_fn
-                        .emit_typed(field_ir_ty.clone(), InstData::MakeVec2(*x, *y)),
-                    [x, y, z] => self
-                        .ir_fn
-                        .emit_typed(field_ir_ty.clone(), InstData::MakeVec3(*x, *y, *z)),
-                    [x, y, z, w] => self
-                        .ir_fn
-                        .emit_typed(field_ir_ty.clone(), InstData::MakeVec4(*x, *y, *z, *w)),
-                    _ => self.ir_fn.emit_typed(
-                        field_ir_ty.clone(),
-                        InstData::CompositeConstruct { elems: lanes },
-                    ),
-                }
-            }
-            IrType::Matrix { scalar, cols, rows } => {
-                let col_ty = IrType::Vector {
-                    scalar: *scalar,
-                    len: *rows,
-                };
-                let mut col_vals = Vec::with_capacity(usize::from(*cols));
-                for c in 0..u32::from(*cols) {
-                    let mut elems = Vec::with_capacity(usize::from(*rows));
-                    for r in 0..u32::from(*rows) {
-                        elems.push(self.ir_fn.emit_typed(
-                            IrType::Scalar(*scalar),
-                            InstData::DescriptorLoad {
-                                descriptor_index,
-                                word_index: base_word + c * u32::from(*rows) + r,
-                                scalar: *scalar,
-                            },
-                        ));
-                    }
-                    let col = match elems.as_slice() {
-                        [x, y, z, w] => self
-                            .ir_fn
-                            .emit_typed(col_ty.clone(), InstData::MakeVec4(*x, *y, *z, *w)),
-                        _ => self.ir_fn.emit_typed(
-                            col_ty.clone(),
-                            InstData::CompositeConstruct { elems },
-                        ),
-                    };
-                    col_vals.push(col);
-                }
-                self.ir_fn.emit_typed(
-                    field_ir_ty.clone(),
-                    InstData::CompositeConstruct { elems: col_vals },
-                )
-            }
-            _ => self.ir_fn.emit_typed(
-                field_ir_ty.clone(),
-                InstData::DescriptorLoad {
-                    descriptor_index,
-                    word_index: base_word,
-                    scalar: ScalarIrTy::U32,
-                },
-            ),
-        }
+        self.ir_fn
+            .emit_typed(field_ir_ty, InstData::ResourceLoad { ptr: chain })
     }
 
     fn try_lower_descriptor_elem_index(
@@ -2540,7 +2534,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             IrType::Scalar(ScalarIrTy::U32),
             InstData::ConstU32(elem_field_idx),
         );
-        let _chain = self.ir_fn.emit_typed(
+        let chain = self.ir_fn.emit_typed(
             IrType::Pointer {
                 pointee: Box::new(field_ir_ty.clone()),
                 align: 4,
@@ -2551,13 +2545,8 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 indices: vec![items_idx_const, binding.index_val, field_idx_const],
             },
         );
-        let shifted_desc = BuiltinFieldDesc {
-            name: field_desc.name,
-            byte_offset: binding.header_size + field_desc.byte_offset,
-            byte_size: field_desc.byte_size,
-            ty: field_desc.ty,
-        };
-        self.emit_descriptor_value_load(binding.descriptor_index, &shifted_desc, &field_ir_ty)
+        self.ir_fn
+            .emit_typed(field_ir_ty, InstData::ResourceLoad { ptr: chain })
     }
 
     fn lower_field_expr(
@@ -2799,15 +2788,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         indices: vec![zero, idx_val],
                     },
                 );
-                let scalar = expr_ir_ty.scalar_ty().unwrap_or(ScalarIrTy::F32);
-                return self.ir_fn.emit_typed(
-                    expr_ir_ty.clone(),
-                    InstData::DescriptorLoad {
-                        descriptor_index: desc_idx,
-                        word_index: 0,
-                        scalar,
-                    },
-                );
+                return self
+                    .ir_fn
+                    .emit_typed(expr_ir_ty.clone(), InstData::ResourceLoad { ptr });
             }
         }
 
@@ -2890,10 +2873,39 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         if let Some(fn_id) = resolved_fn
             && let Some(callee_name) = self.fn_names_by_id.get(&fn_id).cloned()
         {
-            let lowered_args: Vec<InstId> = args
+            let param_modes: Vec<ParamMode> = self.hir.functions[fn_id]
+                .params
                 .iter()
-                .map(|a| self.lower_expr(&a.value, out))
+                .map(|p| p.mode)
                 .collect();
+            let mut lowered_args = Vec::with_capacity(args.len());
+            for (idx, a) in args.iter().enumerate() {
+                let is_ptr_arg = matches!(
+                    param_modes.get(idx).copied(),
+                    Some(ParamMode::InOut | ParamMode::Out)
+                );
+                if is_ptr_arg {
+                    if let Some((ptr, _)) = self.try_lower_local_lvalue_ptr(&a.value, out) {
+                        lowered_args.push(ptr);
+                    } else {
+                        let val = self.lower_expr(&a.value, out);
+                        let val_ty = self.inst_ty(val).clone();
+                        let tmp = alloc_local_var(
+                            self.ir_fn,
+                            SmolStr::new(format!("__inout_tmp_{idx}")),
+                            val_ty.clone(),
+                        );
+                        let addr = emit_local_addr(self.ir_fn, tmp, &val_ty);
+                        let store = self
+                            .ir_fn
+                            .emit_typed(IrType::Void, InstData::LocalStore { ptr: addr, value: val });
+                        out.push(StructuredStmt::Eval(store));
+                        lowered_args.push(addr);
+                    }
+                } else {
+                    lowered_args.push(self.lower_expr(&a.value, out));
+                }
+            }
             let id = self.ir_fn.emit_typed(
                 expr_ir_ty.clone(),
                 InstData::FunctionCall {
@@ -3839,6 +3851,10 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
     /// `WorldUBO::inv_screen_size`.
     fn coord_to_uv(&mut self, coord: InstId, world_desc: u32, span: Span) -> InstId {
         let f32_ty = IrType::Scalar(ScalarIrTy::F32);
+        let vec2_ty = IrType::Vector {
+            scalar: ScalarIrTy::F32,
+            len: 2,
+        };
         let coord_scalar = self.inst_ty(coord).scalar_ty().unwrap_or(ScalarIrTy::I32);
         let cx = self.ir_fn.emit_typed(
             IrType::Scalar(coord_scalar),
@@ -4241,11 +4257,63 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         if let Some(fn_id) = resolved_fn
             && let Some(callee_name) = self.fn_names_by_id.get(&fn_id).cloned()
         {
-            let recv_val = self.lower_expr(receiver, out);
+            let param_modes: Vec<ParamMode> = self.hir.functions[fn_id]
+                .params
+                .iter()
+                .map(|p| p.mode)
+                .collect();
             let mut lowered_args = Vec::with_capacity(1 + args.len());
-            lowered_args.push(recv_val);
-            for arg in args {
-                lowered_args.push(self.lower_expr(&arg.value, out));
+            let self_is_ptr = matches!(
+                param_modes.first().copied(),
+                Some(ParamMode::InOut | ParamMode::Out)
+            );
+            if self_is_ptr {
+                if let Some((ptr, _)) = self.try_lower_local_lvalue_ptr(receiver, out) {
+                    lowered_args.push(ptr);
+                } else {
+                    let val = self.lower_expr(receiver, out);
+                    let val_ty = self.inst_ty(val).clone();
+                    let tmp = alloc_local_var(
+                        self.ir_fn,
+                        SmolStr::new_static("__self_inout_tmp"),
+                        val_ty.clone(),
+                    );
+                    let addr = emit_local_addr(self.ir_fn, tmp, &val_ty);
+                    let store = self
+                        .ir_fn
+                        .emit_typed(IrType::Void, InstData::LocalStore { ptr: addr, value: val });
+                    out.push(StructuredStmt::Eval(store));
+                    lowered_args.push(addr);
+                }
+            } else {
+                lowered_args.push(self.lower_expr(receiver, out));
+            }
+            for (idx, arg) in args.iter().enumerate() {
+                let is_ptr_arg = matches!(
+                    param_modes.get(idx + 1).copied(),
+                    Some(ParamMode::InOut | ParamMode::Out)
+                );
+                if is_ptr_arg {
+                    if let Some((ptr, _)) = self.try_lower_local_lvalue_ptr(&arg.value, out) {
+                        lowered_args.push(ptr);
+                    } else {
+                        let val = self.lower_expr(&arg.value, out);
+                        let val_ty = self.inst_ty(val).clone();
+                        let tmp = alloc_local_var(
+                            self.ir_fn,
+                            SmolStr::new(format!("__method_inout_tmp_{idx}")),
+                            val_ty.clone(),
+                        );
+                        let addr = emit_local_addr(self.ir_fn, tmp, &val_ty);
+                        let store = self
+                            .ir_fn
+                            .emit_typed(IrType::Void, InstData::LocalStore { ptr: addr, value: val });
+                        out.push(StructuredStmt::Eval(store));
+                        lowered_args.push(addr);
+                    }
+                } else {
+                    lowered_args.push(self.lower_expr(&arg.value, out));
+                }
             }
             let id = self.ir_fn.emit_typed(
                 expr_ir_ty.clone(),
