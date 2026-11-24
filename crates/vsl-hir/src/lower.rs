@@ -2,8 +2,9 @@
 //! legality validation, and Hyaloclast 4-set Vulkan ABI reflection computation.
 
 use crate::hir::{
-    EntryReflection, HirFunction, HirModule, HirParam, HirStruct, HirStructField, HirStructId,
-    HirWorkgroupVar,
+    EntryReflection, HirBlock, HirCallArg, HirConst, HirExpr, HirExprKind, HirFnId, HirFunction,
+    HirImpl, HirModule, HirParam, HirStmt, HirStruct, HirStructField, HirStructId, HirSwitchCase,
+    HirTrait, HirTraitMethod, HirWorkgroupVar, SymbolId, SymbolKind,
 };
 use crate::ty::{LayoutKind, ScalarKind, Type, TypeArena, TypeId};
 use indexmap::{IndexMap, IndexSet};
@@ -11,14 +12,18 @@ use la_arena::Arena;
 use smol_str::SmolStr;
 use vsl_diagnostics::{Diagnostic, DiagnosticBag, Span};
 use vsl_mc::{
-    BINDLESS_IMAGE_COUNT, DESCRIPTOR_SET_BINDLESS, DESCRIPTOR_SET_PACK_RESOURCES,
-    DESCRIPTOR_SET_PER_PASS, DESCRIPTOR_SET_SCENE_GLOBALS, DebugChannelBinding, DescriptorAccess,
-    DescriptorBinding, DescriptorKind, HardwareCaps, HookStage, ImageFormat,
-    MAX_PUSH_CONSTANT_BYTES, PACK_RESOURCE_SLOTS, PackParamBinding, PushConstantField, RenderTier,
-    SampleScalar, ShaderStage, SpecConstantUsage, TextureDim,
+    BINDLESS_IMAGE_COUNT, BuiltinFieldType, BuiltinStructDesc, DESCRIPTOR_SET_BINDLESS,
+    DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS, DESCRIPTOR_SET_SCENE_GLOBALS,
+    DebugChannelBinding, DescriptorAccess, DescriptorBinding, DescriptorKind,
+    EMISSIVE_LIGHT_LAYOUT, EMISSIVE_LIGHT_SSBO_LAYOUT, HardwareCaps, HookStage,
+    INSTANCE_META_LAYOUT, INSTANCE_META_SSBO_LAYOUT, ImageFormat, MAX_PUSH_CONSTANT_BYTES,
+    PACK_RESOURCE_SLOTS, PackParamBinding, PackParamType, PushConstantField,
+    RESTIR_RESERVOIR_LAYOUT, RESTIR_RESERVOIR_SSBO_LAYOUT, RenderTier, SHARC_CONFIG_UBO_LAYOUT,
+    SampleScalar, ShaderStage, SpecConstantDefault, SpecConstantUsage, TextureDim,
+    WORLD_UBO_LAYOUT,
 };
 use vsl_syntax::ast::{
-    Attribute, BinaryOp, Block, Expr, FnDecl, GenericParam, ImportTree, Item, ParamMode,
+    Attribute, BinaryOp, Block, CallArg, Expr, FnDecl, GenericParam, ImportTree, Item, ParamMode,
     SourceUnit, Stmt, StructDecl, TypeArg, TypeExpr, UnaryOp,
 };
 
@@ -28,13 +33,15 @@ const MAX_PER_PASS_BINDING: u32 = 14;
 /// Maximum valid rendering tier index (`Tier3PathTracing = 3`).
 const MAX_TIER: u8 = 3;
 
-const FLAG_WORLD: u8 = 1 << 0;
-const FLAG_TLAS: u8 = 1 << 1;
-const FLAG_INSTANCES: u8 = 1 << 2;
-const FLAG_LIGHTS: u8 = 1 << 3;
-const FLAG_BINDLESS: u8 = 1 << 4;
-const FLAG_BDA: u8 = 1 << 5;
-const FLAG_SUBGROUPS: u8 = 1 << 6;
+const FLAG_WORLD: u16 = 1 << 0;
+const FLAG_TLAS: u16 = 1 << 1;
+const FLAG_INSTANCES: u16 = 1 << 2;
+const FLAG_LIGHTS: u16 = 1 << 3;
+const FLAG_BINDLESS: u16 = 1 << 4;
+const FLAG_BDA: u16 = 1 << 5;
+const FLAG_SUBGROUPS: u16 = 1 << 6;
+const FLAG_SHARC: u16 = 1 << 7;
+const FLAG_RESERVOIRS: u16 = 1 << 8;
 
 /// Pack-wide parameter layout, specialization-constant IDs, and Set 3 resource slot table
 /// supplied by `pack.vsl`.
@@ -42,10 +49,109 @@ const FLAG_SUBGROUPS: u8 = 1 << 6;
 pub struct PackSchema {
     /// Maps pack parameter name -> `(byte_offset, byte_size)` in `PackParamBuffer`.
     pub params: IndexMap<SmolStr, (u32, u32)>,
+    /// Maps pack parameter name -> concrete shader value type.
+    pub param_types: IndexMap<SmolStr, PackParamType>,
     /// Maps specialization constant name -> pack-global Vulkan `SpecId`.
     pub spec_ids: IndexMap<SmolStr, u32>,
+    /// Maps specialization constant name -> typed specialization default metadata.
+    pub spec_defaults: IndexMap<SmolStr, SpecConstantDefault>,
     /// Maps Set 3 pack resource texture name -> pack-global Set 3 binding slot (`0..=15`).
     pub resource_slots: IndexMap<SmolStr, u32>,
+}
+
+fn builtin_field_type_to_id(
+    field_ty: BuiltinFieldType,
+    types: &mut TypeArena,
+    builtin_structs: &IndexMap<SmolStr, TypeId>,
+) -> TypeId {
+    let ty = match field_ty {
+        BuiltinFieldType::Bool => Type::Scalar(ScalarKind::Bool),
+        BuiltinFieldType::I32 => Type::Scalar(ScalarKind::I32),
+        BuiltinFieldType::U32 => Type::Scalar(ScalarKind::U32),
+        BuiltinFieldType::I64 => Type::Scalar(ScalarKind::I64),
+        BuiltinFieldType::U64 => Type::Scalar(ScalarKind::U64),
+        BuiltinFieldType::F32 => Type::Scalar(ScalarKind::F32),
+        BuiltinFieldType::Vec2 => Type::Vector {
+            scalar: ScalarKind::F32,
+            len: 2,
+        },
+        BuiltinFieldType::Vec3 => Type::Vector {
+            scalar: ScalarKind::F32,
+            len: 3,
+        },
+        BuiltinFieldType::Vec4 => Type::Vector {
+            scalar: ScalarKind::F32,
+            len: 4,
+        },
+        BuiltinFieldType::UVec2 => Type::Vector {
+            scalar: ScalarKind::U32,
+            len: 2,
+        },
+        BuiltinFieldType::UVec3 => Type::Vector {
+            scalar: ScalarKind::U32,
+            len: 3,
+        },
+        BuiltinFieldType::UVec4 => Type::Vector {
+            scalar: ScalarKind::U32,
+            len: 4,
+        },
+        BuiltinFieldType::Mat4 => Type::Matrix {
+            scalar: ScalarKind::F32,
+            cols: 4,
+            rows: 4,
+        },
+        BuiltinFieldType::RuntimeArrayStruct(elem_name) => {
+            let element = builtin_structs
+                .get(elem_name)
+                .copied()
+                .unwrap_or_else(|| types.alloc(Type::Void));
+            Type::Buffer { element }
+        }
+    };
+    types.alloc(ty)
+}
+
+fn register_builtin_mc_structs(types: &mut TypeArena) -> IndexMap<SmolStr, TypeId> {
+    const LAYOUTS: &[(&BuiltinStructDesc, LayoutKind)] = &[
+        (&WORLD_UBO_LAYOUT, LayoutKind::Std140),
+        (&INSTANCE_META_LAYOUT, LayoutKind::Std430),
+        (&INSTANCE_META_SSBO_LAYOUT, LayoutKind::Std430),
+        (&SHARC_CONFIG_UBO_LAYOUT, LayoutKind::Std140),
+        (&EMISSIVE_LIGHT_LAYOUT, LayoutKind::Std430),
+        (&EMISSIVE_LIGHT_SSBO_LAYOUT, LayoutKind::Std430),
+        (&RESTIR_RESERVOIR_LAYOUT, LayoutKind::Std430),
+        (&RESTIR_RESERVOIR_SSBO_LAYOUT, LayoutKind::Std430),
+    ];
+
+    let mut map = IndexMap::with_capacity(LAYOUTS.len());
+    for &(desc, layout_kind) in LAYOUTS {
+        let mut fields = Vec::with_capacity(desc.fields.len());
+        for field in desc.fields {
+            let field_ty = builtin_field_type_to_id(field.ty, types, &map);
+            fields.push((SmolStr::new_static(field.name), field_ty));
+        }
+        let ty_id = types.alloc(Type::Struct {
+            name: SmolStr::new_static(desc.name),
+            layout: layout_kind,
+            fields,
+        });
+        map.insert(SmolStr::new_static(desc.name), ty_id);
+    }
+    map
+}
+
+fn pack_param_type_to_id(param_ty: PackParamType, types: &mut TypeArena) -> TypeId {
+    let ty = match param_ty {
+        PackParamType::Bool => Type::Scalar(ScalarKind::Bool),
+        PackParamType::I32 | PackParamType::Enum => Type::Scalar(ScalarKind::I32),
+        PackParamType::U32 => Type::Scalar(ScalarKind::U32),
+        PackParamType::F32 => Type::Scalar(ScalarKind::F32),
+        PackParamType::Vec3 => Type::Vector {
+            scalar: ScalarKind::F32,
+            len: 3,
+        },
+    };
+    types.alloc(ty)
 }
 
 /// Lowers a parsed [`SourceUnit`] into an arena-backed [`HirModule`] for a target
@@ -117,6 +223,9 @@ fn lower_unit_internal(
     let mut diags = DiagnosticBag::new();
 
     let mc_imports = collect_mc_imports(unit);
+    let builtin_struct_types = register_builtin_mc_structs(&mut module.types);
+    let mut struct_generic_args: IndexMap<SmolStr, (SmolStr, Vec<TypeId>)> = IndexMap::new();
+    let empty_subst: IndexMap<SmolStr, TypeId> = IndexMap::new();
 
     // Pass 0: Collect declared traits so generic bounds and `impl Trait for Type` can be validated.
     let mut trait_names: IndexSet<SmolStr> = IndexSet::new();
@@ -272,8 +381,14 @@ fn lower_unit_internal(
                 pending.direct_f16_fields.insert(field.name.name.clone());
             }
 
-            let mut type_ctx = TypeLowerCtx::types_only(&mut module.types, &mut struct_types);
-            if let Some(ty_id) = lower_type_expr(&field.ty, &mut type_ctx, &generic_names) {
+            let mut type_ctx = TypeLowerCtx::types_only(
+                &mut module.types,
+                &mut struct_types,
+                &builtin_struct_types,
+            );
+            if let Some(ty_id) =
+                lower_type_expr(&field.ty, &mut type_ctx, &generic_names, &empty_subst)
+            {
                 pending.hir_fields.push(HirStructField {
                     name: field.name.name.clone(),
                     ty: ty_id,
@@ -336,8 +451,12 @@ fn lower_unit_internal(
                 &mut module.structs,
                 &mut struct_types,
                 &mut struct_ids,
+                &builtin_struct_types,
+                &mut struct_generic_args,
             );
-            if let Some(ty_id) = lower_type_expr(&field.ty, &mut type_ctx, &generic_names) {
+            if let Some(ty_id) =
+                lower_type_expr(&field.ty, &mut type_ctx, &generic_names, &empty_subst)
+            {
                 if let Some(hir_field) = pending
                     .hir_fields
                     .iter_mut()
@@ -494,8 +613,11 @@ fn lower_unit_internal(
 
     // Pass 4: Lower module constants and workgroup variables before lowering functions.
     let empty_generics: IndexSet<SmolStr> = IndexSet::new();
+    let empty_bounds: IndexMap<SmolStr, SmolStr> = IndexMap::new();
     let mut const_types: IndexMap<SmolStr, TypeId> = IndexMap::new();
+    let mut const_symbols: IndexMap<SmolStr, SymbolId> = IndexMap::new();
     let mut workgroup_var_types: IndexMap<SmolStr, TypeId> = IndexMap::new();
+    let mut workgroup_var_symbols: IndexMap<SmolStr, SymbolId> = IndexMap::new();
 
     for item in &unit.items {
         match item {
@@ -505,9 +627,21 @@ fn lower_unit_internal(
                     &mut module.structs,
                     &mut struct_types,
                     &mut struct_ids,
+                    &builtin_struct_types,
+                    &mut struct_generic_args,
                 );
-                if let Some(ty_id) = lower_type_expr(&decl.ty, &mut type_ctx, &empty_generics) {
+                if let Some(ty_id) =
+                    lower_type_expr(&decl.ty, &mut type_ctx, &empty_generics, &empty_subst)
+                {
+                    let sym_id = module.alloc_symbol(
+                        decl.name.name.clone(),
+                        SymbolKind::Const,
+                        ty_id,
+                        false,
+                        decl.span,
+                    );
                     const_types.insert(decl.name.name.clone(), ty_id);
+                    const_symbols.insert(decl.name.name.clone(), sym_id);
                 }
             }
             Item::WorkgroupVar(var) => {
@@ -537,8 +671,10 @@ fn lower_unit_internal(
                         &mut module.structs,
                         &mut struct_types,
                         &mut struct_ids,
+                        &builtin_struct_types,
+                        &mut struct_generic_args,
                     );
-                    lower_type_expr(&var.ty, &mut type_ctx, &empty_generics)
+                    lower_type_expr(&var.ty, &mut type_ctx, &empty_generics, &empty_subst)
                 }
                 .unwrap_or_else(|| module.types.alloc(Type::Void));
 
@@ -573,7 +709,15 @@ fn lower_unit_internal(
                     );
                 }
 
+                let sym_id = module.alloc_symbol(
+                    var.name.name.clone(),
+                    SymbolKind::WorkgroupVar,
+                    ty,
+                    true,
+                    var.span,
+                );
                 workgroup_var_types.insert(var.name.name.clone(), ty);
+                workgroup_var_symbols.insert(var.name.name.clone(), sym_id);
                 module.workgroup_vars.push(HirWorkgroupVar {
                     name: var.name.name.clone(),
                     ty,
@@ -597,32 +741,137 @@ fn lower_unit_internal(
         })
         .unwrap_or(0);
 
-    // Pass 4.5: Pre-collect declared return types for all module functions and `impl` methods
-    // so call-site type inference (such as `atomic_add(get_u64_ptr(), 1u64)`) resolves regardless
-    // of declaration order.
+    // Pass 4.5: Pre-collect declared signatures, return types, and generic templates for all
+    // module functions, traits, and `impl` blocks so call-site typechecking and monomorphization
+    // resolve regardless of declaration order.
     let mut fn_return_types: IndexMap<SmolStr, TypeId> = IndexMap::new();
+    let mut fn_sigs: IndexMap<SmolStr, FnSig> = IndexMap::new();
+    let mut trait_method_sigs: IndexMap<SmolStr, IndexMap<SmolStr, FnSig>> = IndexMap::new();
+    let mut generic_fn_templates: IndexMap<SmolStr, GenericFnTemplate> = IndexMap::new();
+    let mut generic_impl_templates: Vec<GenericImplTemplate> = Vec::new();
+
     for item in &unit.items {
         match item {
+            Item::Trait(decl) => {
+                let mut methods_map = IndexMap::new();
+                for method in &decl.methods {
+                    let method_generics: IndexSet<SmolStr> =
+                        method.generics.iter().map(|g| g.name.name.clone()).collect();
+                    let mut sig_params = Vec::with_capacity(method.params.len());
+                    for param in &method.params {
+                        let ty = param.ty.as_ref().and_then(|ty_expr| {
+                            let mut type_ctx = TypeLowerCtx::full(
+                                &mut module.types,
+                                &mut module.structs,
+                                &mut struct_types,
+                                &mut struct_ids,
+                                &builtin_struct_types,
+                                &mut struct_generic_args,
+                            );
+                            lower_type_expr(ty_expr, &mut type_ctx, &method_generics, &empty_subst)
+                        });
+                        sig_params.push((param.name.name.clone(), param.mode, ty));
+                    }
+                    let ret_ty = method.return_ty.as_ref().and_then(|ty_expr| {
+                        let mut type_ctx = TypeLowerCtx::full(
+                            &mut module.types,
+                            &mut module.structs,
+                            &mut struct_types,
+                            &mut struct_ids,
+                            &builtin_struct_types,
+                            &mut struct_generic_args,
+                        );
+                        lower_type_expr(ty_expr, &mut type_ctx, &method_generics, &empty_subst)
+                    });
+                    methods_map.insert(
+                        method.name.name.clone(),
+                        FnSig {
+                            params: sig_params,
+                            return_ty: ret_ty,
+                            fn_id: None,
+                        },
+                    );
+                }
+                trait_method_sigs.insert(decl.name.name.clone(), methods_map);
+            }
             Item::Function(func) => {
-                if let Some(ref ret_ty) = func.return_ty {
-                    let fn_generics: IndexSet<SmolStr> =
-                        func.generics.iter().map(|g| g.name.name.clone()).collect();
+                let fn_generics: IndexSet<SmolStr> =
+                    func.generics.iter().map(|g| g.name.name.clone()).collect();
+                if !func.generics.is_empty() {
+                    let gp = func
+                        .generics
+                        .iter()
+                        .map(|g| (g.name.name.clone(), g.bound.as_ref().map(|b| SmolStr::new(b.joined()))))
+                        .collect();
+                    generic_fn_templates.insert(
+                        func.name.name.clone(),
+                        GenericFnTemplate {
+                            decl: func.clone(),
+                            generic_params: gp,
+                        },
+                    );
+                }
+                let mut sig_params = Vec::with_capacity(func.params.len());
+                for param in &func.params {
+                    let ty = param.ty.as_ref().and_then(|ty_expr| {
+                        let mut type_ctx = TypeLowerCtx::full(
+                            &mut module.types,
+                            &mut module.structs,
+                            &mut struct_types,
+                            &mut struct_ids,
+                            &builtin_struct_types,
+                            &mut struct_generic_args,
+                        );
+                        lower_type_expr(ty_expr, &mut type_ctx, &fn_generics, &empty_subst)
+                    });
+                    sig_params.push((param.name.name.clone(), param.mode, ty));
+                }
+                let ret_ty = func.return_ty.as_ref().and_then(|ty_expr| {
                     let mut type_ctx = TypeLowerCtx::full(
                         &mut module.types,
                         &mut module.structs,
                         &mut struct_types,
                         &mut struct_ids,
+                        &builtin_struct_types,
+                        &mut struct_generic_args,
                     );
-                    if let Some(ty_id) = lower_type_expr(ret_ty, &mut type_ctx, &fn_generics) {
-                        fn_return_types.insert(func.name.name.clone(), ty_id);
-                    }
+                    lower_type_expr(ty_expr, &mut type_ctx, &fn_generics, &empty_subst)
+                });
+                if let Some(ty_id) = ret_ty {
+                    fn_return_types.insert(func.name.name.clone(), ty_id);
                 }
+                fn_sigs.insert(
+                    func.name.name.clone(),
+                    FnSig {
+                        params: sig_params,
+                        return_ty: ret_ty,
+                        fn_id: None,
+                    },
+                );
             }
             Item::Impl(imp) => {
                 let target_name = match &imp.target {
                     TypeExpr::Named { path, .. } => Some(path.joined()),
                     TypeExpr::Array { .. } => None,
                 };
+                if !imp.generics.is_empty()
+                    && let Some(ref target) = target_name
+                {
+                    let gp = imp
+                        .generics
+                        .iter()
+                        .map(|g| (g.name.name.clone(), g.bound.as_ref().map(|b| SmolStr::new(b.joined()))))
+                        .collect();
+                    let mut methods_map = IndexMap::new();
+                    for method in &imp.methods {
+                        methods_map.insert(method.name.name.clone(), method.clone());
+                    }
+                    generic_impl_templates.push(GenericImplTemplate {
+                        generic_params: gp,
+                        target_struct: SmolStr::new(target),
+                        methods: methods_map,
+                    });
+                }
                 let impl_self_ty = target_name
                     .as_deref()
                     .and_then(|name| struct_types.get(name).copied())
@@ -632,33 +881,73 @@ fn lower_unit_internal(
                             &mut module.structs,
                             &mut struct_types,
                             &mut struct_ids,
+                            &builtin_struct_types,
+                            &mut struct_generic_args,
                         );
-                        lower_type_expr(&imp.target, &mut type_ctx, &empty_generics)
+                        lower_type_expr(&imp.target, &mut type_ctx, &empty_generics, &empty_subst)
                     });
                 for method in &imp.methods {
-                    let Some(ref ret_ty) = method.return_ty else {
-                        continue;
-                    };
                     let mut method_generics: IndexSet<SmolStr> =
                         imp.generics.iter().map(|g| g.name.name.clone()).collect();
                     method_generics.extend(method.generics.iter().map(|g| g.name.name.clone()));
 
-                    let resolved_ret = if is_self_type_expr(ret_ty) {
-                        impl_self_ty
-                    } else {
-                        let mut type_ctx = TypeLowerCtx::full(
-                            &mut module.types,
-                            &mut module.structs,
-                            &mut struct_types,
-                            &mut struct_ids,
-                        );
-                        lower_type_expr(ret_ty, &mut type_ctx, &method_generics)
-                    };
-                    if let Some(ty_id) = resolved_ret
-                        && let Some(ref target) = target_name
-                    {
+                    let mut sig_params = Vec::with_capacity(method.params.len());
+                    for param in &method.params {
+                        let ty = if param.ty.is_none() && param.name.name == "self" {
+                            impl_self_ty
+                        } else {
+                            param.ty.as_ref().and_then(|ty_expr| {
+                                if is_self_type_expr(ty_expr) {
+                                    impl_self_ty
+                                } else {
+                                    let mut type_ctx = TypeLowerCtx::full(
+                                        &mut module.types,
+                                        &mut module.structs,
+                                        &mut struct_types,
+                                        &mut struct_ids,
+                                        &builtin_struct_types,
+                                        &mut struct_generic_args,
+                                    );
+                                    lower_type_expr(
+                                        ty_expr,
+                                        &mut type_ctx,
+                                        &method_generics,
+                                        &empty_subst,
+                                    )
+                                }
+                            })
+                        };
+                        sig_params.push((param.name.name.clone(), param.mode, ty));
+                    }
+
+                    let resolved_ret = method.return_ty.as_ref().and_then(|ret_ty| {
+                        if is_self_type_expr(ret_ty) {
+                            impl_self_ty
+                        } else {
+                            let mut type_ctx = TypeLowerCtx::full(
+                                &mut module.types,
+                                &mut module.structs,
+                                &mut struct_types,
+                                &mut struct_ids,
+                                &builtin_struct_types,
+                                &mut struct_generic_args,
+                            );
+                            lower_type_expr(ret_ty, &mut type_ctx, &method_generics, &empty_subst)
+                        }
+                    });
+                    if let Some(ref target) = target_name {
                         let qualified = SmolStr::from(format!("{target}::{}", method.name.name));
-                        fn_return_types.insert(qualified, ty_id);
+                        if let Some(ty_id) = resolved_ret {
+                            fn_return_types.insert(qualified.clone(), ty_id);
+                        }
+                        fn_sigs.insert(
+                            qualified,
+                            FnSig {
+                                params: sig_params,
+                                return_ty: resolved_ret,
+                                fn_id: None,
+                            },
+                        );
                     }
                 }
             }
@@ -666,16 +955,32 @@ fn lower_unit_internal(
         }
     }
 
-    // Pass 5: Validate trait methods, impl blocks, and lower functions.
+    // Pass 5: Validate traits, lower const initializers, lower impl blocks (concrete trait impls
+    // first so monomorphized generic methods can resolve trait method targets regardless of order),
+    // and lower top-level functions.
     let mut ctx = LowerCtx {
         module: &mut module,
         diags: &mut diags,
         struct_types: &mut struct_types,
         struct_ids: &mut struct_ids,
+        builtin_struct_types: &builtin_struct_types,
+        struct_generic_args: &mut struct_generic_args,
         trait_names: &trait_names,
+        trait_method_sigs: &trait_method_sigs,
         const_types: &const_types,
+        const_symbols: &const_symbols,
         workgroup_var_types: &workgroup_var_types,
-        fn_return_types: &fn_return_types,
+        workgroup_var_symbols: &workgroup_var_symbols,
+        fn_return_types: &mut fn_return_types,
+        fn_sigs: &mut fn_sigs,
+        fn_symbols: IndexMap::new(),
+        mc_descriptor_symbols: IndexMap::new(),
+        trait_impls: IndexMap::new(),
+        inherent_impls: IndexMap::new(),
+        generic_fn_templates: &generic_fn_templates,
+        generic_impl_templates: &generic_impl_templates,
+        monomorphized_fns: IndexMap::new(),
+        monomorphizing_in_progress: IndexSet::new(),
         module_push_constants: &module_push_constants,
         mc_imports: &mc_imports,
         active_tier,
@@ -688,35 +993,169 @@ fn lower_unit_internal(
         bool_checked_structs: &mut bool_checked_structs,
     };
 
+    // 5a: Traits and module constants.
     for item in &unit.items {
         match item {
             Item::Trait(decl) => {
+                let mut hir_methods = Vec::with_capacity(decl.methods.len());
                 for method in &decl.methods {
                     ctx.validate_trait_method(method);
+                    hir_methods.push(ctx.lower_trait_method(method));
                 }
+                ctx.module.traits.push(HirTrait {
+                    name: decl.name.name.clone(),
+                    methods: hir_methods,
+                    span: decl.span,
+                });
             }
-            Item::Function(func) => ctx.lower_function(func, None, &empty_generics),
-            Item::Impl(imp) => {
+            Item::Const(decl) => {
+                let declared_ty = ctx
+                    .const_types
+                    .get(&decl.name.name)
+                    .copied()
+                    .unwrap_or_else(|| ctx.module.types.alloc(Type::Void));
+                let mut dummy_locals = IndexMap::new();
+                let mut dummy_scan = BodyScan::default();
+                let value_expr = {
+                    let mut scanner = BodyScanner {
+                        ctx: &mut ctx,
+                        generic_params: &empty_generics,
+                        generic_bounds: &empty_bounds,
+                        type_subst: &empty_subst,
+                        expected_return_ty: None,
+                        is_compute: false,
+                        is_non_compute_stage: false,
+                        caps: HardwareCaps::empty(),
+                        scopes: vec![IndexMap::new()],
+                        local_types: &mut dummy_locals,
+                        scan: &mut dummy_scan,
+                    };
+                    scanner.lower_expr(&decl.value, false).0
+                };
+                ctx.module.consts.push(HirConst {
+                    name: decl.name.name.clone(),
+                    ty: declared_ty,
+                    value_expr,
+                    is_pub: decl.is_pub,
+                    span: decl.span,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // 5b: Concrete `impl` blocks (trait impls first, then inherent impls) so trait method lookup
+    // tables are populated before generic impls and functions trigger monomorphization.
+    for pass in 0..3 {
+        for item in &unit.items {
+            if let Item::Impl(imp) = item {
+                let is_concrete_trait = imp.generics.is_empty() && imp.trait_path.is_some();
+                let is_concrete_inherent = imp.generics.is_empty() && imp.trait_path.is_none();
+                let is_generic = !imp.generics.is_empty();
+                let run_now = match pass {
+                    0 => is_concrete_trait,
+                    1 => is_concrete_inherent,
+                    _ => is_generic,
+                };
+                if !run_now {
+                    continue;
+                }
+
                 validate_generic_bounds(&imp.generics, ctx.trait_names, ctx.diags);
-                if let Some(ref trait_path) = imp.trait_path {
-                    let trait_name = trait_path.joined();
-                    if !ctx.trait_names.contains(trait_name.as_str()) {
+                let trait_name = imp.trait_path.as_ref().map(|trait_path| {
+                    let name = trait_path.joined();
+                    if !ctx.trait_names.contains(name.as_str()) {
                         ctx.diags.push(Diagnostic::error(
                             "E0272",
-                            format!("unknown trait `{trait_name}` in `impl` block"),
+                            format!("unknown trait `{name}` in `impl` block"),
                             trait_path.span,
                         ));
                     }
-                }
+                    SmolStr::new(name)
+                });
 
                 let impl_generics: IndexSet<SmolStr> =
                     imp.generics.iter().map(|g| g.name.name.clone()).collect();
+                let impl_bounds: IndexMap<SmolStr, SmolStr> = imp
+                    .generics
+                    .iter()
+                    .filter_map(|g| {
+                        g.bound
+                            .as_ref()
+                            .map(|b| (g.name.name.clone(), SmolStr::new(b.joined())))
+                    })
+                    .collect();
                 let self_ty = ctx.validate_impl_target(&imp.target, imp.span);
+                let target_struct = match &imp.target {
+                    TypeExpr::Named { path, .. } => SmolStr::new(path.joined()),
+                    TypeExpr::Array { .. } => SmolStr::new_static("array"),
+                };
+                let mut method_ids = Vec::with_capacity(imp.methods.len());
                 for method in &imp.methods {
-                    ctx.lower_function(method, self_ty, &impl_generics);
+                    if let Some(fn_id) = ctx.lower_function_inner(
+                        method,
+                        self_ty,
+                        &impl_generics,
+                        &impl_bounds,
+                        &empty_subst,
+                        None,
+                    ) {
+                        method_ids.push(fn_id);
+                        let qualified =
+                            SmolStr::from(format!("{target_struct}::{}", method.name.name));
+                        if let Some(sig) = ctx.fn_sigs.get_mut(&qualified) {
+                            sig.fn_id = Some(fn_id);
+                        }
+                        if imp.generics.is_empty() {
+                            if let Some(ref tr) = trait_name {
+                                ctx.trait_impls
+                                    .entry((tr.clone(), target_struct.clone()))
+                                    .or_default()
+                                    .insert(method.name.name.clone(), fn_id);
+                            } else {
+                                ctx.inherent_impls
+                                    .entry(target_struct.clone())
+                                    .or_default()
+                                    .insert(method.name.name.clone(), fn_id);
+                            }
+                        }
+                    }
                 }
+                let hir_generics = imp
+                    .generics
+                    .iter()
+                    .map(|g| {
+                        (
+                            g.name.name.clone(),
+                            g.bound.as_ref().map(|b| SmolStr::new(b.joined())),
+                        )
+                    })
+                    .collect();
+                ctx.module.impls.push(HirImpl {
+                    generic_params: hir_generics,
+                    trait_name,
+                    target_struct,
+                    methods: method_ids,
+                    span: imp.span,
+                });
             }
-            _ => {}
+        }
+    }
+
+    // 5c: Top-level functions.
+    for item in &unit.items {
+        if let Item::Function(func) = item
+            && let Some(fn_id) = ctx.lower_function_inner(
+                func,
+                None,
+                &empty_generics,
+                &empty_bounds,
+                &empty_subst,
+                None,
+            )
+            && let Some(sig) = ctx.fn_sigs.get_mut(&func.name.name)
+        {
+            sig.fn_id = Some(fn_id);
         }
     }
 
@@ -731,15 +1170,49 @@ struct ParsedFnAttrs {
     required_caps: HardwareCaps,
 }
 
+#[derive(Clone)]
+struct FnSig {
+    params: Vec<(SmolStr, ParamMode, Option<TypeId>)>,
+    return_ty: Option<TypeId>,
+    fn_id: Option<HirFnId>,
+}
+
+#[derive(Clone)]
+struct GenericFnTemplate {
+    decl: FnDecl,
+    generic_params: Vec<(SmolStr, Option<SmolStr>)>,
+}
+
+#[derive(Clone)]
+struct GenericImplTemplate {
+    generic_params: Vec<(SmolStr, Option<SmolStr>)>,
+    target_struct: SmolStr,
+    methods: IndexMap<SmolStr, FnDecl>,
+}
+
 struct LowerCtx<'a> {
     module: &'a mut HirModule,
     diags: &'a mut DiagnosticBag,
     struct_types: &'a mut IndexMap<SmolStr, TypeId>,
     struct_ids: &'a mut IndexMap<SmolStr, HirStructId>,
+    builtin_struct_types: &'a IndexMap<SmolStr, TypeId>,
+    struct_generic_args: &'a mut IndexMap<SmolStr, (SmolStr, Vec<TypeId>)>,
     trait_names: &'a IndexSet<SmolStr>,
+    trait_method_sigs: &'a IndexMap<SmolStr, IndexMap<SmolStr, FnSig>>,
     const_types: &'a IndexMap<SmolStr, TypeId>,
+    const_symbols: &'a IndexMap<SmolStr, SymbolId>,
     workgroup_var_types: &'a IndexMap<SmolStr, TypeId>,
-    fn_return_types: &'a IndexMap<SmolStr, TypeId>,
+    workgroup_var_symbols: &'a IndexMap<SmolStr, SymbolId>,
+    fn_return_types: &'a mut IndexMap<SmolStr, TypeId>,
+    fn_sigs: &'a mut IndexMap<SmolStr, FnSig>,
+    fn_symbols: IndexMap<SmolStr, SymbolId>,
+    mc_descriptor_symbols: IndexMap<SmolStr, SymbolId>,
+    trait_impls: IndexMap<(SmolStr, SmolStr), IndexMap<SmolStr, HirFnId>>,
+    inherent_impls: IndexMap<SmolStr, IndexMap<SmolStr, HirFnId>>,
+    generic_fn_templates: &'a IndexMap<SmolStr, GenericFnTemplate>,
+    generic_impl_templates: &'a [GenericImplTemplate],
+    monomorphized_fns: IndexMap<SmolStr, HirFnId>,
+    monomorphizing_in_progress: IndexSet<SmolStr>,
     module_push_constants: &'a [HirStructId],
     mc_imports: &'a IndexSet<SmolStr>,
     active_tier: Option<RenderTier>,
@@ -759,11 +1232,233 @@ impl LowerCtx<'_> {
             &mut self.module.structs,
             self.struct_types,
             self.struct_ids,
+            self.builtin_struct_types,
+            self.struct_generic_args,
         )
+    }
+
+    fn get_or_alloc_mc_symbol(&mut self, name: &str, ty: TypeId, is_mut: bool, span: Span) -> SymbolId {
+        if let Some(&id) = self.mc_descriptor_symbols.get(name) {
+            return id;
+        }
+        let id = self.module.alloc_symbol(
+            SmolStr::new(name),
+            SymbolKind::Descriptor,
+            ty,
+            is_mut,
+            span,
+        );
+        self.mc_descriptor_symbols.insert(SmolStr::new(name), id);
+        id
+    }
+
+    fn type_implements_trait(&self, ty_id: TypeId, trait_name: &str) -> bool {
+        let Type::Struct { name, .. } = self.module.types.get(ty_id) else {
+            return false;
+        };
+        self.trait_impls
+            .contains_key(&(SmolStr::new(trait_name), name.clone()))
+    }
+
+    fn find_concrete_method(&self, struct_name: &str, method_name: &str) -> Option<HirFnId> {
+        if let Some(methods) = self.inherent_impls.get(struct_name)
+            && let Some(&fn_id) = methods.get(method_name)
+        {
+            return Some(fn_id);
+        }
+        for ((_, target), methods) in &self.trait_impls {
+            if target == struct_name
+                && let Some(&fn_id) = methods.get(method_name)
+            {
+                return Some(fn_id);
+            }
+        }
+        None
+    }
+
+    /// Instantiates a generic function template with concrete type arguments, checking trait
+    /// bounds and lowering the specialized body with substituted `TypeId`s.
+    fn monomorphize_function(
+        &mut self,
+        fn_name: &str,
+        type_args: &[TypeId],
+        call_span: Span,
+    ) -> Option<HirFnId> {
+        let template = self.generic_fn_templates.get(fn_name)?.clone();
+        if template.generic_params.len() != type_args.len() {
+            return None;
+        }
+        if type_args
+            .iter()
+            .any(|&arg_ty| contains_type_param(&self.module.types, arg_ty))
+        {
+            return None;
+        }
+
+        for ((param_name, bound_opt), &arg_ty) in template.generic_params.iter().zip(type_args) {
+            if let Some(bound_trait) = bound_opt
+                && !self.type_implements_trait(arg_ty, bound_trait.as_str())
+            {
+                let arg_name = format_type_name(&self.module.types, arg_ty);
+                self.diags.push(Diagnostic::error(
+                    "E0274",
+                    format!(
+                        "type `{arg_name}` does not implement trait `{bound_trait}` required by generic parameter `{param_name}` of `{fn_name}`"
+                    ),
+                    call_span,
+                ));
+            }
+        }
+
+        let arg_names: Vec<String> = type_args
+            .iter()
+            .map(|&ty| format_type_name(&self.module.types, ty))
+            .collect();
+        let mangled = SmolStr::from(format!("{fn_name}<{}>", arg_names.join(", ")));
+
+        if let Some(&existing) = self.monomorphized_fns.get(&mangled) {
+            return Some(existing);
+        }
+        if !self.monomorphizing_in_progress.insert(mangled.clone()) {
+            return None;
+        }
+
+        let mut subst = IndexMap::with_capacity(template.generic_params.len());
+        for ((param_name, _), &arg_ty) in template.generic_params.iter().zip(type_args) {
+            subst.insert(param_name.clone(), arg_ty);
+        }
+
+        let empty_generics = IndexSet::new();
+        let empty_bounds = IndexMap::new();
+        let fn_id = self.lower_function_inner(
+            &template.decl,
+            None,
+            &empty_generics,
+            &empty_bounds,
+            &subst,
+            Some(mangled.clone()),
+        );
+        self.monomorphizing_in_progress.swap_remove(&mangled);
+
+        if let Some(id) = fn_id {
+            let sig = {
+                let func = &self.module.functions[id];
+                FnSig {
+                    params: func
+                        .params
+                        .iter()
+                        .map(|p| (p.name.clone(), p.mode, p.ty))
+                        .collect(),
+                    return_ty: func.return_ty,
+                    fn_id: Some(id),
+                }
+            };
+            if let Some(ret) = sig.return_ty {
+                self.fn_return_types.insert(mangled.clone(), ret);
+            }
+            self.fn_sigs.insert(mangled.clone(), sig);
+            self.monomorphized_fns.insert(mangled, id);
+        }
+        fn_id
+    }
+
+    /// Instantiates a generic `impl<T: Trait> Struct<T>` method for a concrete monomorphized
+    /// struct type (such as `Reservoir<MySample>`), resolving trait method calls inside the body
+    /// to concrete `impl Trait for ConcreteType` methods.
+    fn monomorphize_impl_method(
+        &mut self,
+        concrete_self_ty: TypeId,
+        method_name: &str,
+        call_span: Span,
+    ) -> Option<HirFnId> {
+        let Type::Struct { name, .. } = self.module.types.get(concrete_self_ty) else {
+            return None;
+        };
+        let concrete_struct_name = name.clone();
+        let (base_struct_name, type_args) = self
+            .struct_generic_args
+            .get(&concrete_struct_name)
+            .cloned()?;
+
+        let template = self
+            .generic_impl_templates
+            .iter()
+            .find(|t| t.target_struct == base_struct_name && t.methods.contains_key(method_name))?
+            .clone();
+        if template.generic_params.len() != type_args.len() {
+            return None;
+        }
+        let method_decl = template.methods.get(method_name)?.clone();
+
+        for ((param_name, bound_opt), &arg_ty) in template.generic_params.iter().zip(&type_args) {
+            if let Some(bound_trait) = bound_opt
+                && !self.type_implements_trait(arg_ty, bound_trait.as_str())
+            {
+                let arg_name = format_type_name(&self.module.types, arg_ty);
+                self.diags.push(Diagnostic::error(
+                    "E0274",
+                    format!(
+                        "type `{arg_name}` does not implement trait `{bound_trait}` required by generic parameter `{param_name}` of `{base_struct_name}`"
+                    ),
+                    call_span,
+                ));
+            }
+        }
+
+        let mangled = SmolStr::from(format!("{concrete_struct_name}::{method_name}"));
+        if let Some(&existing) = self.monomorphized_fns.get(&mangled) {
+            return Some(existing);
+        }
+        if !self.monomorphizing_in_progress.insert(mangled.clone()) {
+            return None;
+        }
+
+        let mut subst = IndexMap::with_capacity(template.generic_params.len());
+        for ((param_name, _), &arg_ty) in template.generic_params.iter().zip(&type_args) {
+            subst.insert(param_name.clone(), arg_ty);
+        }
+
+        let empty_generics = IndexSet::new();
+        let empty_bounds = IndexMap::new();
+        let fn_id = self.lower_function_inner(
+            &method_decl,
+            Some(concrete_self_ty),
+            &empty_generics,
+            &empty_bounds,
+            &subst,
+            Some(mangled.clone()),
+        );
+        self.monomorphizing_in_progress.swap_remove(&mangled);
+
+        if let Some(id) = fn_id {
+            let sig = {
+                let func = &self.module.functions[id];
+                FnSig {
+                    params: func
+                        .params
+                        .iter()
+                        .map(|p| (p.name.clone(), p.mode, p.ty))
+                        .collect(),
+                    return_ty: func.return_ty,
+                    fn_id: Some(id),
+                }
+            };
+            if let Some(ret) = sig.return_ty {
+                self.fn_return_types.insert(mangled.clone(), ret);
+            }
+            self.fn_sigs.insert(mangled.clone(), sig);
+            self.inherent_impls
+                .entry(concrete_struct_name)
+                .or_default()
+                .insert(SmolStr::new(method_name), id);
+            self.monomorphized_fns.insert(mangled, id);
+        }
+        fn_id
     }
 
     fn validate_impl_target(&mut self, target: &TypeExpr, span: Span) -> Option<TypeId> {
         let empty_generics = IndexSet::new();
+        let empty_subst = IndexMap::new();
         match target {
             TypeExpr::Named { path, .. } => {
                 let name = path.joined();
@@ -771,7 +1466,9 @@ impl LowerCtx<'_> {
                     return Some(id);
                 }
                 let mut type_ctx = self.type_ctx();
-                if let Some(id) = lower_type_expr(target, &mut type_ctx, &empty_generics) {
+                if let Some(id) =
+                    lower_type_expr(target, &mut type_ctx, &empty_generics, &empty_subst)
+                {
                     return Some(id);
                 }
                 self.diags.push(Diagnostic::error(
@@ -783,7 +1480,7 @@ impl LowerCtx<'_> {
             }
             TypeExpr::Array { .. } => {
                 let mut type_ctx = self.type_ctx();
-                lower_type_expr(target, &mut type_ctx, &empty_generics)
+                lower_type_expr(target, &mut type_ctx, &empty_generics, &empty_subst)
             }
         }
     }
@@ -828,12 +1525,47 @@ impl LowerCtx<'_> {
         }
     }
 
-    fn lower_function(
+    fn lower_trait_method(&mut self, method: &FnDecl) -> HirTraitMethod {
+        let method_generics: IndexSet<SmolStr> =
+            method.generics.iter().map(|g| g.name.name.clone()).collect();
+        let empty_subst = IndexMap::new();
+        let mut params = Vec::with_capacity(method.params.len());
+        for param in &method.params {
+            let ty = param.ty.as_ref().and_then(|ty_expr| {
+                let mut type_ctx = self.type_ctx();
+                lower_type_expr(ty_expr, &mut type_ctx, &method_generics, &empty_subst)
+            });
+            params.push(HirParam {
+                name: param.name.name.clone(),
+                mode: param.mode,
+                ty,
+                builtin: None,
+                is_push_constant: false,
+                pack_resource_slot: None,
+                span: param.span,
+            });
+        }
+        let return_ty = method.return_ty.as_ref().and_then(|ty_expr| {
+            let mut type_ctx = self.type_ctx();
+            lower_type_expr(ty_expr, &mut type_ctx, &method_generics, &empty_subst)
+        });
+        HirTraitMethod {
+            name: method.name.name.clone(),
+            params,
+            return_ty,
+            span: method.span,
+        }
+    }
+
+    fn lower_function_inner(
         &mut self,
         func: &FnDecl,
         self_ty: Option<TypeId>,
         impl_generics: &IndexSet<SmolStr>,
-    ) {
+        impl_bounds: &IndexMap<SmolStr, SmolStr>,
+        type_subst: &IndexMap<SmolStr, TypeId>,
+        override_name: Option<SmolStr>,
+    ) -> Option<HirFnId> {
         let tier_range = parse_tier_range(&func.attrs, self.diags);
 
         // Spec §3.4: Early Tier Pruning strips excluded functions before cap/reflection emission.
@@ -841,14 +1573,31 @@ impl LowerCtx<'_> {
             let active = active_tier.as_u8();
             if !(tier_range.0..=tier_range.1).contains(&active) {
                 self.module.pruned_functions += 1;
-                return;
+                return None;
             }
         }
 
         validate_generic_bounds(&func.generics, self.trait_names, self.diags);
 
         let mut fn_generics = impl_generics.clone();
-        fn_generics.extend(func.generics.iter().map(|g| g.name.name.clone()));
+        let mut fn_bounds = impl_bounds.clone();
+        if type_subst.is_empty() {
+            for g in &func.generics {
+                fn_generics.insert(g.name.name.clone());
+                if let Some(ref bound) = g.bound {
+                    fn_bounds.insert(g.name.name.clone(), SmolStr::new(bound.joined()));
+                }
+            }
+        } else {
+            for g in &func.generics {
+                if !type_subst.contains_key(&g.name.name) {
+                    fn_generics.insert(g.name.name.clone());
+                    if let Some(ref bound) = g.bound {
+                        fn_bounds.insert(g.name.name.clone(), SmolStr::new(bound.joined()));
+                    }
+                }
+            }
+        }
 
         let mut parsed_attrs = ParsedFnAttrs::default();
         for attr in &func.attrs {
@@ -872,7 +1621,7 @@ impl LowerCtx<'_> {
         let mut params = Vec::with_capacity(func.params.len());
         let mut param_push_constant_struct: Option<HirStructId> = None;
         let mut uses_bda = false;
-        let mut root_scope: IndexMap<SmolStr, Option<TypeId>> = IndexMap::new();
+        let mut root_scope: IndexMap<SmolStr, ScopedVar> = IndexMap::new();
 
         for param in &func.params {
             let mut builtin: Option<SmolStr> = None;
@@ -933,7 +1682,7 @@ impl LowerCtx<'_> {
                         self_ty
                     } else {
                         let mut type_ctx = self.type_ctx();
-                        lower_type_expr(ty_expr, &mut type_ctx, &fn_generics)
+                        lower_type_expr(ty_expr, &mut type_ctx, &fn_generics, type_subst)
                     }
                 })
             };
@@ -984,7 +1733,26 @@ impl LowerCtx<'_> {
                 self.check_buffer_struct_bool(ty_id, param.span);
             }
 
-            root_scope.insert(param.name.name.clone(), resolved_ty);
+            let is_mut = matches!(
+                param.mode,
+                ParamMode::Mut | ParamMode::InOut | ParamMode::Out
+            );
+            let sym_ty = resolved_ty.unwrap_or_else(|| self.module.types.alloc(Type::Void));
+            let sym_id = self.module.alloc_symbol(
+                param.name.name.clone(),
+                SymbolKind::Param,
+                sym_ty,
+                is_mut,
+                param.span,
+            );
+            root_scope.insert(
+                param.name.name.clone(),
+                ScopedVar {
+                    ty: resolved_ty,
+                    is_mut,
+                    symbol: sym_id,
+                },
+            );
             params.push(HirParam {
                 name: param.name.name.clone(),
                 mode: param.mode,
@@ -1017,7 +1785,7 @@ impl LowerCtx<'_> {
                 self_ty
             } else {
                 let mut type_ctx = self.type_ctx();
-                lower_type_expr(ty_expr, &mut type_ctx, &fn_generics)
+                lower_type_expr(ty_expr, &mut type_ctx, &fn_generics, type_subst)
             }
         });
 
@@ -1055,37 +1823,32 @@ impl LowerCtx<'_> {
             }
         }
 
-        // Scan function body for legality, local types, mc::* global references, debug channels,
-        // BDA, subgroups, params, specs, and Set 3 pack resources.
+        // Lower function body into typed `HirBlock` while scanning for SPIR-V legality,
+        // local types, mc::* global references, debug channels, BDA, subgroups, params, specs,
+        // and Set 3 pack resources.
         let mut scan = BodyScan::default();
         let mut local_types: IndexMap<SmolStr, TypeId> = IndexMap::new();
-        if let Some(ref body) = func.body {
+        let body_hir = func.body.as_ref().map(|body| {
             let is_compute = matches!(parsed_attrs.stage, Some(ShaderStage::Compute));
             let is_non_compute_stage = matches!(
                 parsed_attrs.stage,
                 Some(ShaderStage::Vertex | ShaderStage::Fragment)
             );
             let mut scanner = BodyScanner {
-                types: &mut self.module.types,
-                structs: &mut self.module.structs,
-                struct_types: self.struct_types,
-                struct_ids: self.struct_ids,
-                const_types: self.const_types,
-                workgroup_var_types: self.workgroup_var_types,
-                fn_return_types: self.fn_return_types,
+                ctx: self,
                 generic_params: &fn_generics,
-                mc_imports: self.mc_imports,
+                generic_bounds: &fn_bounds,
+                type_subst,
+                expected_return_ty: return_ty,
                 is_compute,
                 is_non_compute_stage,
                 caps: parsed_attrs.required_caps,
                 scopes: vec![root_scope],
                 local_types: &mut local_types,
                 scan: &mut scan,
-                diags: self.diags,
-                bool_checked_structs: self.bool_checked_structs,
             };
-            scanner.scan_block(body);
-        }
+            scanner.lower_block(body).0
+        });
         uses_bda |= scan.has(FLAG_BDA);
 
         // Build single-source-of-truth reflection for entry points (and record BDA/subgroup flags for all fns).
@@ -1106,8 +1869,34 @@ impl LowerCtx<'_> {
             }
         };
 
-        self.module.functions.alloc(HirFunction {
-            name: func.name.name.clone(),
+        let fn_name = override_name.unwrap_or_else(|| func.name.name.clone());
+        let hir_generic_params = if type_subst.is_empty() {
+            func.generics
+                .iter()
+                .map(|g| {
+                    (
+                        g.name.name.clone(),
+                        g.bound.as_ref().map(|b| SmolStr::new(b.joined())),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let fn_ret_sym_ty = return_ty.unwrap_or_else(|| self.module.types.alloc(Type::Void));
+        let fn_sym_id = self.module.alloc_symbol(
+            fn_name.clone(),
+            SymbolKind::Function,
+            fn_ret_sym_ty,
+            false,
+            func.span,
+        );
+        self.fn_symbols.insert(fn_name.clone(), fn_sym_id);
+
+        let fn_id = self.module.functions.alloc(HirFunction {
+            name: fn_name,
+            generic_params: hir_generic_params,
             stage: parsed_attrs.stage,
             workgroup_size: parsed_attrs.workgroup_size,
             hook: parsed_attrs.hook,
@@ -1116,10 +1905,13 @@ impl LowerCtx<'_> {
             params,
             return_ty,
             local_types,
+            body_hir,
             body_ast: func.body.clone(),
+            is_pub: func.is_pub,
             reflection,
             span: func.span,
         });
+        Some(fn_id)
     }
 
     fn check_buffer_struct_bool(&mut self, ty_id: TypeId, span: Span) {
@@ -1309,7 +2101,7 @@ impl LowerCtx<'_> {
             next_pass_binding += 1;
         }
 
-        // Set 1: Scene globals (0 = tlas, 1 = instances, 3 = lights).
+        // Set 1: Scene globals (0 = tlas, 1 = instances, 2 = sharc, 3 = lights, 4 = reservoirs).
         if scan.has(FLAG_TLAS) {
             descriptors.push(DescriptorBinding {
                 name: SmolStr::new_static("tlas"),
@@ -1338,6 +2130,20 @@ impl LowerCtx<'_> {
                 count: None,
             });
         }
+        if scan.has(FLAG_SHARC) {
+            descriptors.push(DescriptorBinding {
+                name: SmolStr::new_static("sharc"),
+                set: DESCRIPTOR_SET_SCENE_GLOBALS,
+                binding: 2,
+                kind: DescriptorKind::UniformBuffer,
+                dim: None,
+                sample_scalar: None,
+                image_format: None,
+                access: DescriptorAccess::ReadOnly,
+                is_unsized: false,
+                count: None,
+            });
+        }
         if scan.has(FLAG_LIGHTS) {
             descriptors.push(DescriptorBinding {
                 name: SmolStr::new_static("lights"),
@@ -1348,6 +2154,20 @@ impl LowerCtx<'_> {
                 sample_scalar: None,
                 image_format: None,
                 access: DescriptorAccess::ReadOnly,
+                is_unsized: false,
+                count: None,
+            });
+        }
+        if scan.has(FLAG_RESERVOIRS) {
+            descriptors.push(DescriptorBinding {
+                name: SmolStr::new_static("reservoirs"),
+                set: DESCRIPTOR_SET_SCENE_GLOBALS,
+                binding: 4,
+                kind: DescriptorKind::StorageBuffer,
+                dim: None,
+                sample_scalar: None,
+                image_format: None,
+                access: DescriptorAccess::ReadWrite,
                 is_unsized: false,
                 count: None,
             });
@@ -1568,7 +2388,15 @@ fn collect_mc_imports(unit: &SourceUnit) -> IndexSet<SmolStr> {
                     }
                 }
                 ImportTree::Glob => {
-                    for name in ["world", "tlas", "instances", "lights", "bindless"] {
+                    for name in [
+                        "world",
+                        "tlas",
+                        "instances",
+                        "sharc",
+                        "lights",
+                        "reservoirs",
+                        "bindless",
+                    ] {
                         imported.insert(SmolStr::new_static(name));
                     }
                 }
@@ -1852,7 +2680,7 @@ const fn rw_image_access(mode: ParamMode) -> DescriptorAccess {
 
 #[derive(Default)]
 struct BodyScan {
-    flags: u8,
+    flags: u16,
     debug_channels: IndexSet<SmolStr>,
     used_specs: IndexSet<SmolStr>,
     used_params: IndexSet<SmolStr>,
@@ -1860,90 +2688,639 @@ struct BodyScan {
 }
 
 impl BodyScan {
-    const fn has(&self, flag: u8) -> bool {
+    const fn has(&self, flag: u16) -> bool {
         (self.flags & flag) != 0
     }
 
-    fn set(&mut self, flag: u8) {
+    fn set(&mut self, flag: u16) {
         self.flags |= flag;
     }
 }
 
-struct BodyScanner<'a> {
-    types: &'a mut TypeArena,
-    structs: &'a mut Arena<HirStruct>,
-    struct_types: &'a mut IndexMap<SmolStr, TypeId>,
-    struct_ids: &'a mut IndexMap<SmolStr, HirStructId>,
-    const_types: &'a IndexMap<SmolStr, TypeId>,
-    workgroup_var_types: &'a IndexMap<SmolStr, TypeId>,
-    fn_return_types: &'a IndexMap<SmolStr, TypeId>,
-    generic_params: &'a IndexSet<SmolStr>,
-    mc_imports: &'a IndexSet<SmolStr>,
+#[derive(Clone, Copy)]
+struct ScopedVar {
+    ty: Option<TypeId>,
+    is_mut: bool,
+    symbol: SymbolId,
+}
+
+enum SwizzleError {
+    InvalidLength,
+    InvalidComponent,
+    MixedSets,
+    OutOfRange { component: char, vec_len: u8 },
+    DuplicateWriteComponent(char),
+}
+
+fn parse_vector_swizzle(
+    swizzle: &str,
+    vec_len: u8,
+    is_write: bool,
+) -> Result<Vec<u8>, SwizzleError> {
+    if swizzle.is_empty() || swizzle.len() > 4 {
+        return Err(SwizzleError::InvalidLength);
+    }
+    let mut family: Option<u8> = None;
+    let mut components = Vec::with_capacity(swizzle.len());
+    let mut seen_mask = 0u8;
+
+    for ch in swizzle.chars() {
+        let (ch_family, idx) = match ch {
+            'x' => (0u8, 0u8),
+            'y' => (0, 1),
+            'z' => (0, 2),
+            'w' => (0, 3),
+            'r' => (1, 0),
+            'g' => (1, 1),
+            'b' => (1, 2),
+            'a' => (1, 3),
+            's' => (2, 0),
+            't' => (2, 1),
+            'p' => (2, 2),
+            'q' => (2, 3),
+            _ => return Err(SwizzleError::InvalidComponent),
+        };
+        if let Some(expected_family) = family {
+            if ch_family != expected_family {
+                return Err(SwizzleError::MixedSets);
+            }
+        } else {
+            family = Some(ch_family);
+        }
+        if idx >= vec_len {
+            return Err(SwizzleError::OutOfRange {
+                component: ch,
+                vec_len,
+            });
+        }
+        if is_write {
+            let bit = 1u8 << idx;
+            if (seen_mask & bit) != 0 {
+                return Err(SwizzleError::DuplicateWriteComponent(ch));
+            }
+            seen_mask |= bit;
+        }
+        components.push(idx);
+    }
+
+    Ok(components)
+}
+
+const fn is_numeric_scalar(s: ScalarKind) -> bool {
+    matches!(
+        s,
+        ScalarKind::I32
+            | ScalarKind::U32
+            | ScalarKind::I64
+            | ScalarKind::U64
+            | ScalarKind::F32
+            | ScalarKind::F16
+    )
+}
+
+const fn is_integer_scalar(s: ScalarKind) -> bool {
+    matches!(
+        s,
+        ScalarKind::I32 | ScalarKind::U32 | ScalarKind::I64 | ScalarKind::U64
+    )
+}
+
+const fn is_assignment_op(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Assign
+            | BinaryOp::AddAssign
+            | BinaryOp::SubAssign
+            | BinaryOp::MulAssign
+            | BinaryOp::DivAssign
+            | BinaryOp::RemAssign
+            | BinaryOp::BitAndAssign
+            | BinaryOp::BitOrAssign
+            | BinaryOp::BitXorAssign
+    )
+}
+
+const fn compound_base_op(op: BinaryOp) -> Option<BinaryOp> {
+    match op {
+        BinaryOp::AddAssign => Some(BinaryOp::Add),
+        BinaryOp::SubAssign => Some(BinaryOp::Sub),
+        BinaryOp::MulAssign => Some(BinaryOp::Mul),
+        BinaryOp::DivAssign => Some(BinaryOp::Div),
+        BinaryOp::RemAssign => Some(BinaryOp::Rem),
+        BinaryOp::BitAndAssign => Some(BinaryOp::BitAnd),
+        BinaryOp::BitOrAssign => Some(BinaryOp::BitOr),
+        BinaryOp::BitXorAssign => Some(BinaryOp::BitXor),
+        _ => None,
+    }
+}
+
+fn unify_type_params(
+    types: &TypeArena,
+    pattern: TypeId,
+    concrete: TypeId,
+    out: &mut IndexMap<SmolStr, TypeId>,
+) {
+    match (types.get(pattern), types.get(concrete)) {
+        (Type::TypeParam(name), _) => {
+            if !matches!(types.get(concrete), Type::Void | Type::TypeParam(_)) {
+                out.entry(name.clone()).or_insert(concrete);
+            }
+        }
+        (Type::Array { element: pe, .. }, Type::Array { element: ce, .. })
+        | (Type::Buffer { element: pe }, Type::Buffer { element: ce })
+        | (Type::RwBuffer { element: pe }, Type::RwBuffer { element: ce })
+        | (Type::Pointer { pointee: pe, .. }, Type::Pointer { pointee: ce, .. }) => {
+            unify_type_params(types, *pe, *ce, out);
+        }
+        (Type::Struct { fields: pf, .. }, Type::Struct { fields: cf, .. })
+            if pf.len() == cf.len() =>
+        {
+            for ((_, pt), (_, ct)) in pf.iter().zip(cf) {
+                unify_type_params(types, *pt, *ct, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct BodyScanner<'a, 'b> {
+    ctx: &'b mut LowerCtx<'a>,
+    generic_params: &'b IndexSet<SmolStr>,
+    generic_bounds: &'b IndexMap<SmolStr, SmolStr>,
+    type_subst: &'b IndexMap<SmolStr, TypeId>,
+    expected_return_ty: Option<TypeId>,
     is_compute: bool,
     is_non_compute_stage: bool,
     caps: HardwareCaps,
-    scopes: Vec<IndexMap<SmolStr, Option<TypeId>>>,
-    local_types: &'a mut IndexMap<SmolStr, TypeId>,
-    scan: &'a mut BodyScan,
-    diags: &'a mut DiagnosticBag,
-    bool_checked_structs: &'a mut IndexSet<SmolStr>,
+    scopes: Vec<IndexMap<SmolStr, ScopedVar>>,
+    local_types: &'b mut IndexMap<SmolStr, TypeId>,
+    scan: &'b mut BodyScan,
 }
 
-impl BodyScanner<'_> {
+impl BodyScanner<'_, '_> {
+    fn void_ty(&mut self) -> TypeId {
+        self.ctx.module.types.alloc(Type::Void)
+    }
+
+    fn is_concrete_value_ty(&self, ty_id: TypeId) -> bool {
+        !matches!(
+            self.ctx.module.types.get(ty_id),
+            Type::Void | Type::TypeParam(_)
+        )
+    }
+
     fn is_shadowed(&self, name: &str) -> bool {
         self.scopes.iter().rev().any(|s| s.contains_key(name))
     }
 
-    fn lookup_var_type(&self, name: &str) -> Option<TypeId> {
+    fn lookup_scoped(&self, name: &str) -> Option<ScopedVar> {
         for scope in self.scopes.iter().rev() {
-            if let Some(&ty) = scope.get(name) {
-                return ty;
+            if let Some(&var) = scope.get(name) {
+                return Some(var);
             }
         }
-        self.workgroup_var_types
-            .get(name)
-            .copied()
-            .or_else(|| self.const_types.get(name).copied())
+        None
     }
 
-    fn insert_local(&mut self, name: SmolStr, ty: Option<TypeId>) {
+    fn lookup_var(&self, name: &str) -> (Option<TypeId>, Option<SymbolId>) {
+        if let Some(var) = self.lookup_scoped(name) {
+            return (var.ty, Some(var.symbol));
+        }
+        if let Some(&ty) = self.ctx.workgroup_var_types.get(name) {
+            return (Some(ty), self.ctx.workgroup_var_symbols.get(name).copied());
+        }
+        if let Some(&ty) = self.ctx.const_types.get(name) {
+            return (Some(ty), self.ctx.const_symbols.get(name).copied());
+        }
+        (None, self.ctx.fn_symbols.get(name).copied())
+    }
+
+    fn insert_local(
+        &mut self,
+        name: SmolStr,
+        ty: Option<TypeId>,
+        is_mut: bool,
+        span: Span,
+    ) -> SymbolId {
+        let sym_ty = ty.unwrap_or_else(|| self.void_ty());
+        let sym_id =
+            self.ctx
+                .module
+                .alloc_symbol(name.clone(), SymbolKind::Local, sym_ty, is_mut, span);
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.clone(), ty);
+            scope.insert(
+                name.clone(),
+                ScopedVar {
+                    ty,
+                    is_mut,
+                    symbol: sym_id,
+                },
+            );
         }
         if let Some(ty_id) = ty {
             self.local_types.insert(name, ty_id);
         }
+        sym_id
     }
 
-    fn scan_block(&mut self, block: &Block) -> Option<TypeId> {
-        self.scopes.push(IndexMap::new());
-        for stmt in &block.stmts {
-            self.scan_stmt(stmt);
+    fn is_lvalue_mutable(&self, expr: &HirExpr) -> bool {
+        match &expr.kind {
+            HirExprKind::Path { path, .. } => {
+                if let Some(var) = self.lookup_scoped(path.as_str()) {
+                    return var.is_mut;
+                }
+                if self.ctx.workgroup_var_types.contains_key(path.as_str()) {
+                    return true;
+                }
+                if self.ctx.const_types.contains_key(path.as_str()) {
+                    return false;
+                }
+                if path == "mc::reservoirs"
+                    || (path == "reservoirs" && self.ctx.mc_imports.contains("reservoirs"))
+                {
+                    return true;
+                }
+                if path.starts_with("mc::") {
+                    return false;
+                }
+                // Unknown/unresolved identifier: avoid false-positive mutability errors.
+                true
+            }
+            HirExprKind::Field { receiver, .. } => match self.ctx.module.types.get(receiver.ty) {
+                Type::Pointer { mutable, .. } => *mutable,
+                _ => self.is_lvalue_mutable(receiver),
+            },
+            HirExprKind::Swizzle { base, .. } => self.is_lvalue_mutable(base),
+            HirExprKind::Index { receiver, .. } => match self.ctx.module.types.get(receiver.ty) {
+                Type::RwBuffer { .. } => true,
+                Type::Buffer { .. } => false,
+                Type::Pointer { mutable, .. } => *mutable,
+                _ => self.is_lvalue_mutable(receiver),
+            },
+            _ => false,
         }
-        let tail_ty = block
-            .tail_expr
-            .as_deref()
-            .and_then(|tail| self.scan_expr(tail));
-        self.scopes.pop();
-        tail_ty
     }
 
-    fn scan_stmt(&mut self, stmt: &Stmt) {
+    fn check_binary_types(
+        &mut self,
+        op: BinaryOp,
+        lhs_ty: Option<TypeId>,
+        rhs_ty: Option<TypeId>,
+        span: Span,
+    ) -> Option<TypeId> {
+        let bool_ty = self.ctx.module.types.alloc(Type::Scalar(ScalarKind::Bool));
+
+        if matches!(op, BinaryOp::Assign) {
+            if let (Some(lt), Some(rt)) = (lhs_ty, rhs_ty)
+                && self.is_concrete_value_ty(lt)
+                && self.is_concrete_value_ty(rt)
+                && lt != rt
+            {
+                let lhs_name = format_type_name(&self.ctx.module.types, lt);
+                let rhs_name = format_type_name(&self.ctx.module.types, rt);
+                self.ctx.diags.push(Diagnostic::error(
+                    "E0270",
+                    format!("cannot assign value of type `{rhs_name}` to `{lhs_name}`"),
+                    span,
+                ));
+            }
+            return None;
+        }
+
+        if let Some(base_op) = compound_base_op(op) {
+            let res = self.check_binary_types(base_op, lhs_ty, rhs_ty, span);
+            if let (Some(lt), Some(res_ty)) = (lhs_ty, res)
+                && self.is_concrete_value_ty(lt)
+                && self.is_concrete_value_ty(res_ty)
+                && lt != res_ty
+            {
+                let lhs_name = format_type_name(&self.ctx.module.types, lt);
+                let res_name = format_type_name(&self.ctx.module.types, res_ty);
+                self.ctx.diags.push(Diagnostic::error(
+                    "E0270",
+                    format!("compound assignment result `{res_name}` is incompatible with `{lhs_name}`"),
+                    span,
+                ));
+            }
+            return None;
+        }
+
+        let (Some(lt), Some(rt)) = (lhs_ty, rhs_ty) else {
+            return match op {
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::And
+                | BinaryOp::Or => Some(bool_ty),
+                _ => lhs_ty.or(rhs_ty),
+            };
+        };
+
+        let lhs_t = self.ctx.module.types.get(lt).clone();
+        let rhs_t = self.ctx.module.types.get(rt).clone();
+
+        if matches!(lhs_t, Type::Void | Type::TypeParam(_))
+            || matches!(rhs_t, Type::Void | Type::TypeParam(_))
+        {
+            return match op {
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::And
+                | BinaryOp::Or => Some(bool_ty),
+                _ => Some(lt),
+            };
+        }
+
+        match op {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+                match (&lhs_t, &rhs_t) {
+                    (Type::Scalar(a), Type::Scalar(b)) if a == b && is_numeric_scalar(*a) => {
+                        Some(lt)
+                    }
+                    (
+                        Type::Vector { scalar: sa, len: la },
+                        Type::Vector { scalar: sb, len: lb },
+                    ) if sa == sb && la == lb && is_numeric_scalar(*sa) => Some(lt),
+                    (Type::Vector { scalar: sa, .. }, Type::Scalar(sb))
+                        if sa == sb && is_numeric_scalar(*sa) =>
+                    {
+                        Some(lt)
+                    }
+                    (Type::Scalar(sa), Type::Vector { scalar: sb, .. })
+                        if sa == sb && is_numeric_scalar(*sa) =>
+                    {
+                        Some(rt)
+                    }
+                    (
+                        Type::Matrix {
+                            scalar: sa,
+                            cols: ca,
+                            rows: ra,
+                        },
+                        Type::Matrix {
+                            scalar: sb,
+                            cols: cb,
+                            rows: rb,
+                        },
+                    ) if sa == sb && is_numeric_scalar(*sa) => {
+                        if matches!(op, BinaryOp::Mul) && ca == rb {
+                            Some(self.ctx.module.types.alloc(Type::Matrix {
+                                scalar: *sa,
+                                cols: *cb,
+                                rows: *ra,
+                            }))
+                        } else if matches!(op, BinaryOp::Add | BinaryOp::Sub)
+                            && ca == cb
+                            && ra == rb
+                        {
+                            Some(lt)
+                        } else {
+                            let ln = format_type_name(&self.ctx.module.types, lt);
+                            let rn = format_type_name(&self.ctx.module.types, rt);
+                            self.ctx.diags.push(Diagnostic::error(
+                                "E0270",
+                                format!("incompatible matrix operands `{ln}` and `{rn}`"),
+                                span,
+                            ));
+                            Some(lt)
+                        }
+                    }
+                    (
+                        Type::Matrix {
+                            scalar: sa,
+                            cols,
+                            rows,
+                        },
+                        Type::Vector { scalar: sb, len },
+                    ) if matches!(op, BinaryOp::Mul)
+                        && sa == sb
+                        && cols == len
+                        && is_numeric_scalar(*sa) =>
+                    {
+                        Some(self.ctx.module.types.alloc(Type::Vector {
+                            scalar: *sa,
+                            len: *rows,
+                        }))
+                    }
+                    (
+                        Type::Vector { scalar: sa, len },
+                        Type::Matrix {
+                            scalar: sb,
+                            cols,
+                            rows,
+                        },
+                    ) if matches!(op, BinaryOp::Mul)
+                        && sa == sb
+                        && len == rows
+                        && is_numeric_scalar(*sa) =>
+                    {
+                        Some(self.ctx.module.types.alloc(Type::Vector {
+                            scalar: *sa,
+                            len: *cols,
+                        }))
+                    }
+                    (Type::Matrix { scalar: sa, .. }, Type::Scalar(sb))
+                        if matches!(op, BinaryOp::Mul | BinaryOp::Div)
+                            && sa == sb
+                            && is_numeric_scalar(*sa) =>
+                    {
+                        Some(lt)
+                    }
+                    (Type::Scalar(sa), Type::Matrix { scalar: sb, .. })
+                        if matches!(op, BinaryOp::Mul)
+                            && sa == sb
+                            && is_numeric_scalar(*sa) =>
+                    {
+                        Some(rt)
+                    }
+                    _ => {
+                        let ln = format_type_name(&self.ctx.module.types, lt);
+                        let rn = format_type_name(&self.ctx.module.types, rt);
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0270",
+                            format!("incompatible operand types `{ln}` and `{rn}` for arithmetic operator `{op:?}`"),
+                            span,
+                        ));
+                        Some(lt)
+                    }
+                }
+            }
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => match (&lhs_t, &rhs_t) {
+                (Type::Scalar(a), Type::Scalar(b)) if a == b && is_integer_scalar(*a) => Some(lt),
+                (
+                    Type::Vector { scalar: sa, len: la },
+                    Type::Vector { scalar: sb, len: lb },
+                ) if sa == sb && la == lb && is_integer_scalar(*sa) => Some(lt),
+                (Type::Vector { scalar: sa, .. }, Type::Scalar(sb))
+                    if sa == sb && is_integer_scalar(*sa) =>
+                {
+                    Some(lt)
+                }
+                (Type::Scalar(sa), Type::Vector { scalar: sb, .. })
+                    if sa == sb && is_integer_scalar(*sa) =>
+                {
+                    Some(rt)
+                }
+                _ => {
+                    let ln = format_type_name(&self.ctx.module.types, lt);
+                    let rn = format_type_name(&self.ctx.module.types, rt);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("incompatible operand types `{ln}` and `{rn}` for bitwise operator `{op:?}`"),
+                        span,
+                    ));
+                    Some(lt)
+                }
+            },
+            BinaryOp::Shl | BinaryOp::Shr => match (&lhs_t, &rhs_t) {
+                (Type::Scalar(a), Type::Scalar(b))
+                    if is_integer_scalar(*a) && is_integer_scalar(*b) =>
+                {
+                    Some(lt)
+                }
+                (
+                    Type::Vector { scalar: sa, len: la },
+                    Type::Vector { scalar: sb, len: lb },
+                ) if is_integer_scalar(*sa) && is_integer_scalar(*sb) && la == lb => Some(lt),
+                (Type::Vector { scalar: sa, .. }, Type::Scalar(sb))
+                    if is_integer_scalar(*sa) && is_integer_scalar(*sb) =>
+                {
+                    Some(lt)
+                }
+                _ => {
+                    let ln = format_type_name(&self.ctx.module.types, lt);
+                    let rn = format_type_name(&self.ctx.module.types, rt);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("incompatible operand types `{ln}` and `{rn}` for shift operator `{op:?}`"),
+                        span,
+                    ));
+                    Some(lt)
+                }
+            },
+            BinaryOp::And | BinaryOp::Or => {
+                if lhs_t != Type::Scalar(ScalarKind::Bool)
+                    || rhs_t != Type::Scalar(ScalarKind::Bool)
+                {
+                    let ln = format_type_name(&self.ctx.module.types, lt);
+                    let rn = format_type_name(&self.ctx.module.types, rt);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("logical operator `{op:?}` requires `bool` operands, found `{ln}` and `{rn}`"),
+                        span,
+                    ));
+                }
+                Some(bool_ty)
+            }
+            BinaryOp::Eq | BinaryOp::Ne => {
+                if lt != rt {
+                    let ln = format_type_name(&self.ctx.module.types, lt);
+                    let rn = format_type_name(&self.ctx.module.types, rt);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("cannot compare `{ln}` with `{rn}`"),
+                        span,
+                    ));
+                }
+                Some(bool_ty)
+            }
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => match (&lhs_t, &rhs_t) {
+                (Type::Scalar(a), Type::Scalar(b)) if a == b && is_numeric_scalar(*a) => {
+                    Some(bool_ty)
+                }
+                (
+                    Type::Vector { scalar: sa, len: la },
+                    Type::Vector { scalar: sb, len: lb },
+                ) if sa == sb && la == lb && is_numeric_scalar(*sa) => {
+                    Some(self.ctx.module.types.alloc(Type::Vector {
+                        scalar: ScalarKind::Bool,
+                        len: *la,
+                    }))
+                }
+                _ => {
+                    let ln = format_type_name(&self.ctx.module.types, lt);
+                    let rn = format_type_name(&self.ctx.module.types, rt);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("cannot order-compare `{ln}` and `{rn}`"),
+                        span,
+                    ));
+                    Some(bool_ty)
+                }
+            },
+            BinaryOp::Range | BinaryOp::RangeInclusive => match (&lhs_t, &rhs_t) {
+                (Type::Scalar(a), Type::Scalar(b)) if a == b && is_integer_scalar(*a) => Some(lt),
+                _ => {
+                    let ln = format_type_name(&self.ctx.module.types, lt);
+                    let rn = format_type_name(&self.ctx.module.types, rt);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("range bounds must have matching integer types, found `{ln}` and `{rn}`"),
+                        span,
+                    ));
+                    Some(lt)
+                }
+            },
+            BinaryOp::Assign
+            | BinaryOp::AddAssign
+            | BinaryOp::SubAssign
+            | BinaryOp::MulAssign
+            | BinaryOp::DivAssign
+            | BinaryOp::RemAssign
+            | BinaryOp::BitAndAssign
+            | BinaryOp::BitOrAssign
+            | BinaryOp::BitXorAssign => None,
+        }
+    }
+
+    fn lower_block(&mut self, block: &Block) -> (HirBlock, Option<TypeId>) {
+        self.scopes.push(IndexMap::new());
+        let mut stmts = Vec::with_capacity(block.stmts.len());
+        for stmt in &block.stmts {
+            stmts.push(self.lower_stmt(stmt));
+        }
+        let (tail_expr, tail_ty) = if let Some(tail) = block.tail_expr.as_deref() {
+            let (hir_tail, ty_opt) = self.lower_expr(tail, false);
+            (Some(Box::new(hir_tail)), ty_opt)
+        } else {
+            (None, None)
+        };
+        self.scopes.pop();
+        let ty = tail_ty.unwrap_or_else(|| self.void_ty());
+        (
+            HirBlock {
+                stmts,
+                tail_expr,
+                ty,
+                span: block.span,
+            },
+            tail_ty,
+        )
+    }
+
+    fn lower_stmt(&mut self, stmt: &Stmt) -> HirStmt {
         match stmt {
             Stmt::Let {
+                is_mut,
                 name,
                 ty,
                 init,
                 span,
-                ..
             } => {
                 let mut resolved_ty = None;
                 let mut flagged_logical_ptr = false;
 
                 if let Some(ty_expr) = ty {
-                    check_type_caps_and_legality(ty_expr, self.caps, *span, self.diags);
+                    check_type_caps_and_legality(ty_expr, self.caps, *span, self.ctx.diags);
                     if is_logical_pointer_type(ty_expr) {
-                        self.diags.push(
+                        self.ctx.diags.push(
                             Diagnostic::error(
                                 "E0215",
                                 format!(
@@ -1961,28 +3338,22 @@ impl BodyScanner<'_> {
                     if type_expr_contains_bda(ty_expr) {
                         self.scan.set(FLAG_BDA);
                     }
-                    let mut type_ctx = TypeLowerCtx::full(
-                        self.types,
-                        self.structs,
-                        self.struct_types,
-                        self.struct_ids,
+                    let mut type_ctx = self.ctx.type_ctx();
+                    resolved_ty = lower_type_expr(
+                        ty_expr,
+                        &mut type_ctx,
+                        self.generic_params,
+                        self.type_subst,
                     );
-                    resolved_ty = lower_type_expr(ty_expr, &mut type_ctx, self.generic_params);
                     if let Some(ty_id) = resolved_ty {
-                        check_buffer_struct_bool_inner(
-                            self.types,
-                            self.bool_checked_structs,
-                            self.diags,
-                            ty_id,
-                            *span,
-                        );
+                        self.ctx.check_buffer_struct_bool(ty_id, *span);
                     }
                     if let Some(ty_id) = resolved_ty
-                        && self.types.requires_float16(ty_id)
+                        && self.ctx.module.types.requires_float16(ty_id)
                         && !self.caps.contains(HardwareCaps::FLOAT16)
                         && !type_expr_uses_f16(ty_expr)
                     {
-                        self.diags.push(Diagnostic::error(
+                        self.ctx.diags.push(Diagnostic::error(
                             "E0232",
                             "`f16` types require `#[cap(float16)]` on the enclosing function",
                             *span,
@@ -1990,9 +3361,11 @@ impl BodyScanner<'_> {
                     }
                 }
 
-                let init_ty = init.as_ref().and_then(|expr| {
+                let mut lowered_init = None;
+                let mut init_ty = None;
+                if let Some(expr) = init {
                     if !flagged_logical_ptr && expr_yields_addr_of(expr) {
-                        self.diags.push(
+                        self.ctx.diags.push(
                             Diagnostic::error(
                                 "E0215",
                                 format!(
@@ -2006,79 +3379,265 @@ impl BodyScanner<'_> {
                             ),
                         );
                     }
-                    let inferred = self.scan_expr(expr);
+                    let (hir_init, inferred) = self.lower_expr(expr, false);
                     if let Some(ty_id) = inferred
-                        && self.types.contains_ray_query(ty_id)
+                        && self.ctx.module.types.contains_ray_query(ty_id)
                     {
-                        self.diags.push(Diagnostic::error(
+                        self.ctx.diags.push(Diagnostic::error(
                             "E0217",
                             "`RayQuery` cannot be assigned or copied into another variable",
                             *span,
                         ));
                     }
-                    inferred
-                });
+                    if let (Some(ann_ty), Some(inf_ty)) = (resolved_ty, inferred)
+                        && self.is_concrete_value_ty(ann_ty)
+                        && self.is_concrete_value_ty(inf_ty)
+                        && ann_ty != inf_ty
+                    {
+                        let ann_name = format_type_name(&self.ctx.module.types, ann_ty);
+                        let inf_name = format_type_name(&self.ctx.module.types, inf_ty);
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0270",
+                            format!(
+                                "mismatched initializer type for `{}`: expected `{ann_name}`, found `{inf_name}`",
+                                name.name
+                            ),
+                            *span,
+                        ));
+                    }
+                    init_ty = inferred;
+                    lowered_init = Some(hir_init);
+                }
 
-                self.insert_local(name.name.clone(), resolved_ty.or(init_ty));
+                let final_ty_opt = resolved_ty.or(init_ty);
+                let sym_id = self.insert_local(name.name.clone(), final_ty_opt, *is_mut, *span);
+                let final_ty = final_ty_opt.unwrap_or_else(|| self.void_ty());
+                HirStmt::Let {
+                    symbol: sym_id,
+                    is_mut: *is_mut,
+                    name: name.name.clone(),
+                    ty: final_ty,
+                    init: lowered_init,
+                    span: *span,
+                }
             }
             Stmt::Return { value, span } => {
-                if let Some(expr) = value {
-                    let ty = self.scan_expr(expr);
+                let (hir_val, val_ty) = if let Some(expr) = value {
+                    let (e, ty) = self.lower_expr(expr, false);
                     if let Some(ty_id) = ty
-                        && self.types.contains_ray_query(ty_id)
+                        && self.ctx.module.types.contains_ray_query(ty_id)
                     {
-                        self.diags.push(Diagnostic::error(
+                        self.ctx.diags.push(Diagnostic::error(
                             "E0214",
                             "`RayQuery` cannot be returned from a function",
                             *span,
                         ));
                     }
+                    (Some(e), ty)
+                } else {
+                    (None, None)
+                };
+
+                match (self.expected_return_ty, val_ty) {
+                    (Some(exp_ty), Some(actual_ty))
+                        if self.is_concrete_value_ty(exp_ty)
+                            && self.is_concrete_value_ty(actual_ty)
+                            && exp_ty != actual_ty =>
+                    {
+                        let exp_name = format_type_name(&self.ctx.module.types, exp_ty);
+                        let act_name = format_type_name(&self.ctx.module.types, actual_ty);
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0275",
+                            format!(
+                                "return type mismatch: expected `{exp_name}`, found `{act_name}`"
+                            ),
+                            *span,
+                        ));
+                    }
+                    (Some(exp_ty), None)
+                        if value.is_none() && self.is_concrete_value_ty(exp_ty) =>
+                    {
+                        let exp_name = format_type_name(&self.ctx.module.types, exp_ty);
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0275",
+                            format!("missing return value; expected `{exp_name}`"),
+                            *span,
+                        ));
+                    }
+                    (None, Some(actual_ty)) if self.is_concrete_value_ty(actual_ty) => {
+                        let act_name = format_type_name(&self.ctx.module.types, actual_ty);
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0275",
+                            format!("cannot return a value of type `{act_name}` from a void function"),
+                            *span,
+                        ));
+                    }
+                    _ => {}
+                }
+
+                HirStmt::Return {
+                    value: hir_val,
+                    span: *span,
                 }
             }
             Stmt::For {
                 binding,
                 iter,
                 body,
+                span,
                 ..
             } => {
-                let iter_ty = self.scan_expr(iter);
+                let (hir_iter, iter_ty) = self.lower_expr(iter, false);
                 self.scopes.push(IndexMap::new());
-                self.insert_local(binding.name.clone(), iter_ty);
-                self.scan_block(body);
+                let binding_symbol =
+                    self.insert_local(binding.name.clone(), iter_ty, false, binding.span);
+                let (hir_body, _) = self.lower_block(body);
                 self.scopes.pop();
+                let binding_ty = iter_ty.unwrap_or_else(|| self.void_ty());
+                HirStmt::For {
+                    binding_symbol,
+                    binding: binding.name.clone(),
+                    binding_ty,
+                    iter: hir_iter,
+                    body: hir_body,
+                    span: *span,
+                }
             }
-            Stmt::While { cond, body, .. } => {
-                self.scan_expr(cond);
-                self.scan_block(body);
+            Stmt::While {
+                cond, body, span, ..
+            } => {
+                let (hir_cond, _) = self.lower_expr(cond, false);
+                let (hir_body, _) = self.lower_block(body);
+                HirStmt::While {
+                    cond: hir_cond,
+                    body: hir_body,
+                    span: *span,
+                }
             }
-            Stmt::Loop { body, .. } => {
-                self.scan_block(body);
+            Stmt::Loop { body, span, .. } => {
+                let (hir_body, _) = self.lower_block(body);
+                HirStmt::Loop {
+                    body: hir_body,
+                    span: *span,
+                }
             }
             Stmt::Switch {
                 selector,
                 cases,
                 default,
-                ..
+                span,
             } => {
-                self.scan_expr(selector);
+                let (hir_sel, _) = self.lower_expr(selector, false);
+                let mut hir_cases = Vec::with_capacity(cases.len());
                 for case in cases {
-                    self.scan_expr(&case.value);
-                    self.scan_block(&case.body);
+                    let (val, _) = self.lower_expr(&case.value, false);
+                    let (b, _) = self.lower_block(&case.body);
+                    hir_cases.push(HirSwitchCase {
+                        value: val,
+                        body: b,
+                        span: case.span,
+                    });
                 }
-                if let Some(def_block) = default {
-                    self.scan_block(def_block);
+                let hir_default = default.as_ref().map(|d| self.lower_block(d).0);
+                HirStmt::Switch {
+                    selector: hir_sel,
+                    cases: hir_cases,
+                    default: hir_default,
+                    span: *span,
                 }
             }
-            Stmt::Expr { expr, .. } => {
-                self.scan_expr(expr);
+            Stmt::Expr {
+                expr,
+                has_semi,
+                span,
+            } => {
+                let (hir_expr, _) = self.lower_expr(expr, false);
+                HirStmt::Expr {
+                    expr: hir_expr,
+                    has_semi: *has_semi,
+                    span: *span,
+                }
             }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Break(span) => HirStmt::Break(*span),
+            Stmt::Continue(span) => HirStmt::Continue(*span),
         }
     }
 
-    fn scan_expr(&mut self, expr: &Expr) -> Option<TypeId> {
+    fn lower_call_args(&mut self, args: &[CallArg]) -> (Vec<HirCallArg>, Vec<Option<TypeId>>) {
+        let mut hir_args = Vec::with_capacity(args.len());
+        let mut arg_types = Vec::with_capacity(args.len());
+        for arg in args {
+            let (val, ty) = self.lower_expr(&arg.value, false);
+            arg_types.push(ty);
+            hir_args.push(HirCallArg {
+                name: arg.name.as_ref().map(|n| n.name.clone()),
+                value: val,
+                span: arg.span,
+            });
+        }
+        (hir_args, arg_types)
+    }
+
+    fn check_call_against_sig(
+        &mut self,
+        callee_label: &str,
+        sig_params: &[(SmolStr, ParamMode, Option<TypeId>)],
+        hir_args: &[HirCallArg],
+        arg_types: &[Option<TypeId>],
+        call_span: Span,
+    ) {
+        if hir_args.len() != sig_params.len() {
+            self.ctx.diags.push(Diagnostic::error(
+                "E0274",
+                format!(
+                    "`{callee_label}` expects {} argument(s), but {} were supplied",
+                    sig_params.len(),
+                    hir_args.len()
+                ),
+                call_span,
+            ));
+        }
+
+        for ((param_name, mode, expected_ty_opt), (hir_arg, actual_ty_opt)) in
+            sig_params.iter().zip(hir_args.iter().zip(arg_types.iter()))
+        {
+            if matches!(mode, ParamMode::InOut | ParamMode::Out)
+                && !self.is_lvalue_mutable(&hir_arg.value)
+            {
+                let mode_str = if matches!(mode, ParamMode::InOut) {
+                    "inout"
+                } else {
+                    "out"
+                };
+                self.ctx.diags.push(Diagnostic::error(
+                    "E0272",
+                    format!(
+                        "`{mode_str}` parameter `{param_name}` of `{callee_label}` requires a mutable lvalue argument"
+                    ),
+                    hir_arg.span,
+                ));
+            }
+            if let (Some(exp_ty), Some(act_ty)) = (*expected_ty_opt, *actual_ty_opt)
+                && self.is_concrete_value_ty(exp_ty)
+                && self.is_concrete_value_ty(act_ty)
+                && exp_ty != act_ty
+            {
+                let exp_name = format_type_name(&self.ctx.module.types, exp_ty);
+                let act_name = format_type_name(&self.ctx.module.types, act_ty);
+                self.ctx.diags.push(Diagnostic::error(
+                    "E0274",
+                    format!(
+                        "argument type mismatch for parameter `{param_name}` of `{callee_label}`: expected `{exp_name}`, found `{act_name}`"
+                    ),
+                    hir_arg.span,
+                ));
+            }
+        }
+    }
+
+    fn lower_expr(&mut self, expr: &Expr, is_write_target: bool) -> (HirExpr, Option<TypeId>) {
         match expr {
-            Expr::IntLit(raw, _) => {
+            Expr::IntLit(raw, span) => {
                 let scalar = if raw.ends_with("u64") {
                     ScalarKind::U64
                 } else if raw.ends_with("i64") {
@@ -2088,56 +3647,260 @@ impl BodyScanner<'_> {
                 } else {
                     ScalarKind::I32
                 };
-                Some(self.types.alloc(Type::Scalar(scalar)))
+                let ty = self.ctx.module.types.alloc(Type::Scalar(scalar));
+                (
+                    HirExpr {
+                        kind: HirExprKind::IntLit(raw.clone()),
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    Some(ty),
+                )
             }
             Expr::FloatLit(raw, span) => {
-                if raw.ends_with("f16") {
+                let scalar = if raw.ends_with("f16") {
                     if !self.caps.contains(HardwareCaps::FLOAT16) {
-                        self.diags.push(Diagnostic::error(
+                        self.ctx.diags.push(Diagnostic::error(
                             "E0232",
                             "`f16` literals require `#[cap(float16)]` on the enclosing function",
                             *span,
                         ));
                     }
-                    Some(self.types.alloc(Type::Scalar(ScalarKind::F16)))
+                    ScalarKind::F16
                 } else {
-                    Some(self.types.alloc(Type::Scalar(ScalarKind::F32)))
-                }
+                    ScalarKind::F32
+                };
+                let ty = self.ctx.module.types.alloc(Type::Scalar(scalar));
+                (
+                    HirExpr {
+                        kind: HirExprKind::FloatLit(raw.clone()),
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    Some(ty),
+                )
             }
-            Expr::BoolLit(_, _) => Some(self.types.alloc(Type::Scalar(ScalarKind::Bool))),
-            Expr::StringLit(_, _) | Expr::NoneLit(_) => None,
+            Expr::BoolLit(val, span) => {
+                let ty = self.ctx.module.types.alloc(Type::Scalar(ScalarKind::Bool));
+                (
+                    HirExpr {
+                        kind: HirExprKind::BoolLit(*val),
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    Some(ty),
+                )
+            }
+            Expr::StringLit(val, span) => {
+                let ty = self.void_ty();
+                (
+                    HirExpr {
+                        kind: HirExprKind::StringLit(val.clone()),
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    None,
+                )
+            }
+            Expr::NoneLit(span) => {
+                let ty = self.void_ty();
+                (
+                    HirExpr {
+                        kind: HirExprKind::NoneLit,
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    None,
+                )
+            }
             Expr::Path {
-                path, turbofish, ..
+                path,
+                turbofish,
+                span,
             } => {
                 let joined = path.joined();
+                let mut resolved_ty: Option<TypeId> = None;
+                let mut resolved_sym: Option<SymbolId> = None;
+
                 match joined.as_str() {
-                    "mc::world" => self.scan.set(FLAG_WORLD),
-                    "world" if self.mc_imports.contains("world") && !self.is_shadowed("world") => {
+                    "mc::world" => {
                         self.scan.set(FLAG_WORLD);
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("WorldUBO") {
+                            resolved_ty = Some(ty);
+                            resolved_sym =
+                                Some(self.ctx.get_or_alloc_mc_symbol("mc::world", ty, false, *span));
+                        }
                     }
-                    "mc::tlas" => self.scan.set(FLAG_TLAS),
-                    "tlas" if self.mc_imports.contains("tlas") && !self.is_shadowed("tlas") => {
+                    "world"
+                        if self.ctx.mc_imports.contains("world") && !self.is_shadowed("world") =>
+                    {
+                        self.scan.set(FLAG_WORLD);
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("WorldUBO") {
+                            resolved_ty = Some(ty);
+                            resolved_sym =
+                                Some(self.ctx.get_or_alloc_mc_symbol("mc::world", ty, false, *span));
+                        }
+                    }
+                    "mc::tlas" => {
                         self.scan.set(FLAG_TLAS);
+                        let ty = self.ctx.module.types.alloc(Type::AccelStruct);
+                        resolved_ty = Some(ty);
+                        resolved_sym =
+                            Some(self.ctx.get_or_alloc_mc_symbol("mc::tlas", ty, false, *span));
                     }
-                    "mc::instances" => self.scan.set(FLAG_INSTANCES),
+                    "tlas" if self.ctx.mc_imports.contains("tlas") && !self.is_shadowed("tlas") => {
+                        self.scan.set(FLAG_TLAS);
+                        let ty = self.ctx.module.types.alloc(Type::AccelStruct);
+                        resolved_ty = Some(ty);
+                        resolved_sym =
+                            Some(self.ctx.get_or_alloc_mc_symbol("mc::tlas", ty, false, *span));
+                    }
+                    "mc::instances" => {
+                        self.scan.set(FLAG_INSTANCES);
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("InstanceMetaSSBO") {
+                            resolved_ty = Some(ty);
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::instances",
+                                ty,
+                                false,
+                                *span,
+                            ));
+                        }
+                    }
                     "instances"
-                        if self.mc_imports.contains("instances")
+                        if self.ctx.mc_imports.contains("instances")
                             && !self.is_shadowed("instances") =>
                     {
                         self.scan.set(FLAG_INSTANCES);
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("InstanceMetaSSBO") {
+                            resolved_ty = Some(ty);
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::instances",
+                                ty,
+                                false,
+                                *span,
+                            ));
+                        }
                     }
-                    "mc::lights" => self.scan.set(FLAG_LIGHTS),
+                    "mc::sharc" => {
+                        self.scan.set(FLAG_SHARC);
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("SharcConfigUBO") {
+                            resolved_ty = Some(ty);
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::sharc",
+                                ty,
+                                false,
+                                *span,
+                            ));
+                        }
+                    }
+                    "sharc"
+                        if self.ctx.mc_imports.contains("sharc") && !self.is_shadowed("sharc") =>
+                    {
+                        self.scan.set(FLAG_SHARC);
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("SharcConfigUBO") {
+                            resolved_ty = Some(ty);
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::sharc",
+                                ty,
+                                false,
+                                *span,
+                            ));
+                        }
+                    }
+                    "mc::lights" => {
+                        self.scan.set(FLAG_LIGHTS);
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("EmissiveLightSSBO") {
+                            resolved_ty = Some(ty);
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::lights",
+                                ty,
+                                false,
+                                *span,
+                            ));
+                        }
+                    }
                     "lights"
-                        if self.mc_imports.contains("lights") && !self.is_shadowed("lights") =>
+                        if self.ctx.mc_imports.contains("lights")
+                            && !self.is_shadowed("lights") =>
                     {
                         self.scan.set(FLAG_LIGHTS);
+                        if let Some(&ty) = self.ctx.builtin_struct_types.get("EmissiveLightSSBO") {
+                            resolved_ty = Some(ty);
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::lights",
+                                ty,
+                                false,
+                                *span,
+                            ));
+                        }
                     }
-                    "mc::bindless" => self.scan.set(FLAG_BINDLESS),
+                    "mc::reservoirs" => {
+                        self.scan.set(FLAG_RESERVOIRS);
+                        if let Some(&ty) =
+                            self.ctx.builtin_struct_types.get("RestirReservoirSSBO")
+                        {
+                            resolved_ty = Some(ty);
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::reservoirs",
+                                ty,
+                                true,
+                                *span,
+                            ));
+                        }
+                    }
+                    "reservoirs"
+                        if self.ctx.mc_imports.contains("reservoirs")
+                            && !self.is_shadowed("reservoirs") =>
+                    {
+                        self.scan.set(FLAG_RESERVOIRS);
+                        if let Some(&ty) =
+                            self.ctx.builtin_struct_types.get("RestirReservoirSSBO")
+                        {
+                            resolved_ty = Some(ty);
+                            resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                                "mc::reservoirs",
+                                ty,
+                                true,
+                                *span,
+                            ));
+                        }
+                    }
+                    "mc::bindless" => {
+                        self.scan.set(FLAG_BINDLESS);
+                        let ty = self.ctx.module.types.alloc(Type::Texture2D {
+                            sample_scalar: ScalarKind::F32,
+                            unsized_array: true,
+                        });
+                        resolved_ty = Some(ty);
+                        resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                            "mc::bindless",
+                            ty,
+                            false,
+                            *span,
+                        ));
+                    }
                     "bindless"
-                        if self.mc_imports.contains("bindless")
+                        if self.ctx.mc_imports.contains("bindless")
                             && !self.is_shadowed("bindless") =>
                     {
                         self.scan.set(FLAG_BINDLESS);
+                        let ty = self.ctx.module.types.alloc(Type::Texture2D {
+                            sample_scalar: ScalarKind::F32,
+                            unsized_array: true,
+                        });
+                        resolved_ty = Some(ty);
+                        resolved_sym = Some(self.ctx.get_or_alloc_mc_symbol(
+                            "mc::bindless",
+                            ty,
+                            false,
+                            *span,
+                        ));
                     }
                     _ => {}
                 }
@@ -2146,6 +3909,10 @@ impl BodyScanner<'_> {
                     && !res_name.is_empty()
                 {
                     self.scan.pack_resources.insert(SmolStr::new(res_name));
+                    resolved_ty = Some(self.ctx.module.types.alloc(Type::Texture2D {
+                        sample_scalar: ScalarKind::F32,
+                        unsized_array: false,
+                    }));
                 }
 
                 if let Some(spec_name) = joined
@@ -2153,6 +3920,18 @@ impl BodyScanner<'_> {
                     .or_else(|| joined.strip_prefix("mc::spec::"))
                 {
                     self.scan.used_specs.insert(SmolStr::new(spec_name));
+                    if let Some(schema) = self.ctx.schema
+                        && let Some(spec_def) = schema.spec_defaults.get(spec_name)
+                    {
+                        resolved_ty = Some(pack_param_type_to_id(
+                            spec_def.ty,
+                            &mut self.ctx.module.types,
+                        ));
+                    }
+                }
+
+                if joined.starts_with("mc::RayFlags::") || joined.starts_with("mc::HitType::") {
+                    resolved_ty = Some(self.ctx.module.types.alloc(Type::Scalar(ScalarKind::U32)));
                 }
 
                 if let Some(last) = path.segments.last()
@@ -2161,34 +3940,61 @@ impl BodyScanner<'_> {
                     self.scan.set(FLAG_SUBGROUPS);
                 }
 
+                let mut lowered_turbofish = Vec::new();
                 for arg in turbofish {
-                    if let TypeArg::Type(ty_expr) = arg
-                        && type_expr_contains_bda(ty_expr)
-                    {
-                        self.scan.set(FLAG_BDA);
+                    if let TypeArg::Type(ty_expr) = arg {
+                        if type_expr_contains_bda(ty_expr) {
+                            self.scan.set(FLAG_BDA);
+                        }
+                        let mut type_ctx = self.ctx.type_ctx();
+                        if let Some(tid) = lower_type_expr(
+                            ty_expr,
+                            &mut type_ctx,
+                            self.generic_params,
+                            self.type_subst,
+                        ) {
+                            lowered_turbofish.push(tid);
+                        }
                     }
                 }
 
-                if path.segments.len() == 1 {
+                if resolved_ty.is_none() && path.segments.len() == 1 {
                     let ident = path.segments[0].name.as_str();
                     if self.is_non_compute_stage
                         && !self.is_shadowed(ident)
-                        && self.workgroup_var_types.contains_key(ident)
+                        && self.ctx.workgroup_var_types.contains_key(ident)
                     {
-                        self.diags.push(Diagnostic::error(
+                        self.ctx.diags.push(Diagnostic::error(
                             "E0251",
                             format!("`workgroup var` `{ident}` is only valid in compute shaders"),
                             path.span,
                         ));
                     }
-                    self.lookup_var_type(ident)
-                } else {
-                    None
+                    let (vty, vsym) = self.lookup_var(ident);
+                    resolved_ty = vty;
+                    resolved_sym = vsym;
                 }
+
+                let ty = resolved_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::Path {
+                            path: SmolStr::new(joined),
+                            turbofish: lowered_turbofish,
+                        },
+                        ty,
+                        symbol: resolved_sym,
+                        span: *span,
+                    },
+                    resolved_ty,
+                )
             }
             Expr::Call { callee, args, span } => {
                 let mut callee_path = None;
                 let mut callee_name = None;
+                let mut mc_param_ty: Option<TypeId> = None;
+                let mut mc_spec_ty: Option<TypeId> = None;
+
                 if let Expr::Path { path, .. } = callee.as_ref() {
                     let joined = path.joined();
                     if joined == "mc::debug_write" {
@@ -2199,7 +4005,7 @@ impl BodyScanner<'_> {
                                 self.scan.debug_channels.insert(channel.clone());
                             }
                         } else {
-                            self.diags.push(Diagnostic::error(
+                            self.ctx.diags.push(Diagnostic::error(
                                 "E0250",
                                 "`mc::debug_write` is only valid inside `@stage(compute(...))` entry points",
                                 *span,
@@ -2207,12 +4013,26 @@ impl BodyScanner<'_> {
                         }
                     } else if joined == "mc::param" {
                         if let Some(name) = extract_name_arg(args.first().map(|a| &a.value)) {
-                            self.scan.used_params.insert(name);
+                            self.scan.used_params.insert(name.clone());
+                            if let Some(schema) = self.ctx.schema
+                                && let Some(&pt) = schema.param_types.get(&name)
+                            {
+                                mc_param_ty =
+                                    Some(pack_param_type_to_id(pt, &mut self.ctx.module.types));
+                            }
                         }
                     } else if joined == "mc::spec"
                         && let Some(name) = extract_name_arg(args.first().map(|a| &a.value))
                     {
-                        self.scan.used_specs.insert(name);
+                        self.scan.used_specs.insert(name.clone());
+                        if let Some(schema) = self.ctx.schema
+                            && let Some(spec_def) = schema.spec_defaults.get(&name)
+                        {
+                            mc_spec_ty = Some(pack_param_type_to_id(
+                                spec_def.ty,
+                                &mut self.ctx.module.types,
+                            ));
+                        }
                     }
 
                     if let Some(last) = path.segments.last() {
@@ -2224,17 +4044,14 @@ impl BodyScanner<'_> {
                     callee_path = Some(joined);
                 }
 
-                self.scan_expr(callee);
-                let mut arg_types = Vec::with_capacity(args.len());
-                for arg in args {
-                    arg_types.push(self.scan_expr(&arg.value));
-                }
+                let (hir_callee, _) = self.lower_expr(callee, false);
+                let (hir_args, arg_types) = self.lower_call_args(args);
 
                 if let Some(ref fn_name) = callee_name {
                     if matches!(fn_name.as_str(), "f16" | "f16vec2" | "f16vec3" | "f16vec4")
                         && !self.caps.contains(HardwareCaps::FLOAT16)
                     {
-                        self.diags.push(
+                        self.ctx.diags.push(
                             Diagnostic::error(
                                 "E0232",
                                 format!(
@@ -2252,50 +4069,362 @@ impl BodyScanner<'_> {
                     }
                 }
 
-                // Infer constructor/cast or declared module function return types.
-                callee_name
+                // Attempt generic function monomorphization if callee is a generic function template.
+                let mut resolved_fn: Option<HirFnId> = None;
+                let mut mono_sig: Option<FnSig> = None;
+                if let Some(ref cp) = callee_path
+                    && let Some(template) = self.ctx.generic_fn_templates.get(cp.as_str()).cloned()
+                {
+                    let explicit_targs = match &hir_callee.kind {
+                        HirExprKind::Path { turbofish, .. } if !turbofish.is_empty() => {
+                            Some(turbofish.clone())
+                        }
+                        _ => None,
+                    };
+                    let inferred_targs = explicit_targs.or_else(|| {
+                        let base_sig = self.ctx.fn_sigs.get(cp.as_str())?.clone();
+                        let mut inferred_map: IndexMap<SmolStr, TypeId> = IndexMap::new();
+                        for ((_, _, param_ty_opt), arg_ty_opt) in
+                            base_sig.params.iter().zip(arg_types.iter())
+                        {
+                            if let (Some(pt), Some(at)) = (*param_ty_opt, *arg_ty_opt) {
+                                unify_type_params(
+                                    &self.ctx.module.types,
+                                    pt,
+                                    at,
+                                    &mut inferred_map,
+                                );
+                            }
+                        }
+                        let mut ordered = Vec::with_capacity(template.generic_params.len());
+                        for (gname, _) in &template.generic_params {
+                            ordered.push(*inferred_map.get(gname)?);
+                        }
+                        Some(ordered)
+                    });
+                    if let Some(targs) = inferred_targs
+                        && let Some(mono_id) =
+                            self.ctx.monomorphize_function(cp.as_str(), &targs, *span)
+                    {
+                        resolved_fn = Some(mono_id);
+                        let func = &self.ctx.module.functions[mono_id];
+                        mono_sig = Some(FnSig {
+                            params: func
+                                .params
+                                .iter()
+                                .map(|p| (p.name.clone(), p.mode, p.ty))
+                                .collect(),
+                            return_ty: func.return_ty,
+                            fn_id: Some(mono_id),
+                        });
+                    }
+                }
+
+                // Typecheck arguments against declared signature (if this is a declared user fn).
+                let is_builtin_ctor = callee_name
                     .as_deref()
-                    .and_then(|name| infer_builtin_constructor_type(name, self.types))
-                    .or_else(|| {
-                        callee_path
+                    .and_then(|n| infer_builtin_constructor_type(n, &mut self.ctx.module.types))
+                    .is_some();
+
+                let mut ret_ty: Option<TypeId> = mc_param_ty.or(mc_spec_ty);
+                if let Some(sig) = mono_sig {
+                    let label = callee_path.as_deref().unwrap_or("<fn>");
+                    self.check_call_against_sig(label, &sig.params, &hir_args, &arg_types, *span);
+                    ret_ty = sig.return_ty;
+                } else if !is_builtin_ctor {
+                    let found_sig = callee_path
+                        .as_deref()
+                        .and_then(|p| self.ctx.fn_sigs.get(p).cloned())
+                        .or_else(|| {
+                            callee_name
+                                .as_deref()
+                                .and_then(|n| self.ctx.fn_sigs.get(n).cloned())
+                        });
+                    if let Some(sig) = found_sig {
+                        resolved_fn = sig.fn_id;
+                        let label = callee_path
                             .as_deref()
-                            .and_then(|path| self.fn_return_types.get(path).copied())
-                    })
-                    .or_else(|| {
-                        callee_name
-                            .as_deref()
-                            .and_then(|name| self.fn_return_types.get(name).copied())
-                    })
+                            .or(callee_name.as_deref())
+                            .unwrap_or("<fn>");
+                        self.check_call_against_sig(
+                            label,
+                            &sig.params,
+                            &hir_args,
+                            &arg_types,
+                            *span,
+                        );
+                        ret_ty = sig.return_ty;
+                    }
+                }
+
+                if ret_ty.is_none() {
+                    ret_ty = callee_name
+                        .as_deref()
+                        .and_then(|name| {
+                            infer_builtin_constructor_type(name, &mut self.ctx.module.types)
+                        })
+                        .or_else(|| {
+                            callee_path.as_deref().and_then(|p| {
+                                infer_builtin_call_return_type(
+                                    p,
+                                    &arg_types,
+                                    &mut self.ctx.module.types,
+                                )
+                            })
+                        })
+                        .or_else(|| {
+                            callee_name.as_deref().and_then(|n| {
+                                infer_builtin_call_return_type(
+                                    n,
+                                    &arg_types,
+                                    &mut self.ctx.module.types,
+                                )
+                            })
+                        })
+                        .or_else(|| {
+                            callee_path
+                                .as_deref()
+                                .and_then(|p| self.ctx.fn_return_types.get(p).copied())
+                        })
+                        .or_else(|| {
+                            callee_name
+                                .as_deref()
+                                .and_then(|n| self.ctx.fn_return_types.get(n).copied())
+                        });
+                }
+
+                let ty = ret_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::Call {
+                            callee: Box::new(hir_callee),
+                            resolved_fn,
+                            args: hir_args,
+                        },
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    ret_ty,
+                )
             }
             Expr::MethodCall {
                 receiver,
                 method,
                 turbofish,
                 args,
-                ..
+                span,
             } => {
+                let mut lowered_turbofish = Vec::new();
                 for arg in turbofish {
-                    if let TypeArg::Type(ty_expr) = arg
-                        && type_expr_contains_bda(ty_expr)
-                    {
-                        self.scan.set(FLAG_BDA);
+                    if let TypeArg::Type(ty_expr) = arg {
+                        if type_expr_contains_bda(ty_expr) {
+                            self.scan.set(FLAG_BDA);
+                        }
+                        let mut type_ctx = self.ctx.type_ctx();
+                        if let Some(tid) = lower_type_expr(
+                            ty_expr,
+                            &mut type_ctx,
+                            self.generic_params,
+                            self.type_subst,
+                        ) {
+                            lowered_turbofish.push(tid);
+                        }
                     }
                 }
-                let recv_ty = self.scan_expr(receiver);
-                for arg in args {
-                    self.scan_expr(&arg.value);
+                let (hir_recv, recv_ty) = self.lower_expr(receiver, false);
+                let (hir_args, arg_types) = self.lower_call_args(args);
+
+                let mut resolved_fn: Option<HirFnId> = None;
+                let mut ret_ty: Option<TypeId> = None;
+
+                if method.name == "offset" || method.name == "step_by" {
+                    ret_ty = recv_ty;
+                } else if let Some(rty) = recv_ty {
+                    let base_ty = match self.ctx.module.types.get(rty) {
+                        Type::Pointer { pointee, .. } => *pointee,
+                        _ => rty,
+                    };
+                    match self.ctx.module.types.get(base_ty).clone() {
+                        Type::Struct { name, .. } => {
+                            // 1. Check concrete inherent/trait impl methods first.
+                            let concrete_id = self
+                                .ctx
+                                .find_concrete_method(name.as_str(), method.name.as_str())
+                                .or_else(|| {
+                                    // 2. If `name` is a monomorphized generic struct (e.g.
+                                    // `Reservoir<MySample>`), instantiate the `impl<T: Trait>` method!
+                                    self.ctx.monomorphize_impl_method(
+                                        base_ty,
+                                        method.name.as_str(),
+                                        *span,
+                                    )
+                                });
+
+                            if let Some(fn_id) = concrete_id {
+                                resolved_fn = Some(fn_id);
+                                let (fn_params, fn_ret) = {
+                                    let f = &self.ctx.module.functions[fn_id];
+                                    let ps: Vec<(SmolStr, ParamMode, Option<TypeId>)> = f
+                                        .params
+                                        .iter()
+                                        .map(|p| (p.name.clone(), p.mode, p.ty))
+                                        .collect();
+                                    (ps, f.return_ty)
+                                };
+                                let label = format!("{name}::{}", method.name);
+                                if let Some((first_name, first_mode, _)) = fn_params.first()
+                                    && first_name == "self"
+                                {
+                                    if matches!(first_mode, ParamMode::InOut | ParamMode::Out)
+                                        && !self.is_lvalue_mutable(&hir_recv)
+                                    {
+                                        self.ctx.diags.push(Diagnostic::error(
+                                            "E0272",
+                                            format!(
+                                                "method `{label}` requires a mutable receiver for `self`"
+                                            ),
+                                            hir_recv.span,
+                                        ));
+                                    }
+                                    self.check_call_against_sig(
+                                        &label,
+                                        &fn_params[1..],
+                                        &hir_args,
+                                        &arg_types,
+                                        *span,
+                                    );
+                                } else {
+                                    self.check_call_against_sig(
+                                        &label,
+                                        &fn_params,
+                                        &hir_args,
+                                        &arg_types,
+                                        *span,
+                                    );
+                                }
+                                ret_ty = fn_ret;
+                            } else {
+                                let qualified = format!("{name}::{}", method.name);
+                                if let Some(sig) = self.ctx.fn_sigs.get(qualified.as_str()).cloned()
+                                {
+                                    resolved_fn = sig.fn_id;
+                                    if let Some((first_name, first_mode, _)) = sig.params.first()
+                                        && first_name == "self"
+                                    {
+                                        if matches!(first_mode, ParamMode::InOut | ParamMode::Out)
+                                            && !self.is_lvalue_mutable(&hir_recv)
+                                        {
+                                            self.ctx.diags.push(Diagnostic::error(
+                                                "E0272",
+                                                format!(
+                                                    "method `{qualified}` requires a mutable receiver for `self`"
+                                                ),
+                                                hir_recv.span,
+                                            ));
+                                        }
+                                        self.check_call_against_sig(
+                                            &qualified,
+                                            &sig.params[1..],
+                                            &hir_args,
+                                            &arg_types,
+                                            *span,
+                                        );
+                                    } else {
+                                        self.check_call_against_sig(
+                                            &qualified,
+                                            &sig.params,
+                                            &hir_args,
+                                            &arg_types,
+                                            *span,
+                                        );
+                                    }
+                                    ret_ty = sig.return_ty;
+                                } else {
+                                    ret_ty =
+                                        self.ctx.fn_return_types.get(qualified.as_str()).copied();
+                                }
+                            }
+                        }
+                        Type::TypeParam(param_name) => {
+                            // Resolve trait-bounded method calls (e.g. `self.sample.target_pdf(...)`).
+                            if let Some(bound_trait) = self.generic_bounds.get(&param_name)
+                                && let Some(methods) = self.ctx.trait_method_sigs.get(bound_trait)
+                                && let Some(sig) = methods.get(method.name.as_str()).cloned()
+                            {
+                                let label = format!("{bound_trait}::{}", method.name);
+                                let check_params = if sig
+                                    .params
+                                    .first()
+                                    .is_some_and(|(n, _, _)| n == "self")
+                                {
+                                    &sig.params[1..]
+                                } else {
+                                    &sig.params[..]
+                                };
+                                self.check_call_against_sig(
+                                    &label,
+                                    check_params,
+                                    &hir_args,
+                                    &arg_types,
+                                    *span,
+                                );
+                                ret_ty = sig.return_ty;
+                            }
+                        }
+                        Type::RayQuery => {
+                            ret_ty = infer_rayquery_method_return(
+                                method.name.as_str(),
+                                &mut self.ctx.module.types,
+                            );
+                        }
+                        Type::Texture2D { sample_scalar, .. }
+                        | Type::Texture2DArray { sample_scalar }
+                        | Type::Texture3D { sample_scalar }
+                        | Type::TextureCube { sample_scalar } => {
+                            if matches!(
+                                method.name.as_str(),
+                                "sample" | "sample_lod" | "sample_grad" | "fetch" | "load"
+                            ) {
+                                ret_ty = Some(self.ctx.module.types.alloc(Type::Vector {
+                                    scalar: sample_scalar,
+                                    len: 4,
+                                }));
+                            }
+                        }
+                        _ => {
+                            if let Type::Pointer { pointee, .. } = self.ctx.module.types.get(rty)
+                                && method.name == "load"
+                            {
+                                ret_ty = Some(*pointee);
+                            }
+                        }
+                    }
                 }
-                if method.name == "offset" {
-                    recv_ty
-                } else {
-                    recv_ty.and_then(|ty_id| {
-                        self.resolve_method_return_type(ty_id, method.name.as_str())
-                    })
-                }
+
+                let ty = ret_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::MethodCall {
+                            receiver: Box::new(hir_recv),
+                            method: method.name.clone(),
+                            resolved_fn,
+                            turbofish: lowered_turbofish,
+                            args: hir_args,
+                        },
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    ret_ty,
+                )
             }
             Expr::Field {
-                receiver, field, ..
+                receiver,
+                field,
+                span,
             } => {
+                let mut pack_field_ty: Option<TypeId> = None;
                 if let Expr::Path { path, .. } = receiver.as_ref() {
                     let joined = path.joined();
                     if joined == "pack::params"
@@ -2303,72 +4432,358 @@ impl BodyScanner<'_> {
                         || (joined == "params" && !self.is_shadowed("params"))
                     {
                         self.scan.used_params.insert(field.name.clone());
+                        if let Some(schema) = self.ctx.schema
+                            && let Some(&pt) = schema.param_types.get(&field.name)
+                        {
+                            pack_field_ty =
+                                Some(pack_param_type_to_id(pt, &mut self.ctx.module.types));
+                        }
                     } else if joined == "mc::spec"
                         || (joined == "spec" && !self.is_shadowed("spec"))
                     {
                         self.scan.used_specs.insert(field.name.clone());
+                        if let Some(schema) = self.ctx.schema
+                            && let Some(spec_def) = schema.spec_defaults.get(&field.name)
+                        {
+                            pack_field_ty = Some(pack_param_type_to_id(
+                                spec_def.ty,
+                                &mut self.ctx.module.types,
+                            ));
+                        }
                     }
                 }
-                let recv_ty = self.scan_expr(receiver)?;
-                self.resolve_field_type(recv_ty, field.name.as_str())
-            }
-            Expr::StructLit { path, fields, .. } => {
-                for (_, value) in fields {
-                    self.scan_expr(value);
+
+                let (hir_recv, recv_ty) = self.lower_expr(receiver, false);
+
+                if let Some(rty) = recv_ty {
+                    let base_ty = match self.ctx.module.types.get(rty) {
+                        Type::Pointer { pointee, .. } => *pointee,
+                        _ => rty,
+                    };
+                    match self.ctx.module.types.get(base_ty).clone() {
+                        Type::Vector { scalar, len } => {
+                            match parse_vector_swizzle(field.name.as_str(), len, is_write_target) {
+                                Ok(components) => {
+                                    let swizzle_ty = if components.len() == 1 {
+                                        self.ctx.module.types.alloc(Type::Scalar(scalar))
+                                    } else {
+                                        self.ctx.module.types.alloc(Type::Vector {
+                                            scalar,
+                                            len: components.len() as u8,
+                                        })
+                                    };
+                                    return (
+                                        HirExpr {
+                                            kind: HirExprKind::Swizzle {
+                                                base: Box::new(hir_recv),
+                                                components,
+                                                is_write: is_write_target,
+                                            },
+                                            ty: swizzle_ty,
+                                            symbol: None,
+                                            span: *span,
+                                        },
+                                        Some(swizzle_ty),
+                                    );
+                                }
+                                Err(err) => {
+                                    let msg = match err {
+                                        SwizzleError::InvalidLength => format!(
+                                            "invalid vector swizzle `.{}`: length must be 1..=4",
+                                            field.name
+                                        ),
+                                        SwizzleError::InvalidComponent => format!(
+                                            "invalid vector swizzle `.{}`: components must be from `xyzw`, `rgba`, or `stpq`",
+                                            field.name
+                                        ),
+                                        SwizzleError::MixedSets => format!(
+                                            "invalid vector swizzle `.{}`: cannot mix component sets (`xyzw`/`rgba`/`stpq`)",
+                                            field.name
+                                        ),
+                                        SwizzleError::OutOfRange { component, vec_len } => {
+                                            format!(
+                                                "swizzle component `{component}` is out of bounds for {vec_len}-component vector"
+                                            )
+                                        }
+                                        SwizzleError::DuplicateWriteComponent(ch) => format!(
+                                            "duplicate component `{ch}` in write swizzle `.{}`",
+                                            field.name
+                                        ),
+                                    };
+                                    self.ctx.diags.push(Diagnostic::error("E0273", msg, *span));
+                                    let void = self.void_ty();
+                                    return (
+                                        HirExpr {
+                                            kind: HirExprKind::Field {
+                                                receiver: Box::new(hir_recv),
+                                                field: field.name.clone(),
+                                                field_index: None,
+                                            },
+                                            ty: void,
+                                            symbol: None,
+                                            span: *span,
+                                        },
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                        Type::Struct { fields, .. } => {
+                            let found = fields
+                                .iter()
+                                .enumerate()
+                                .find(|(_, (name, _))| *name == field.name);
+                            let (field_ty_opt, field_index) = match found {
+                                Some((idx, (_, ty_id))) => (Some(*ty_id), Some(idx as u32)),
+                                None => (pack_field_ty, None),
+                            };
+                            let ty = field_ty_opt.unwrap_or_else(|| self.void_ty());
+                            return (
+                                HirExpr {
+                                    kind: HirExprKind::Field {
+                                        receiver: Box::new(hir_recv),
+                                        field: field.name.clone(),
+                                        field_index,
+                                    },
+                                    ty,
+                                    symbol: None,
+                                    span: *span,
+                                },
+                                field_ty_opt,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
-                self.struct_types.get(path.joined().as_str()).copied()
+
+                let ty = pack_field_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::Field {
+                            receiver: Box::new(hir_recv),
+                            field: field.name.clone(),
+                            field_index: None,
+                        },
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    pack_field_ty,
+                )
             }
-            Expr::Unary { op, operand, .. } => {
-                let inner = self.scan_expr(operand);
-                match op {
-                    UnaryOp::Not => Some(self.types.alloc(Type::Scalar(ScalarKind::Bool))),
-                    UnaryOp::AddrOf | UnaryOp::Neg | UnaryOp::BitNot => inner,
+            Expr::StructLit { path, fields, span } => {
+                let mut hir_fields = Vec::with_capacity(fields.len());
+                for (fname, fval) in fields {
+                    let (v, _) = self.lower_expr(fval, false);
+                    hir_fields.push((fname.name.clone(), v));
                 }
+                let struct_name = SmolStr::new(path.joined());
+                let resolved_ty = self
+                    .ctx
+                    .struct_types
+                    .get(struct_name.as_str())
+                    .copied()
+                    .or_else(|| {
+                        self.ctx
+                            .builtin_struct_types
+                            .get(struct_name.as_str())
+                            .copied()
+                    });
+                let ty = resolved_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::StructLit {
+                            struct_name,
+                            fields: hir_fields,
+                        },
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    resolved_ty,
+                )
+            }
+            Expr::Unary { op, operand, span } => {
+                let (hir_op, inner_ty) = self.lower_expr(operand, false);
+                let result_ty = match op {
+                    UnaryOp::Not => {
+                        if let Some(it) = inner_ty
+                            && self.is_concrete_value_ty(it)
+                        {
+                            match self.ctx.module.types.get(it) {
+                                Type::Scalar(ScalarKind::Bool)
+                                | Type::Vector {
+                                    scalar: ScalarKind::Bool,
+                                    ..
+                                } => {}
+                                _ => {
+                                    let tname = format_type_name(&self.ctx.module.types, it);
+                                    self.ctx.diags.push(Diagnostic::error(
+                                        "E0270",
+                                        format!("logical `!` requires `bool` operand, found `{tname}`"),
+                                        *span,
+                                    ));
+                                }
+                            }
+                        }
+                        Some(self.ctx.module.types.alloc(Type::Scalar(ScalarKind::Bool)))
+                    }
+                    UnaryOp::Neg => {
+                        if let Some(it) = inner_ty
+                            && self.is_concrete_value_ty(it)
+                        {
+                            let valid = matches!(
+                                self.ctx.module.types.get(it),
+                                Type::Scalar(s)
+                                | Type::Vector { scalar: s, .. }
+                                | Type::Matrix { scalar: s, .. } if is_numeric_scalar(*s)
+                            );
+                            if !valid {
+                                let tname = format_type_name(&self.ctx.module.types, it);
+                                self.ctx.diags.push(Diagnostic::error(
+                                    "E0270",
+                                    format!("unary `-` requires numeric operand, found `{tname}`"),
+                                    *span,
+                                ));
+                            }
+                        }
+                        inner_ty
+                    }
+                    UnaryOp::BitNot => {
+                        if let Some(it) = inner_ty
+                            && self.is_concrete_value_ty(it)
+                        {
+                            let valid = matches!(
+                                self.ctx.module.types.get(it),
+                                Type::Scalar(s) | Type::Vector { scalar: s, .. } if is_integer_scalar(*s)
+                            );
+                            if !valid {
+                                let tname = format_type_name(&self.ctx.module.types, it);
+                                self.ctx.diags.push(Diagnostic::error(
+                                    "E0270",
+                                    format!("bitwise `~` requires integer operand, found `{tname}`"),
+                                    *span,
+                                ));
+                            }
+                        }
+                        inner_ty
+                    }
+                    UnaryOp::AddrOf => inner_ty,
+                };
+                let ty = result_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::Unary {
+                            op: *op,
+                            operand: Box::new(hir_op),
+                        },
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    result_ty,
+                )
             }
             Expr::Binary { op, lhs, rhs, span } => {
-                let lhs_ty = self.scan_expr(lhs);
-                let rhs_ty = self.scan_expr(rhs);
+                let is_assign = is_assignment_op(*op);
+                let (hir_lhs, lhs_ty) = self.lower_expr(lhs, is_assign);
+                let (hir_rhs, rhs_ty) = self.lower_expr(rhs, false);
+
+                if is_assign && !self.is_lvalue_mutable(&hir_lhs) {
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0271",
+                        "cannot assign to immutable variable or non-mutable lvalue",
+                        hir_lhs.span,
+                    ));
+                }
+
                 if matches!(op, BinaryOp::Assign) {
                     if expr_yields_addr_of(rhs) {
-                        self.diags.push(Diagnostic::error(
+                        self.ctx.diags.push(Diagnostic::error(
                             "E0215",
                             "assigning a logical pointer (`&...`) to a variable is forbidden in SPIR-V",
                             *span,
                         ));
                     }
-                    if lhs_ty.is_some_and(|t| self.types.contains_ray_query(t))
-                        || rhs_ty.is_some_and(|t| self.types.contains_ray_query(t))
+                    if lhs_ty.is_some_and(|t| self.ctx.module.types.contains_ray_query(t))
+                        || rhs_ty.is_some_and(|t| self.ctx.module.types.contains_ray_query(t))
                     {
-                        self.diags.push(Diagnostic::error(
+                        self.ctx.diags.push(Diagnostic::error(
                             "E0217",
                             "`RayQuery` cannot be assigned or copied",
                             *span,
                         ));
                     }
                 }
-                match op {
-                    BinaryOp::Eq
-                    | BinaryOp::Ne
-                    | BinaryOp::Lt
-                    | BinaryOp::Le
-                    | BinaryOp::Gt
-                    | BinaryOp::Ge
-                    | BinaryOp::And
-                    | BinaryOp::Or => Some(self.types.alloc(Type::Scalar(ScalarKind::Bool))),
-                    _ => lhs_ty.or(rhs_ty),
-                }
+
+                let res_ty = self.check_binary_types(*op, lhs_ty, rhs_ty, *span);
+                let ty = res_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::Binary {
+                            op: *op,
+                            lhs: Box::new(hir_lhs),
+                            rhs: Box::new(hir_rhs),
+                        },
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    res_ty,
+                )
             }
             Expr::Index {
-                receiver, index, ..
+                receiver,
+                index,
+                span,
             } => {
-                let recv_ty = self.scan_expr(receiver);
-                self.scan_expr(index);
-                recv_ty.and_then(|ty_id| match self.types.get(ty_id) {
-                    Type::Array { element, .. }
-                    | Type::Buffer { element }
-                    | Type::RwBuffer { element } => Some(*element),
-                    _ => None,
-                })
+                let (hir_recv, recv_ty) = self.lower_expr(receiver, false);
+                let (hir_idx, _) = self.lower_expr(index, false);
+                let elem_ty = recv_ty.and_then(|ty_id| {
+                    match self.ctx.module.types.get(ty_id).clone() {
+                        Type::Array { element, .. }
+                        | Type::Buffer { element }
+                        | Type::RwBuffer { element } => Some(element),
+                        Type::Texture2D {
+                            sample_scalar,
+                            unsized_array: true,
+                        } => Some(self.ctx.module.types.alloc(Type::Texture2D {
+                            sample_scalar,
+                            unsized_array: false,
+                        })),
+                        Type::Vector { scalar, .. } => {
+                            Some(self.ctx.module.types.alloc(Type::Scalar(scalar)))
+                        }
+                        Type::Matrix { scalar, rows, .. } => {
+                            Some(self.ctx.module.types.alloc(Type::Vector {
+                                scalar,
+                                len: rows,
+                            }))
+                        }
+                        Type::Struct { fields, .. } if fields.len() == 1 && fields[0].0 == "items" => {
+                            match self.ctx.module.types.get(fields[0].1) {
+                                Type::Buffer { element } | Type::RwBuffer { element } => {
+                                    Some(*element)
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                });
+                let ty = elem_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::Index {
+                            receiver: Box::new(hir_recv),
+                            index: Box::new(hir_idx),
+                        },
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    elem_ty,
+                )
             }
             Expr::If {
                 cond,
@@ -2376,14 +4791,19 @@ impl BodyScanner<'_> {
                 else_branch,
                 span,
             } => {
-                self.scan_expr(cond);
-                let then_ty = self.scan_block(then_branch);
-                let else_ty = else_branch.as_deref().and_then(|eb| self.scan_expr(eb));
+                let (hir_cond, _) = self.lower_expr(cond, false);
+                let (hir_then, then_ty) = self.lower_block(then_branch);
+                let (hir_else, else_ty) = if let Some(eb) = else_branch.as_deref() {
+                    let (e, ty) = self.lower_expr(eb, false);
+                    (Some(Box::new(e)), ty)
+                } else {
+                    (None, None)
+                };
                 if else_branch.is_some()
-                    && (then_ty.is_some_and(|t| self.types.contains_ray_query(t))
-                        || else_ty.is_some_and(|t| self.types.contains_ray_query(t)))
+                    && (then_ty.is_some_and(|t| self.ctx.module.types.contains_ray_query(t))
+                        || else_ty.is_some_and(|t| self.ctx.module.types.contains_ray_query(t)))
                 {
-                    self.diags.push(
+                    self.ctx.diags.push(
                         Diagnostic::error(
                             "E0216",
                             "`RayQuery` is forbidden in `if`-expression (`OpPhi`) merges",
@@ -2394,60 +4814,64 @@ impl BodyScanner<'_> {
                         ),
                     );
                 }
-                then_ty.or(else_ty)
+                let res_ty = then_ty.or(else_ty);
+                let ty = res_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::If {
+                            cond: Box::new(hir_cond),
+                            then_branch: hir_then,
+                            else_branch: hir_else,
+                        },
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    res_ty,
+                )
             }
-            Expr::Block(b) => self.scan_block(b),
-            Expr::ArrayLit { elements, .. } => {
+            Expr::Block(b) => {
+                let (hir_block, block_ty) = self.lower_block(b);
+                let ty = hir_block.ty;
+                let span = hir_block.span;
+                (
+                    HirExpr {
+                        kind: HirExprKind::Block(hir_block),
+                        ty,
+                        symbol: None,
+                        span,
+                    },
+                    block_ty,
+                )
+            }
+            Expr::ArrayLit { elements, span } => {
+                let mut hir_elems = Vec::with_capacity(elements.len());
                 let mut elem_ty = None;
                 for el in elements {
-                    let t = self.scan_expr(el);
+                    let (he, t) = self.lower_expr(el, false);
                     if elem_ty.is_none() {
                         elem_ty = t;
                     }
+                    hir_elems.push(he);
                 }
-                elem_ty.and_then(|e| {
+                let arr_ty = elem_ty.and_then(|e| {
                     u32::try_from(elements.len())
                         .ok()
-                        .map(|len| self.types.alloc(Type::Array { element: e, len }))
-                })
+                        .map(|len| self.ctx.module.types.alloc(Type::Array { element: e, len }))
+                });
+                let ty = arr_ty.unwrap_or_else(|| self.void_ty());
+                (
+                    HirExpr {
+                        kind: HirExprKind::ArrayLit {
+                            elements: hir_elems,
+                        },
+                        ty,
+                        symbol: None,
+                        span: *span,
+                    },
+                    arr_ty,
+                )
             }
-        }
-    }
-
-    fn resolve_method_return_type(&self, recv_ty: TypeId, method_name: &str) -> Option<TypeId> {
-        let base_ty = match self.types.get(recv_ty) {
-            Type::Pointer { pointee, .. } => *pointee,
-            _ => recv_ty,
-        };
-        let Type::Struct { name, .. } = self.types.get(base_ty) else {
-            return None;
-        };
-        let qualified = format!("{name}::{method_name}");
-        self.fn_return_types.get(qualified.as_str()).copied()
-    }
-
-    fn resolve_field_type(&mut self, recv_ty: TypeId, field_name: &str) -> Option<TypeId> {
-        let base_ty = match self.types.get(recv_ty) {
-            Type::Pointer { pointee, .. } => *pointee,
-            _ => recv_ty,
-        };
-        match self.types.get(base_ty).clone() {
-            Type::Struct { fields, .. } => fields
-                .iter()
-                .find_map(|(name, ty_id)| (name == field_name).then_some(*ty_id)),
-            Type::Vector { scalar, .. } => {
-                let swizzle_len = field_name.len();
-                if swizzle_len == 1 {
-                    Some(self.types.alloc(Type::Scalar(scalar)))
-                } else if (2..=4).contains(&swizzle_len) {
-                    u8::try_from(swizzle_len)
-                        .ok()
-                        .map(|len| self.types.alloc(Type::Vector { scalar, len }))
-                } else {
-                    None
-                }
-            }
-            _ => None,
         }
     }
 
@@ -2456,8 +4880,8 @@ impl BodyScanner<'_> {
         let mut is_float = fn_name.starts_with("atomic_f");
 
         for ty_id in arg_types.iter().flatten() {
-            let scalar = match self.types.get(*ty_id) {
-                Type::Pointer { pointee, .. } => match self.types.get(*pointee) {
+            let scalar = match self.ctx.module.types.get(*ty_id) {
+                Type::Pointer { pointee, .. } => match self.ctx.module.types.get(*pointee) {
                     Type::Scalar(s) => Some(*s),
                     _ => None,
                 },
@@ -2472,7 +4896,7 @@ impl BodyScanner<'_> {
         }
 
         if is_int64 && !self.caps.contains(HardwareCaps::INT64_ATOMICS) {
-            self.diags.push(Diagnostic::error(
+            self.ctx.diags.push(Diagnostic::error(
                 "E0237",
                 format!(
                     "64-bit atomic `{fn_name}` requires `#[cap(int64_atomics)]` on the enclosing function"
@@ -2482,7 +4906,7 @@ impl BodyScanner<'_> {
         }
 
         if is_float && !self.caps.contains(HardwareCaps::FLOAT_ATOMICS) {
-            self.diags.push(Diagnostic::error(
+            self.ctx.diags.push(Diagnostic::error(
                 "E0238",
                 format!(
                     "floating-point atomic `{fn_name}` requires `#[cap(float_atomics)]` on the enclosing function"
@@ -2490,6 +4914,84 @@ impl BodyScanner<'_> {
                 span,
             ));
         }
+    }
+}
+
+fn infer_rayquery_method_return(method: &str, types: &mut TypeArena) -> Option<TypeId> {
+    let ty = match method {
+        "proceed" => Type::Scalar(ScalarKind::Bool),
+        "committed_type"
+        | "committed_instance_custom_index"
+        | "committed_instance_id"
+        | "committed_primitive_index"
+        | "committed_geometry_index" => Type::Scalar(ScalarKind::U32),
+        "committed_t" => Type::Scalar(ScalarKind::F32),
+        "committed_barycentrics" => Type::Vector {
+            scalar: ScalarKind::F32,
+            len: 2,
+        },
+        _ => return None,
+    };
+    Some(types.alloc(ty))
+}
+
+fn infer_builtin_call_return_type(
+    name: &str,
+    arg_types: &[Option<TypeId>],
+    types: &mut TypeArena,
+) -> Option<TypeId> {
+    match name {
+        "subgroup_ballot" => Some(types.alloc(Type::Vector {
+            scalar: ScalarKind::U32,
+            len: 4,
+        })),
+        "subgroup_ballot_bit_count" | "subgroup_ballot_exclusive_bit_count" => {
+            Some(types.alloc(Type::Scalar(ScalarKind::U32)))
+        }
+        "subgroup_broadcast_first"
+        | "subgroup_broadcast"
+        | "nonuniform"
+        | "min"
+        | "max"
+        | "clamp"
+        | "mix"
+        | "abs"
+        | "floor"
+        | "ceil"
+        | "fract"
+        | "sqrt"
+        | "inversesqrt"
+        | "sin"
+        | "cos"
+        | "tan"
+        | "exp"
+        | "exp2"
+        | "log"
+        | "log2"
+        | "pow"
+        | "normalize"
+        | "reflect"
+        | "refract"
+        | "cross"
+        | "fma"
+        | "smoothstep"
+        | "step"
+        | "saturate" => arg_types.first().copied().flatten(),
+        "dot" | "length" | "distance" => Some(types.alloc(Type::Scalar(ScalarKind::F32))),
+        "mc::reconstruct_world_pos" | "mc::view_dir" | "mc::sample_sky" => {
+            Some(types.alloc(Type::Vector {
+                scalar: ScalarKind::F32,
+                len: 3,
+            }))
+        }
+        _ if name.starts_with("atomic_") => {
+            let first = arg_types.first().copied().flatten()?;
+            match types.get(first) {
+                Type::Pointer { pointee, .. } => Some(*pointee),
+                _ => Some(first),
+            }
+        }
+        _ => None,
     }
 }
 
@@ -2754,18 +5256,23 @@ struct TypeLowerCtx<'a> {
     structs: Option<&'a mut Arena<HirStruct>>,
     struct_types: &'a mut IndexMap<SmolStr, TypeId>,
     struct_ids: Option<&'a mut IndexMap<SmolStr, HirStructId>>,
+    builtin_struct_types: &'a IndexMap<SmolStr, TypeId>,
+    struct_generic_args: Option<&'a mut IndexMap<SmolStr, (SmolStr, Vec<TypeId>)>>,
 }
 
 impl<'a> TypeLowerCtx<'a> {
     const fn types_only(
         types: &'a mut TypeArena,
         struct_types: &'a mut IndexMap<SmolStr, TypeId>,
+        builtin_struct_types: &'a IndexMap<SmolStr, TypeId>,
     ) -> Self {
         Self {
             types,
             structs: None,
             struct_types,
             struct_ids: None,
+            builtin_struct_types,
+            struct_generic_args: None,
         }
     }
 
@@ -2774,12 +5281,16 @@ impl<'a> TypeLowerCtx<'a> {
         structs: &'a mut Arena<HirStruct>,
         struct_types: &'a mut IndexMap<SmolStr, TypeId>,
         struct_ids: &'a mut IndexMap<SmolStr, HirStructId>,
+        builtin_struct_types: &'a IndexMap<SmolStr, TypeId>,
+        struct_generic_args: &'a mut IndexMap<SmolStr, (SmolStr, Vec<TypeId>)>,
     ) -> Self {
         Self {
             types,
             structs: Some(structs),
             struct_types,
             struct_ids: Some(struct_ids),
+            builtin_struct_types,
+            struct_generic_args: Some(struct_generic_args),
         }
     }
 }
@@ -3025,6 +5536,7 @@ fn try_monomorphize_struct(
     args: &[TypeArg],
     ctx: &mut TypeLowerCtx<'_>,
     generic_params: &IndexSet<SmolStr>,
+    type_subst: &IndexMap<SmolStr, TypeId>,
 ) -> Option<TypeId> {
     let type_args: Vec<&TypeExpr> = args
         .iter()
@@ -3059,7 +5571,7 @@ fn try_monomorphize_struct(
 
     let mut lowered_args = Vec::with_capacity(type_args.len());
     for arg_expr in type_args {
-        let arg_ty = lower_type_expr(arg_expr, ctx, generic_params)?;
+        let arg_ty = lower_type_expr(arg_expr, ctx, generic_params, type_subst)?;
         if contains_type_param(ctx.types, arg_ty) {
             return None;
         }
@@ -3077,8 +5589,8 @@ fn try_monomorphize_struct(
     }
 
     let mut subst: IndexMap<SmolStr, TypeId> = IndexMap::with_capacity(base_generic_params.len());
-    for (param_name, arg_ty) in base_generic_params.into_iter().zip(lowered_args) {
-        subst.insert(param_name, arg_ty);
+    for (param_name, &arg_ty) in base_generic_params.iter().zip(&lowered_args) {
+        subst.insert(param_name.clone(), arg_ty);
     }
 
     let mut hir_fields = Vec::with_capacity(base_fields.len());
@@ -3115,6 +5627,9 @@ fn try_monomorphize_struct(
         });
         struct_ids.insert(mono_name.clone(), mono_sid);
     }
+    if let Some(sga) = ctx.struct_generic_args.as_deref_mut() {
+        sga.insert(mono_name.clone(), (SmolStr::new(base_name), lowered_args));
+    }
     ctx.struct_types.insert(mono_name, mono_type_id);
     Some(mono_type_id)
 }
@@ -3123,6 +5638,7 @@ fn lower_type_expr(
     ty: &TypeExpr,
     ctx: &mut TypeLowerCtx<'_>,
     generic_params: &IndexSet<SmolStr>,
+    type_subst: &IndexMap<SmolStr, TypeId>,
 ) -> Option<TypeId> {
     match ty {
         TypeExpr::Named {
@@ -3132,15 +5648,24 @@ fn lower_type_expr(
             ..
         } => {
             let name = path.joined();
-            if args.is_empty() && !*unsized_array && generic_params.contains(name.as_str()) {
-                return Some(ctx.types.alloc(Type::TypeParam(SmolStr::new(name))));
+            if args.is_empty() && !*unsized_array {
+                if let Some(&sub_ty) = type_subst.get(name.as_str()) {
+                    return Some(sub_ty);
+                }
+                if generic_params.contains(name.as_str()) {
+                    return Some(ctx.types.alloc(Type::TypeParam(SmolStr::new(name))));
+                }
             }
             if let Some(&id) = ctx.struct_types.get(name.as_str()) {
                 if !args.is_empty()
-                    && let Some(mono_id) = try_monomorphize_struct(&name, args, ctx, generic_params)
+                    && let Some(mono_id) =
+                        try_monomorphize_struct(&name, args, ctx, generic_params, type_subst)
                 {
                     return Some(mono_id);
                 }
+                return Some(id);
+            }
+            if let Some(&id) = ctx.builtin_struct_types.get(name.as_str()) {
                 return Some(id);
             }
             let resolved = match name.as_str() {
@@ -3228,7 +5753,7 @@ fn lower_type_expr(
                     let pointee = args
                         .iter()
                         .find_map(|arg| match arg {
-                            TypeArg::Type(inner) => lower_type_expr(inner, ctx, generic_params),
+                            TypeArg::Type(inner) => lower_type_expr(inner, ctx, generic_params, type_subst),
                             TypeArg::NamedExpr { .. } => None,
                         })
                         .unwrap_or_else(|| ctx.types.alloc(Type::Void));
@@ -3269,7 +5794,7 @@ fn lower_type_expr(
                     let element = args
                         .iter()
                         .find_map(|arg| match arg {
-                            TypeArg::Type(inner) => lower_type_expr(inner, ctx, generic_params),
+                            TypeArg::Type(inner) => lower_type_expr(inner, ctx, generic_params, type_subst),
                             TypeArg::NamedExpr { .. } => None,
                         })
                         .unwrap_or_else(|| ctx.types.alloc(Type::Void));
@@ -3279,7 +5804,7 @@ fn lower_type_expr(
                     let element = args
                         .iter()
                         .find_map(|arg| match arg {
-                            TypeArg::Type(inner) => lower_type_expr(inner, ctx, generic_params),
+                            TypeArg::Type(inner) => lower_type_expr(inner, ctx, generic_params, type_subst),
                             TypeArg::NamedExpr { .. } => None,
                         })
                         .unwrap_or_else(|| ctx.types.alloc(Type::Void));
@@ -3292,7 +5817,7 @@ fn lower_type_expr(
             Some(ctx.types.alloc(resolved))
         }
         TypeExpr::Array { element, len, .. } => {
-            let elem_id = lower_type_expr(element, ctx, generic_params)?;
+            let elem_id = lower_type_expr(element, ctx, generic_params, type_subst)?;
             let count = parse_u32_lit(Some(len))?;
             Some(ctx.types.alloc(Type::Array {
                 element: elem_id,
@@ -4396,5 +6921,336 @@ mod tests {
         assert!(codes.contains(&"E0204"), "expected E0204: {codes:?}");
         assert!(codes.contains(&"E0218"), "expected E0218: {codes:?}");
         assert!(codes.contains(&"E0251"), "expected E0251: {codes:?}");
+    }
+
+    #[test]
+    fn lowers_typed_hir_body_symbols_consts_and_swizzles() {
+        let src = r"
+            pub const SCALE: f32 = 2.0;
+
+            pub fn compute_tint(v: vec4) -> vec3 {
+                let mut out = v.xyz * SCALE;
+                out.xy = vec2(1.0, 2.0);
+                return out;
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
+        assert!(!diags.has_errors(), "{:?}", diags.as_slice());
+
+        assert_eq!(hir.consts.len(), 1);
+        assert_eq!(hir.consts[0].name, "SCALE");
+        assert_eq!(
+            *hir.types.get(hir.consts[0].ty),
+            Type::Scalar(ScalarKind::F32)
+        );
+
+        let func = hir.find_function("compute_tint").expect("compute_tint");
+        assert!(func.is_pub);
+        let body = func.body_hir.as_ref().expect("body_hir populated");
+        assert_eq!(body.stmts.len(), 3);
+
+        // First statement: `let mut out = v.xyz * SCALE;`
+        match &body.stmts[0] {
+            HirStmt::Let {
+                symbol,
+                is_mut,
+                ty,
+                init: Some(init_expr),
+                ..
+            } => {
+                assert!(*is_mut);
+                assert_eq!(hir.symbol(*symbol).kind, SymbolKind::Local);
+                assert_eq!(
+                    *hir.types.get(*ty),
+                    Type::Vector {
+                        scalar: ScalarKind::F32,
+                        len: 3,
+                    }
+                );
+                assert!(matches!(
+                    &init_expr.kind,
+                    HirExprKind::Binary {
+                        op: BinaryOp::Mul,
+                        lhs,
+                        ..
+                    } if matches!(
+                        &lhs.kind,
+                        HirExprKind::Swizzle {
+                            components,
+                            is_write: false,
+                            ..
+                        } if components == &[0, 1, 2]
+                    )
+                ));
+            }
+            other => panic!("expected HirStmt::Let, got {other:?}"),
+        }
+
+        // Second statement: `out.xy = vec2(1.0, 2.0);` -> write swizzle
+        match &body.stmts[1] {
+            HirStmt::Expr { expr, .. } => match &expr.kind {
+                HirExprKind::Binary {
+                    op: BinaryOp::Assign,
+                    lhs,
+                    ..
+                } => match &lhs.kind {
+                    HirExprKind::Swizzle {
+                        components,
+                        is_write,
+                        ..
+                    } => {
+                        assert_eq!(components, &[0, 1]);
+                        assert!(*is_write);
+                    }
+                    other => panic!("expected write swizzle, got {other:?}"),
+                },
+                other => panic!("expected assign expr, got {other:?}"),
+            },
+            other => panic!("expected HirStmt::Expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reports_type_mismatch_mutability_inout_swizzle_call_and_return_errors() {
+        let src = r"
+            pub fn bump(inout x: f32, y: u32) -> f32 {
+                x += 1.0;
+                return x;
+            }
+
+            pub fn bad_types(in_val: f32, mut v: vec3) -> u32 {
+                let imm = 1.0;
+                imm = 2.0;
+                in_val = 3.0;
+                let _sum = 1u + 2.0;
+                let _r1 = bump(imm, 1u);
+                let _r2 = bump(v.x, 1.0);
+                let _r3 = bump(v.x);
+                v.xx = vec2(1.0, 2.0);
+                let _oob = v.w;
+                return 1.0;
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (_, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
+        let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0270"), "expected E0270 binary mismatch: {codes:?}");
+        assert!(
+            codes.iter().filter(|&&c| c == "E0271").count() >= 2,
+            "expected E0271 for immutable let & ParamMode::In: {codes:?}"
+        );
+        assert!(codes.contains(&"E0272"), "expected E0272 inout immutable arg: {codes:?}");
+        assert!(
+            codes.iter().filter(|&&c| c == "E0273").count() >= 2,
+            "expected E0273 for write-swizzle dup & out-of-range: {codes:?}"
+        );
+        assert!(
+            codes.iter().filter(|&&c| c == "E0274").count() >= 2,
+            "expected E0274 for call arg type & arity mismatch: {codes:?}"
+        );
+        assert!(codes.contains(&"E0275"), "expected E0275 return mismatch: {codes:?}");
+    }
+
+    #[test]
+    fn monomorphizes_generic_functions_and_trait_bounded_impl_methods() {
+        let src = r"
+            pub trait ResampleTarget {
+                fn target_pdf(self, world_pos: vec3, normal: vec3) -> f32;
+            }
+
+            pub struct MySample {
+                pub pos: vec3,
+                pub radiance: f32,
+            }
+
+            impl ResampleTarget for MySample {
+                pub fn target_pdf(self, world_pos: vec3, normal: vec3) -> f32 {
+                    return self.radiance;
+                }
+            }
+
+            #[layout(std430)]
+            pub struct Reservoir<S: ResampleTarget> {
+                pub sample: S,
+                pub w_sum: f32,
+                pub m: u32,
+                pub w: f32,
+            }
+
+            impl<S: ResampleTarget> Reservoir<S> {
+                pub fn finalize(inout self, world_pos: vec3, normal: vec3) {
+                    let p_hat = self.sample.target_pdf(world_pos, normal);
+                    self.w = if p_hat > 1e-6 && self.m > 0u {
+                        self.w_sum / (f32(self.m) * p_hat)
+                    } else {
+                        0.0
+                    };
+                }
+            }
+
+            pub fn eval_generic<T: ResampleTarget>(s: T, p: vec3, n: vec3) -> f32 {
+                return s.target_pdf(p, n);
+            }
+
+            pub fn driver(
+                inout res: Reservoir<MySample>,
+                s: MySample,
+                p: vec3,
+                n: vec3,
+            ) -> f32 {
+                res.finalize(p, n);
+                return eval_generic::<MySample>(s, p, n);
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier2RayQuery, HardwareCaps::all());
+        assert!(!diags.has_errors(), "{:?}", diags.as_slice());
+
+        // Trait and impl metadata populated on HirModule.
+        assert_eq!(hir.traits.len(), 1);
+        assert_eq!(hir.traits[0].name, "ResampleTarget");
+        assert_eq!(hir.impls.len(), 2);
+
+        // Monomorphized `Reservoir<MySample>::finalize` instantiated with concrete `target_pdf` call.
+        let mono_finalize = hir
+            .find_function("Reservoir<MySample>::finalize")
+            .expect("monomorphized Reservoir<MySample>::finalize");
+        assert!(mono_finalize.generic_params.is_empty());
+        let finalize_body = mono_finalize.body_hir.as_ref().expect("finalize body_hir");
+        match &finalize_body.stmts[0] {
+            HirStmt::Let {
+                ty,
+                init: Some(init_expr),
+                ..
+            } => {
+                assert_eq!(*hir.types.get(*ty), Type::Scalar(ScalarKind::F32));
+                match &init_expr.kind {
+                    HirExprKind::MethodCall {
+                        method,
+                        resolved_fn,
+                        ..
+                    } => {
+                        assert_eq!(method, "target_pdf");
+                        let target_fn_id = resolved_fn
+                            .expect("trait method target_pdf resolved to concrete impl");
+                        assert_eq!(hir.functions[target_fn_id].name, "target_pdf");
+                    }
+                    other => panic!("expected MethodCall, got {other:?}"),
+                }
+            }
+            other => panic!("expected Let p_hat, got {other:?}"),
+        }
+
+        // Monomorphized generic function `eval_generic<MySample>` instantiated cleanly.
+        let mono_eval = hir
+            .find_function("eval_generic<MySample>")
+            .expect("monomorphized eval_generic<MySample>");
+        assert_eq!(
+            mono_eval.return_ty.map(|t| hir.types.get(t).clone()),
+            Some(Type::Scalar(ScalarKind::F32))
+        );
+    }
+
+    #[test]
+    fn typechecks_vsl_mc_builtin_struct_fields_and_pack_schema_types() {
+        let src = r"
+            @stage(compute(8, 8, 1))
+            pub fn inspect_engine_buffers(
+                #[builtin(global_invocation_id)] gid: uvec3,
+            ) {
+                let cam: vec3 = mc::world.camera_pos;
+                let vp: mat4 = mc::world.inv_view_proj;
+                let frame: u32 = mc::world.frame_index;
+                let light_cnt: u32 = mc::lights.count;
+                let light_pos: vec3 = mc::lights.items[0u].position;
+                let light_flux: f32 = mc::lights.items[0u].flux;
+                let inst_mat: u32 = mc::instances[0u].material_id;
+                let sharc_cap: u32 = mc::sharc.capacity;
+                let res_w: f32 = mc::reservoirs.items[0u].weight_sum;
+                let tint: vec3 = mc::param(sun_tint);
+                let bounces: i32 = spec::max_bounces;
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let mut schema = PackSchema::default();
+        schema
+            .params
+            .insert(SmolStr::new_static("sun_tint"), (0, 12));
+        schema
+            .param_types
+            .insert(SmolStr::new_static("sun_tint"), PackParamType::Vec3);
+        schema
+            .spec_ids
+            .insert(SmolStr::new_static("max_bounces"), 1);
+        schema.spec_defaults.insert(
+            SmolStr::new_static("max_bounces"),
+            SpecConstantDefault {
+                spec_id: 1,
+                ty: PackParamType::I32,
+                default_bits: 4,
+            },
+        );
+
+        let (hir, diags) = lower_unit_with_schema(
+            &parsed.unit,
+            RenderTier::Tier2RayQuery,
+            HardwareCaps::all(),
+            Some(&schema),
+        );
+        assert!(!diags.has_errors(), "{:?}", diags.as_slice());
+
+        let func = hir
+            .find_function("inspect_engine_buffers")
+            .expect("inspect_engine_buffers");
+        assert_eq!(
+            *hir.types.get(func.local_types["cam"]),
+            Type::Vector {
+                scalar: ScalarKind::F32,
+                len: 3,
+            }
+        );
+        assert_eq!(
+            *hir.types.get(func.local_types["light_cnt"]),
+            Type::Scalar(ScalarKind::U32)
+        );
+        assert_eq!(
+            *hir.types.get(func.local_types["light_pos"]),
+            Type::Vector {
+                scalar: ScalarKind::F32,
+                len: 3,
+            }
+        );
+        assert_eq!(
+            *hir.types.get(func.local_types["inst_mat"]),
+            Type::Scalar(ScalarKind::U32)
+        );
+        assert_eq!(
+            *hir.types.get(func.local_types["sharc_cap"]),
+            Type::Scalar(ScalarKind::U32)
+        );
+        assert_eq!(
+            *hir.types.get(func.local_types["res_w"]),
+            Type::Scalar(ScalarKind::F32)
+        );
+        assert_eq!(
+            *hir.types.get(func.local_types["tint"]),
+            Type::Vector {
+                scalar: ScalarKind::F32,
+                len: 3,
+            }
+        );
+        assert_eq!(
+            *hir.types.get(func.local_types["bounces"]),
+            Type::Scalar(ScalarKind::I32)
+        );
     }
 }

@@ -8,8 +8,9 @@ pub mod ty;
 pub mod validate;
 
 pub use hir::{
-    EntryReflection, HirFnId, HirFunction, HirModule, HirParam, HirStruct, HirStructField,
-    HirStructId, HirWorkgroupVar,
+    EntryReflection, HirBlock, HirCallArg, HirConst, HirExpr, HirExprKind, HirFnId, HirFunction,
+    HirImpl, HirModule, HirParam, HirStmt, HirStruct, HirStructField, HirStructId, HirSwitchCase,
+    HirSymbol, HirTrait, HirTraitMethod, HirWorkgroupVar, SymbolId, SymbolKind,
 };
 pub use lower::{PackSchema, lower_unit, lower_unit_with_schema};
 pub use module::{L1ModuleHash, L2ArtifactHash, ModuleGraph, ModuleGraphError, ModuleId};

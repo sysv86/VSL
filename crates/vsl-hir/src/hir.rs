@@ -10,13 +10,221 @@ use vsl_mc::{
     DebugChannelBinding, DescriptorBinding, HardwareCaps, HookStage, PackParamBinding,
     PushConstantField, ShaderStage, SpecConstantUsage,
 };
-use vsl_syntax::ast::{Block, ParamMode};
+use vsl_syntax::ast::{BinaryOp, Block, ParamMode, UnaryOp};
 
 /// Dense arena index for a lowered [`HirStruct`].
 pub type HirStructId = Idx<HirStruct>;
 
 /// Dense arena index for a lowered [`HirFunction`].
 pub type HirFnId = Idx<HirFunction>;
+
+/// Dense identifier for a resolved symbol in [`HirModule::symbols`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolId(pub u32);
+
+/// Classification of a resolved [`HirSymbol`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolKind {
+    Local,
+    Param,
+    Function,
+    Struct,
+    Const,
+    WorkgroupVar,
+    Descriptor,
+    Builtin,
+}
+
+/// Resolved symbol metadata recorded in [`HirModule::symbols`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirSymbol {
+    pub id: SymbolId,
+    pub name: SmolStr,
+    pub kind: SymbolKind,
+    pub ty: TypeId,
+    pub is_mut: bool,
+    pub span: Span,
+}
+
+/// Lowered function or method call argument with optional keyword label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirCallArg {
+    pub name: Option<SmolStr>,
+    pub value: HirExpr,
+    pub span: Span,
+}
+
+/// Typed HIR expression node with resolved [`TypeId`] and optional [`SymbolId`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirExpr {
+    pub kind: HirExprKind,
+    pub ty: TypeId,
+    pub symbol: Option<SymbolId>,
+    pub span: Span,
+}
+
+/// Typed HIR expression variants covering all lowered VSL 2.0 expressions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HirExprKind {
+    IntLit(SmolStr),
+    FloatLit(SmolStr),
+    BoolLit(bool),
+    StringLit(SmolStr),
+    NoneLit,
+    Path {
+        path: SmolStr,
+        turbofish: Vec<TypeId>,
+    },
+    ArrayLit {
+        elements: Vec<HirExpr>,
+    },
+    StructLit {
+        struct_name: SmolStr,
+        fields: Vec<(SmolStr, HirExpr)>,
+    },
+    Unary {
+        op: UnaryOp,
+        operand: Box<HirExpr>,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: Box<HirExpr>,
+        rhs: Box<HirExpr>,
+    },
+    Call {
+        callee: Box<HirExpr>,
+        resolved_fn: Option<HirFnId>,
+        args: Vec<HirCallArg>,
+    },
+    MethodCall {
+        receiver: Box<HirExpr>,
+        method: SmolStr,
+        resolved_fn: Option<HirFnId>,
+        turbofish: Vec<TypeId>,
+        args: Vec<HirCallArg>,
+    },
+    Field {
+        receiver: Box<HirExpr>,
+        field: SmolStr,
+        field_index: Option<u32>,
+    },
+    Index {
+        receiver: Box<HirExpr>,
+        index: Box<HirExpr>,
+    },
+    If {
+        cond: Box<HirExpr>,
+        then_branch: HirBlock,
+        else_branch: Option<Box<HirExpr>>,
+    },
+    Block(HirBlock),
+    Swizzle {
+        base: Box<HirExpr>,
+        components: Vec<u8>,
+        is_write: bool,
+    },
+}
+
+/// Single `case` arm inside a [`HirStmt::Switch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirSwitchCase {
+    pub value: HirExpr,
+    pub body: HirBlock,
+    pub span: Span,
+}
+
+/// Typed HIR statement node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HirStmt {
+    Let {
+        symbol: SymbolId,
+        is_mut: bool,
+        name: SmolStr,
+        ty: TypeId,
+        init: Option<HirExpr>,
+        span: Span,
+    },
+    Return {
+        value: Option<HirExpr>,
+        span: Span,
+    },
+    For {
+        binding_symbol: SymbolId,
+        binding: SmolStr,
+        binding_ty: TypeId,
+        iter: HirExpr,
+        body: HirBlock,
+        span: Span,
+    },
+    While {
+        cond: HirExpr,
+        body: HirBlock,
+        span: Span,
+    },
+    Loop {
+        body: HirBlock,
+        span: Span,
+    },
+    Switch {
+        selector: HirExpr,
+        cases: Vec<HirSwitchCase>,
+        default: Option<HirBlock>,
+        span: Span,
+    },
+    Break(Span),
+    Continue(Span),
+    Expr {
+        expr: HirExpr,
+        has_semi: bool,
+        span: Span,
+    },
+}
+
+/// Typed HIR block with resolved tail expression type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirBlock {
+    pub stmts: Vec<HirStmt>,
+    pub tail_expr: Option<Box<HirExpr>>,
+    pub ty: TypeId,
+    pub span: Span,
+}
+
+/// Lowered method signature inside a [`HirTrait`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirTraitMethod {
+    pub name: SmolStr,
+    pub params: Vec<HirParam>,
+    pub return_ty: Option<TypeId>,
+    pub span: Span,
+}
+
+/// Lowered trait declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirTrait {
+    pub name: SmolStr,
+    pub methods: Vec<HirTraitMethod>,
+    pub span: Span,
+}
+
+/// Lowered inherent or trait `impl` block linking methods to a target struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirImpl {
+    pub generic_params: Vec<(SmolStr, Option<SmolStr>)>,
+    pub trait_name: Option<SmolStr>,
+    pub target_struct: SmolStr,
+    pub methods: Vec<HirFnId>,
+    pub span: Span,
+}
+
+/// Lowered module-level `const` declaration with typed initializer expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirConst {
+    pub name: SmolStr,
+    pub ty: TypeId,
+    pub value_expr: HirExpr,
+    pub is_pub: bool,
+    pub span: Span,
+}
 
 /// Arena-backed HIR module produced by lowering a parsed [`vsl_syntax::ast::SourceUnit`].
 #[derive(Debug, Clone)]
@@ -25,6 +233,10 @@ pub struct HirModule {
     pub structs: Arena<HirStruct>,
     pub functions: Arena<HirFunction>,
     pub workgroup_vars: Vec<HirWorkgroupVar>,
+    pub traits: Vec<HirTrait>,
+    pub impls: Vec<HirImpl>,
+    pub consts: Vec<HirConst>,
+    pub symbols: Vec<HirSymbol>,
     pub types: TypeArena,
     /// Number of functions pruned during early tier filtering (Spec §3.4).
     pub pruned_functions: usize,
@@ -39,9 +251,39 @@ impl HirModule {
             structs: Arena::new(),
             functions: Arena::new(),
             workgroup_vars: Vec::new(),
+            traits: Vec::new(),
+            impls: Vec::new(),
+            consts: Vec::new(),
+            symbols: Vec::new(),
             types: TypeArena::new(),
             pruned_functions: 0,
         }
+    }
+
+    /// Allocates a new [`HirSymbol`] in [`Self::symbols`] and returns its [`SymbolId`].
+    pub fn alloc_symbol(
+        &mut self,
+        name: SmolStr,
+        kind: SymbolKind,
+        ty: TypeId,
+        is_mut: bool,
+        span: Span,
+    ) -> SymbolId {
+        let id = SymbolId(self.symbols.len() as u32);
+        self.symbols.push(HirSymbol {
+            id,
+            name,
+            kind,
+            ty,
+            is_mut,
+            span,
+        });
+        id
+    }
+
+    /// Returns the [`HirSymbol`] for a previously allocated [`SymbolId`].
+    pub fn symbol(&self, id: SymbolId) -> &HirSymbol {
+        &self.symbols[id.0 as usize]
     }
 
     /// Iterates over all entry-point functions (annotated with `@stage(...)`).
@@ -109,6 +351,7 @@ pub struct HirParam {
 #[derive(Debug, Clone)]
 pub struct HirFunction {
     pub name: SmolStr,
+    pub generic_params: Vec<(SmolStr, Option<SmolStr>)>,
     pub stage: Option<ShaderStage>,
     pub workgroup_size: Option<[u32; 3]>,
     pub hook: Option<HookStage>,
@@ -117,7 +360,9 @@ pub struct HirFunction {
     pub params: Vec<HirParam>,
     pub return_ty: Option<TypeId>,
     pub local_types: IndexMap<SmolStr, TypeId>,
+    pub body_hir: Option<HirBlock>,
     pub body_ast: Option<Block>,
+    pub is_pub: bool,
     pub reflection: EntryReflection,
     pub span: Span,
 }
