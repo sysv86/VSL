@@ -24,7 +24,8 @@ pub fn cull_tile_lights(
     workgroup_barrier();
 
     for i in (lid..mc::lights.count).step_by(64u) {
-        if light_intersects_tile(mc::lights.items[i], gid.xy) {
+        let light = mc::lights.items[i];
+        if distance(vec2(light.position.xy), vec2(gid.xy)) < light.radius {
             let idx = atomic_add::<Scope::Workgroup, Order::Relaxed>(&s_tile_count, 1u);
             if idx < 64u { s_tile_lights[idx] = i; }
         }
@@ -32,6 +33,6 @@ pub fn cull_tile_lights(
     workgroup_barrier();
 
     let total = min(s_tile_count, 64u);
-    let color = shade_tile_pixel(gid.xy, gbuffer_depth, total);
+    let color = vec3(f32(total) / 64.0, 0.0, 0.0);
     out_lit.store(ivec2(gid.xy), vec4(color, 1.0));
 }

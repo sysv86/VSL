@@ -61,7 +61,7 @@ cargo run -p vsl-cli -- check examples/sunlit_vanilla/reflections.vsl --tier 2
 cargo run -p vsl-cli -- reflect examples/sunlit_vanilla/reflections.vsl --tier 2
 
 # Emit SPIR-V 1.6 binaries
-cargo run -p vsl-cli -- emit-spv examples/sunlit_vanilla/reflections.vsl --tier 2
+cargo run -p vsl-cli -- emit-spv examples/sunlit_vanilla/reflections.vsl --tier 2 -o reflections.spv
 
 # Emit GLSL 460 oracle source
 cargo run -p vsl-cli -- emit-glsl examples/sunlit_vanilla/tiled_lighting.vsl
