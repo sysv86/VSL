@@ -1,8 +1,18 @@
-use crate::ssa::{InstData, InstId, IrFunction, IrModule, StructuredStmt};
+use crate::ssa::{
+    BuiltinKind, InstData, InstId, IrFunction, IrLocalVar, IrModule, IrStorageClass, IrType,
+    ScalarIrTy, StructuredStmt,
+};
 use indexmap::{IndexMap, IndexSet};
+use smol_str::SmolStr;
 
 /// Upper bound on loop iterations that [`UnrollLoopsPass`] will expand to prevent code-size blowup.
 pub const MAX_UNROLL_ITERATIONS: u32 = 64;
+
+/// Upper bound on loop body instructions that [`UnrollLoopsPass`] will expand.
+pub const MAX_UNROLL_BODY_INSTS: usize = 128;
+
+/// Upper bound on helper function instructions that [`SelectiveInlinePass`] will inline.
+pub const MAX_INLINE_BODY_INSTS: usize = 64;
 
 /// Deterministic transformation or legalization pass over an [`IrFunction`].
 pub trait IrPass {
@@ -27,7 +37,8 @@ impl IrPass for ConstFoldPass {
             let mut select_remap: IndexMap<InstId, InstId> = IndexMap::new();
             let ids: Vec<InstId> = func.insts.iter().map(|(id, _)| id).collect();
             for id in ids {
-                let folded = match func.insts[id].data {
+                let inst_data = func.insts[id].data.clone();
+                let folded = match inst_data {
                     InstData::IAdd32(a, b) => match (&func.insts[a].data, &func.insts[b].data) {
                         (InstData::ConstI32(x), InstData::ConstI32(y)) => {
                             Some(InstData::ConstI32(x.wrapping_add(*y)))
@@ -35,7 +46,7 @@ impl IrPass for ConstFoldPass {
                         (InstData::ConstU32(x), InstData::ConstU32(y)) => {
                             Some(InstData::ConstU32(x.wrapping_add(*y)))
                         }
-                        _ => None,
+                        _ => fold_vec_int_binop(func, a, b, i32::wrapping_add, u32::wrapping_add),
                     },
                     InstData::ISub32(a, b) => match (&func.insts[a].data, &func.insts[b].data) {
                         (InstData::ConstI32(x), InstData::ConstI32(y)) => {
@@ -44,7 +55,7 @@ impl IrPass for ConstFoldPass {
                         (InstData::ConstU32(x), InstData::ConstU32(y)) => {
                             Some(InstData::ConstU32(x.wrapping_sub(*y)))
                         }
-                        _ => None,
+                        _ => fold_vec_int_binop(func, a, b, i32::wrapping_sub, u32::wrapping_sub),
                     },
                     InstData::IMul32(a, b) => match (&func.insts[a].data, &func.insts[b].data) {
                         (InstData::ConstI32(x), InstData::ConstI32(y)) => {
@@ -53,7 +64,7 @@ impl IrPass for ConstFoldPass {
                         (InstData::ConstU32(x), InstData::ConstU32(y)) => {
                             Some(InstData::ConstU32(x.wrapping_mul(*y)))
                         }
-                        _ => None,
+                        _ => fold_vec_int_binop(func, a, b, i32::wrapping_mul, u32::wrapping_mul),
                     },
                     InstData::IDiv32(a, b) => match (&func.insts[a].data, &func.insts[b].data) {
                         (InstData::ConstI32(x), InstData::ConstI32(y)) => {
@@ -73,10 +84,10 @@ impl IrPass for ConstFoldPass {
                         }
                         _ => None,
                     },
-                    InstData::FAdd32(a, b) => fold_f32_binop(func, a, b, |x, y| x + y),
-                    InstData::FSub32(a, b) => fold_f32_binop(func, a, b, |x, y| x - y),
-                    InstData::FMul32(a, b) => fold_f32_binop(func, a, b, |x, y| x * y),
-                    InstData::FDiv32(a, b) => fold_f32_binop(func, a, b, |x, y| x / y),
+                    InstData::FAdd32(a, b) => fold_float_or_vec_binop(func, a, b, |x, y| x + y),
+                    InstData::FSub32(a, b) => fold_float_or_vec_binop(func, a, b, |x, y| x - y),
+                    InstData::FMul32(a, b) => fold_float_or_vec_binop(func, a, b, |x, y| x * y),
+                    InstData::FDiv32(a, b) => fold_float_or_vec_binop(func, a, b, |x, y| x / y),
                     #[allow(clippy::float_cmp)]
                     InstData::FCmpEq(a, b) => fold_f32_cmp(func, a, b, |x, y| x == y),
                     #[allow(clippy::float_cmp)]
@@ -327,19 +338,80 @@ impl IrPass for ConstFoldPass {
                         }
                         _ => None,
                     },
+                    InstData::FConvert { value, target } => match (&func.insts[value].data, target) {
+                        (InstData::ConstF32(bits), ScalarIrTy::F16) => {
+                            Some(InstData::ConstF16(f32_to_f16_bits(f32::from_bits(*bits))))
+                        }
+                        (InstData::ConstF16(bits), ScalarIrTy::F32) => {
+                            Some(InstData::ConstF32(f16_bits_to_f32(*bits).to_bits()))
+                        }
+                        (InstData::ConstF32(bits), ScalarIrTy::F32) => Some(InstData::ConstF32(*bits)),
+                        (InstData::ConstF16(bits), ScalarIrTy::F16) => Some(InstData::ConstF16(*bits)),
+                        _ => None,
+                    },
+                    InstData::VectorTimesScalar { vec, scalar } => {
+                        fold_vec_times_scalar(func, vec, scalar)
+                    }
+                    InstData::ExtractComponent { vec, index } => {
+                        if let Some(elems) = extract_composite_elems(func, vec)
+                            && let Some(&elem) = elems.get(index as usize)
+                        {
+                            if is_const_inst(&func.insts[elem].data) {
+                                Some(func.insts[elem].data.clone())
+                            } else {
+                                select_remap.insert(id, elem);
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    InstData::CompositeExtract { composite, indices } => {
+                        if let Some(elem) = resolve_composite_extract(func, composite, &indices) {
+                            if is_const_inst(&func.insts[elem].data) {
+                                Some(func.insts[elem].data.clone())
+                            } else {
+                                select_remap.insert(id, elem);
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    InstData::VectorShuffle {
+                        lhs,
+                        rhs,
+                        components,
+                    } => fold_vector_shuffle(func, id, lhs, rhs, &components, &mut select_remap),
                     InstData::ConstBool(_)
                     | InstData::ConstI32(_)
                     | InstData::ConstU32(_)
                     | InstData::ConstF32(_)
+                    | InstData::ConstF16(_)
                     | InstData::ConstI64(_)
                     | InstData::ConstU64(_)
                     | InstData::Phi { .. }
+                    | InstData::LocalAddr { .. }
+                    | InstData::LocalLoad { .. }
+                    | InstData::LocalStore { .. }
+                    | InstData::AccessChain { .. }
+                    | InstData::DescriptorAccessChain { .. }
+                    | InstData::DescriptorStore { .. }
+                    | InstData::Param { .. }
+                    | InstData::FunctionCall { .. }
                     | InstData::BdaOffset { .. }
                     | InstData::ConvertPtrToU(_)
                     | InstData::ConvertUToPtr { .. }
                     | InstData::BdaLoad { .. }
                     | InstData::BdaStore { .. }
                     | InstData::ImageSample { .. }
+                    | InstData::ImageSampleImplicitLod { .. }
+                    | InstData::ImageSampleGrad { .. }
+                    | InstData::ImageSampleDrefExplicitLod { .. }
+                    | InstData::ImageGather { .. }
+                    | InstData::ImageQuerySize { .. }
+                    | InstData::ImageQueryLevels { .. }
+                    | InstData::ImageTexelPointer { .. }
                     | InstData::ImageStore { .. }
                     | InstData::WorkgroupAddr { .. }
                     | InstData::WorkgroupLoad { .. }
@@ -352,27 +424,72 @@ impl IrPass for ConstFoldPass {
                     | InstData::AtomicMax { .. }
                     | InstData::AtomicCas { .. }
                     | InstData::WorkgroupBarrier
+                    | InstData::MemoryBarrier { .. }
                     | InstData::SubgroupBallot(_)
                     | InstData::SubgroupBallotBitCount(_)
+                    | InstData::SubgroupBallotExclusiveBitCount(_)
+                    | InstData::SubgroupBallotInclusiveBitCount(_)
                     | InstData::SubgroupBroadcastFirst(_)
+                    | InstData::SubgroupAdd(_)
+                    | InstData::SubgroupMin(_)
+                    | InstData::SubgroupMax(_)
+                    | InstData::SubgroupExclusiveAdd(_)
+                    | InstData::SubgroupInclusiveAdd(_)
+                    | InstData::SubgroupShuffle { .. }
+                    | InstData::SubgroupShuffleXor { .. }
+                    | InstData::SubgroupAny(_)
+                    | InstData::SubgroupAll(_)
+                    | InstData::SubgroupElect
+                    | InstData::QuadSwapHorizontal(_)
+                    | InstData::QuadSwapVertical(_)
+                    | InstData::QuadSwapDiagonal(_)
+                    | InstData::BitFieldExtract { .. }
+                    | InstData::BitFieldInsert { .. }
+                    | InstData::BitCount(_)
+                    | InstData::Bitcast { .. }
+                    | InstData::IsNan(_)
+                    | InstData::IsInf(_)
+                    | InstData::DPdx(_)
+                    | InstData::DPdy(_)
+                    | InstData::Fwidth(_)
                     | InstData::SpecConstant { .. }
+                    | InstData::SpecConstantOp { .. }
                     | InstData::DescriptorLoad { .. }
                     | InstData::GlslStd450 { .. }
+                    | InstData::MatrixTimesVector { .. }
+                    | InstData::MatrixTimesMatrix { .. }
+                    | InstData::CompositeConstruct { .. }
+                    | InstData::CompositeInsert { .. }
                     | InstData::CastToI32(_)
                     | InstData::CastToF32(_)
                     | InstData::CastToI64(_)
                     | InstData::CastToU64(_)
+                    | InstData::MakeVec2(_, _)
                     | InstData::MakeVec3(_, _, _)
                     | InstData::MakeVec4(_, _, _, _)
-                    | InstData::ExtractComponent { .. }
                     | InstData::LoadBuiltin { .. }
+                    | InstData::LoadStageInput { .. }
+                    | InstData::StoreStageOutput { .. }
+                    | InstData::StoreBuiltin { .. }
+                    | InstData::DemoteToHelperInvocation
                     | InstData::LoadPushConstant { .. }
                     | InstData::RayQueryInitialize { .. }
                     | InstData::RayQueryProceed(_)
                     | InstData::RayQueryCommittedType(_)
+                    | InstData::RayQueryCandidateType(_)
+                    | InstData::RayQueryConfirmIntersection(_)
+                    | InstData::RayQueryTerminate(_)
+                    | InstData::RayQueryGenerateIntersection { .. }
+                    | InstData::RayQueryCommittedT(_)
+                    | InstData::RayQueryCandidateT(_)
+                    | InstData::RayQueryCommittedInstanceId(_)
                     | InstData::RayQueryCommittedInstanceCustomIndex(_)
+                    | InstData::RayQueryCommittedPrimitiveIndex(_)
+                    | InstData::RayQueryCommittedGeometryIndex(_)
+                    | InstData::RayQueryCommittedObjectToWorld(_)
+                    | InstData::RayQueryCommittedWorldToObject(_)
+                    | InstData::RayQueryCommittedFrontFace(_)
                     | InstData::RayQueryCommittedBarycentrics(_)
-                    | InstData::MakeVec2(_, _)
                     | InstData::Nop => None,
                 };
                 if let Some(new_data) = folded {
@@ -423,40 +540,304 @@ impl IrPass for ConstFoldPass {
     }
 }
 
+/// Converts an IEEE-754 binary16 (`f16`) bit pattern to `f32` in pure Rust.
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits >> 15) << 31;
+    let exp = u32::from((bits >> 10) & 0x1F);
+    let mant = u32::from(bits & 0x03FF);
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            let mut m = mant;
+            let mut e: i32 = -14;
+            while (m & 0x0400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x03FF;
+            let f32_exp = (e + 127).cast_unsigned() << 23;
+            sign | f32_exp | (m << 13)
+        }
+    } else if exp == 0x1F {
+        sign | 0x7F80_0000 | (mant << 13)
+    } else {
+        let f32_exp = (exp + 112) << 23;
+        sign | f32_exp | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+/// Converts an `f32` value to an IEEE-754 binary16 (`f16`) bit pattern using round-to-nearest-even.
+fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF).cast_signed();
+    let mant = bits & 0x007F_FFFF;
+
+    if exp == 0xFF {
+        if mant == 0 {
+            return sign | 0x7C00;
+        }
+        let nan_mant = ((mant >> 13) as u16).max(1);
+        return sign | 0x7C00 | nan_mant;
+    }
+
+    let unbiased = exp - 127;
+    if unbiased > 15 {
+        return sign | 0x7C00;
+    }
+    if unbiased < -24 {
+        return sign;
+    }
+    if unbiased < -14 {
+        let shift = (-14 - unbiased).cast_unsigned();
+        let full_mant = mant | 0x0080_0000;
+        let shifted = full_mant >> (shift + 13);
+        let round_bit = (full_mant >> (shift + 12)) & 1;
+        let sticky = u32::from((full_mant & ((1u32 << (shift + 12)) - 1)) != 0);
+        let rounded = shifted + u32::from(round_bit != 0 && (sticky != 0 || (shifted & 1) != 0));
+        return sign | (rounded as u16);
+    }
+
+    let f16_exp = (unbiased + 15).cast_unsigned() << 10;
+    let shifted_mant = mant >> 13;
+    let round_bit = (mant >> 12) & 1;
+    let sticky = u32::from((mant & 0x0FFF) != 0);
+    let mut combined = f16_exp | shifted_mant;
+    if round_bit != 0 && (sticky != 0 || (shifted_mant & 1) != 0) {
+        combined += 1;
+    }
+    sign | (combined as u16)
+}
+
 fn fold_f32_cmp(
     func: &IrFunction,
     a: InstId,
     b: InstId,
     op: impl FnOnce(f32, f32) -> bool,
 ) -> Option<InstData> {
-    if let (InstData::ConstF32(xb), InstData::ConstF32(yb)) =
-        (&func.insts[a].data, &func.insts[b].data)
-    {
-        let x = f32::from_bits(*xb);
-        let y = f32::from_bits(*yb);
-        if x.is_finite() && y.is_finite() {
-            return Some(InstData::ConstBool(op(x, y)));
+    match (&func.insts[a].data, &func.insts[b].data) {
+        (InstData::ConstF32(xb), InstData::ConstF32(yb)) => {
+            let x = f32::from_bits(*xb);
+            let y = f32::from_bits(*yb);
+            (x.is_finite() && y.is_finite()).then(|| InstData::ConstBool(op(x, y)))
         }
+        (InstData::ConstF16(xb), InstData::ConstF16(yb)) => {
+            let x = f16_bits_to_f32(*xb);
+            let y = f16_bits_to_f32(*yb);
+            (x.is_finite() && y.is_finite()).then(|| InstData::ConstBool(op(x, y)))
+        }
+        _ => None,
     }
-    None
 }
 
-fn fold_f32_binop(
+fn extract_composite_elems(func: &IrFunction, id: InstId) -> Option<Vec<InstId>> {
+    match &func.insts[id].data {
+        InstData::MakeVec2(a, b) => Some(vec![*a, *b]),
+        InstData::MakeVec3(a, b, c) => Some(vec![*a, *b, *c]),
+        InstData::MakeVec4(a, b, c, d) => Some(vec![*a, *b, *c, *d]),
+        InstData::CompositeConstruct { elems } => Some(elems.clone()),
+        _ => None,
+    }
+}
+
+fn resolve_composite_extract(
     func: &IrFunction,
+    mut current: InstId,
+    indices: &[u32],
+) -> Option<InstId> {
+    if indices.is_empty() {
+        return None;
+    }
+    for &idx in indices {
+        let elems = extract_composite_elems(func, current)?;
+        current = *elems.get(idx as usize)?;
+    }
+    Some(current)
+}
+
+fn build_vec_inst_data(elems: Vec<InstId>) -> InstData {
+    match elems.as_slice() {
+        [a, b] => InstData::MakeVec2(*a, *b),
+        [a, b, c] => InstData::MakeVec3(*a, *b, *c),
+        [a, b, c, d] => InstData::MakeVec4(*a, *b, *c, *d),
+        _ => InstData::CompositeConstruct { elems },
+    }
+}
+
+fn fold_float_or_vec_binop(
+    func: &mut IrFunction,
     a: InstId,
     b: InstId,
-    op: impl FnOnce(f32, f32) -> f32,
+    op: impl Fn(f32, f32) -> f32,
 ) -> Option<InstData> {
-    if let (InstData::ConstF32(x_bits), InstData::ConstF32(y_bits)) =
-        (&func.insts[a].data, &func.insts[b].data)
-    {
-        let x = f32::from_bits(*x_bits);
-        let y = f32::from_bits(*y_bits);
-        let res = op(x, y);
-        (x.is_finite() && y.is_finite() && res.is_finite()).then(|| InstData::const_f32(res))
-    } else {
-        None
+    match (&func.insts[a].data, &func.insts[b].data) {
+        (InstData::ConstF32(x_bits), InstData::ConstF32(y_bits)) => {
+            let x = f32::from_bits(*x_bits);
+            let y = f32::from_bits(*y_bits);
+            let res = op(x, y);
+            (x.is_finite() && y.is_finite() && res.is_finite()).then(|| InstData::const_f32(res))
+        }
+        (InstData::ConstF16(x_bits), InstData::ConstF16(y_bits)) => {
+            let x = f16_bits_to_f32(*x_bits);
+            let y = f16_bits_to_f32(*y_bits);
+            let res = op(x, y);
+            (x.is_finite() && y.is_finite() && res.is_finite())
+                .then(|| InstData::ConstF16(f32_to_f16_bits(res)))
+        }
+        _ => {
+            let lhs_elems = extract_composite_elems(func, a)?;
+            let rhs_elems = extract_composite_elems(func, b)?;
+            if lhs_elems.is_empty() || lhs_elems.len() != rhs_elems.len() {
+                return None;
+            }
+            let mut folded_lanes = Vec::with_capacity(lhs_elems.len());
+            for (&la, &rb) in lhs_elems.iter().zip(rhs_elems.iter()) {
+                let lane_data = match (&func.insts[la].data, &func.insts[rb].data) {
+                    (InstData::ConstF32(xb), InstData::ConstF32(yb)) => {
+                        let x = f32::from_bits(*xb);
+                        let y = f32::from_bits(*yb);
+                        let res = op(x, y);
+                        if !(x.is_finite() && y.is_finite() && res.is_finite()) {
+                            return None;
+                        }
+                        InstData::const_f32(res)
+                    }
+                    (InstData::ConstF16(xb), InstData::ConstF16(yb)) => {
+                        let x = f16_bits_to_f32(*xb);
+                        let y = f16_bits_to_f32(*yb);
+                        let res = op(x, y);
+                        if !(x.is_finite() && y.is_finite() && res.is_finite()) {
+                            return None;
+                        }
+                        InstData::ConstF16(f32_to_f16_bits(res))
+                    }
+                    _ => return None,
+                };
+                folded_lanes.push(lane_data);
+            }
+            let lane_ids: Vec<InstId> = folded_lanes
+                .into_iter()
+                .map(|d| func.emit(None, d))
+                .collect();
+            Some(build_vec_inst_data(lane_ids))
+        }
     }
+}
+
+fn fold_vec_int_binop(
+    func: &mut IrFunction,
+    a: InstId,
+    b: InstId,
+    op_i: impl Fn(i32, i32) -> i32,
+    op_u: impl Fn(u32, u32) -> u32,
+) -> Option<InstData> {
+    let lhs_elems = extract_composite_elems(func, a)?;
+    let rhs_elems = extract_composite_elems(func, b)?;
+    if lhs_elems.is_empty() || lhs_elems.len() != rhs_elems.len() {
+        return None;
+    }
+    let mut folded_lanes = Vec::with_capacity(lhs_elems.len());
+    for (&la, &rb) in lhs_elems.iter().zip(rhs_elems.iter()) {
+        let lane_data = match (&func.insts[la].data, &func.insts[rb].data) {
+            (InstData::ConstI32(x), InstData::ConstI32(y)) => InstData::ConstI32(op_i(*x, *y)),
+            (InstData::ConstU32(x), InstData::ConstU32(y)) => InstData::ConstU32(op_u(*x, *y)),
+            _ => return None,
+        };
+        folded_lanes.push(lane_data);
+    }
+    let lane_ids: Vec<InstId> = folded_lanes
+        .into_iter()
+        .map(|d| func.emit(None, d))
+        .collect();
+    Some(build_vec_inst_data(lane_ids))
+}
+
+fn fold_vec_times_scalar(func: &mut IrFunction, vec: InstId, scalar: InstId) -> Option<InstData> {
+    let elems = extract_composite_elems(func, vec)?;
+    if elems.is_empty() {
+        return None;
+    }
+    let mut folded_lanes = Vec::with_capacity(elems.len());
+    match func.insts[scalar].data {
+        InstData::ConstF32(sb) => {
+            let s = f32::from_bits(sb);
+            if !s.is_finite() {
+                return None;
+            }
+            for &e in &elems {
+                let InstData::ConstF32(eb) = func.insts[e].data else {
+                    return None;
+                };
+                let x = f32::from_bits(eb);
+                let res = x * s;
+                if !(x.is_finite() && res.is_finite()) {
+                    return None;
+                }
+                folded_lanes.push(InstData::const_f32(res));
+            }
+        }
+        InstData::ConstF16(sb) => {
+            let s = f16_bits_to_f32(sb);
+            if !s.is_finite() {
+                return None;
+            }
+            for &e in &elems {
+                let InstData::ConstF16(eb) = func.insts[e].data else {
+                    return None;
+                };
+                let x = f16_bits_to_f32(eb);
+                let res = x * s;
+                if !(x.is_finite() && res.is_finite()) {
+                    return None;
+                }
+                folded_lanes.push(InstData::ConstF16(f32_to_f16_bits(res)));
+            }
+        }
+        _ => return None,
+    }
+    let lane_ids: Vec<InstId> = folded_lanes
+        .into_iter()
+        .map(|d| func.emit(None, d))
+        .collect();
+    Some(build_vec_inst_data(lane_ids))
+}
+
+fn fold_vector_shuffle(
+    func: &IrFunction,
+    id: InstId,
+    lhs: InstId,
+    rhs: InstId,
+    components: &[u32],
+    select_remap: &mut IndexMap<InstId, InstId>,
+) -> Option<InstData> {
+    let lhs_elems = extract_composite_elems(func, lhs)?;
+    let rhs_elems = if lhs == rhs {
+        lhs_elems.clone()
+    } else {
+        extract_composite_elems(func, rhs)?
+    };
+    let mut selected = Vec::with_capacity(components.len());
+    for &c in components {
+        let idx = c as usize;
+        if idx < lhs_elems.len() {
+            selected.push(lhs_elems[idx]);
+        } else if let Some(&elem) = rhs_elems.get(idx - lhs_elems.len()) {
+            selected.push(elem);
+        } else {
+            return None;
+        }
+    }
+    if selected.len() == 1 {
+        let only = selected[0];
+        if is_const_inst(&func.insts[only].data) {
+            return Some(func.insts[only].data.clone());
+        }
+        select_remap.insert(id, only);
+        return None;
+    }
+    Some(build_vec_inst_data(selected))
 }
 
 const fn is_const_inst(data: &InstData) -> bool {
@@ -466,6 +847,7 @@ const fn is_const_inst(data: &InstData) -> bool {
             | InstData::ConstI32(_)
             | InstData::ConstU32(_)
             | InstData::ConstF32(_)
+            | InstData::ConstF16(_)
             | InstData::ConstI64(_)
             | InstData::ConstU64(_)
     )
@@ -906,9 +1288,15 @@ fn compute_defined_in_loop(
         let is_external_sensitive = matches!(
             data,
             InstData::BdaLoad { .. }
+                | InstData::LocalLoad { .. }
+                | InstData::DescriptorLoad { .. }
                 | InstData::ResourceLoad { .. }
                 | InstData::WorkgroupLoad { .. }
                 | InstData::ImageSample { .. }
+                | InstData::ImageSampleImplicitLod { .. }
+                | InstData::ImageSampleGrad { .. }
+                | InstData::ImageSampleDrefExplicitLod { .. }
+                | InstData::ImageGather { .. }
                 | InstData::Phi { .. }
         );
         if is_external_sensitive {
@@ -1184,9 +1572,11 @@ fn unroll_stmts(
 
                 let body = unroll_stmts(func, body, &body_outside);
                 let continuing = unroll_stmts(func, continuing, &cont_outside);
+                let body_inst_count = count_stmts_insts(&body) + count_stmts_insts(&continuing);
                 if unroll
                     && let Some(trips) = trip_count
                     && trips <= MAX_UNROLL_ITERATIONS
+                    && body_inst_count <= MAX_UNROLL_BODY_INSTS
                     && !contains_top_level_break_or_continue(&body)
                     && !contains_top_level_break_or_continue(&continuing)
                 {
@@ -1327,6 +1717,37 @@ fn emit_stepped_induction(
     }
 }
 
+fn count_stmts_insts(stmts: &[StructuredStmt]) -> usize {
+    let mut total = 0usize;
+    for stmt in stmts {
+        match stmt {
+            StructuredStmt::Eval(_) => total += 1,
+            StructuredStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                total += 1 + count_stmts_insts(then_body) + count_stmts_insts(else_body);
+            }
+            StructuredStmt::Switch { cases, default, .. } => {
+                total += 1 + count_stmts_insts(default);
+                for (_, b) in cases {
+                    total += count_stmts_insts(b);
+                }
+            }
+            StructuredStmt::Loop {
+                body, continuing, ..
+            } => {
+                total += 1 + count_stmts_insts(body) + count_stmts_insts(continuing);
+            }
+            StructuredStmt::Break | StructuredStmt::Continue | StructuredStmt::Return(_) => {
+                total += 1;
+            }
+        }
+    }
+    total
+}
+
 /// Returns `true` if `stmts` contains a `Break` or `Continue` targeting the immediately
 /// enclosing loop (nested loops handle their own `Break`/`Continue` internally).
 fn contains_top_level_break_or_continue(stmts: &[StructuredStmt]) -> bool {
@@ -1379,6 +1800,7 @@ fn clone_inst_in_loop(
     }
     let remapped_data = remap_inst_data(&original.data, remap);
     let new_id = func.emit(original.ty, remapped_data);
+    func.insts[new_id].ir_ty = original.ir_ty;
     func.insts[new_id].non_uniform = original.non_uniform;
     remap.insert(id, new_id);
     new_id
@@ -1728,6 +2150,246 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             remap_id(*c, remap),
             remap_id(*d, remap),
         ),
+        InstData::ConstF16(bits) => InstData::ConstF16(*bits),
+        InstData::FConvert { value, target } => InstData::FConvert {
+            value: remap_id(*value, remap),
+            target: *target,
+        },
+        InstData::SpecConstantOp { op, operands } => InstData::SpecConstantOp {
+            op: *op,
+            operands: operands.iter().map(|&o| remap_id(o, remap)).collect(),
+        },
+        InstData::VectorTimesScalar { vec, scalar } => InstData::VectorTimesScalar {
+            vec: remap_id(*vec, remap),
+            scalar: remap_id(*scalar, remap),
+        },
+        InstData::MatrixTimesVector { mat, vec } => InstData::MatrixTimesVector {
+            mat: remap_id(*mat, remap),
+            vec: remap_id(*vec, remap),
+        },
+        InstData::MatrixTimesMatrix { lhs, rhs } => InstData::MatrixTimesMatrix {
+            lhs: remap_id(*lhs, remap),
+            rhs: remap_id(*rhs, remap),
+        },
+        InstData::VectorShuffle {
+            lhs,
+            rhs,
+            components,
+        } => InstData::VectorShuffle {
+            lhs: remap_id(*lhs, remap),
+            rhs: remap_id(*rhs, remap),
+            components: components.clone(),
+        },
+        InstData::CompositeConstruct { elems } => InstData::CompositeConstruct {
+            elems: elems.iter().map(|&e| remap_id(e, remap)).collect(),
+        },
+        InstData::CompositeExtract { composite, indices } => InstData::CompositeExtract {
+            composite: remap_id(*composite, remap),
+            indices: indices.clone(),
+        },
+        InstData::CompositeInsert {
+            composite,
+            value,
+            indices,
+        } => InstData::CompositeInsert {
+            composite: remap_id(*composite, remap),
+            value: remap_id(*value, remap),
+            indices: indices.clone(),
+        },
+        InstData::LocalAddr { local_index } => InstData::LocalAddr {
+            local_index: *local_index,
+        },
+        InstData::LocalLoad { ptr } => InstData::LocalLoad {
+            ptr: remap_id(*ptr, remap),
+        },
+        InstData::LocalStore { ptr, value } => InstData::LocalStore {
+            ptr: remap_id(*ptr, remap),
+            value: remap_id(*value, remap),
+        },
+        InstData::AccessChain { base_ptr, indices } => InstData::AccessChain {
+            base_ptr: remap_id(*base_ptr, remap),
+            indices: indices.iter().map(|&i| remap_id(i, remap)).collect(),
+        },
+        InstData::DescriptorAccessChain {
+            descriptor_index,
+            indices,
+        } => InstData::DescriptorAccessChain {
+            descriptor_index: *descriptor_index,
+            indices: indices.iter().map(|&i| remap_id(i, remap)).collect(),
+        },
+        InstData::DescriptorStore { ptr, value } => InstData::DescriptorStore {
+            ptr: remap_id(*ptr, remap),
+            value: remap_id(*value, remap),
+        },
+        InstData::Param { index } => InstData::Param { index: *index },
+        InstData::FunctionCall { callee, args } => InstData::FunctionCall {
+            callee: callee.clone(),
+            args: args.iter().map(|&a| remap_id(a, remap)).collect(),
+        },
+        InstData::ImageSampleImplicitLod {
+            descriptor_index,
+            image_inst,
+            coord,
+        } => InstData::ImageSampleImplicitLod {
+            descriptor_index: *descriptor_index,
+            image_inst: image_inst.map(|i| remap_id(i, remap)),
+            coord: remap_id(*coord, remap),
+        },
+        InstData::ImageSampleGrad {
+            descriptor_index,
+            image_inst,
+            coord,
+            ddx,
+            ddy,
+        } => InstData::ImageSampleGrad {
+            descriptor_index: *descriptor_index,
+            image_inst: image_inst.map(|i| remap_id(i, remap)),
+            coord: remap_id(*coord, remap),
+            ddx: remap_id(*ddx, remap),
+            ddy: remap_id(*ddy, remap),
+        },
+        InstData::ImageSampleDrefExplicitLod {
+            descriptor_index,
+            image_inst,
+            coord,
+            dref,
+            lod,
+        } => InstData::ImageSampleDrefExplicitLod {
+            descriptor_index: *descriptor_index,
+            image_inst: image_inst.map(|i| remap_id(i, remap)),
+            coord: remap_id(*coord, remap),
+            dref: remap_id(*dref, remap),
+            lod: remap_id(*lod, remap),
+        },
+        InstData::ImageGather {
+            descriptor_index,
+            image_inst,
+            coord,
+            component,
+        } => InstData::ImageGather {
+            descriptor_index: *descriptor_index,
+            image_inst: image_inst.map(|i| remap_id(i, remap)),
+            coord: remap_id(*coord, remap),
+            component: *component,
+        },
+        InstData::ImageQuerySize {
+            descriptor_index,
+            lod,
+        } => InstData::ImageQuerySize {
+            descriptor_index: *descriptor_index,
+            lod: lod.map(|i| remap_id(i, remap)),
+        },
+        InstData::ImageQueryLevels { descriptor_index } => InstData::ImageQueryLevels {
+            descriptor_index: *descriptor_index,
+        },
+        InstData::ImageTexelPointer {
+            descriptor_index,
+            coord,
+            sample,
+        } => InstData::ImageTexelPointer {
+            descriptor_index: *descriptor_index,
+            coord: remap_id(*coord, remap),
+            sample: remap_id(*sample, remap),
+        },
+        InstData::MemoryBarrier { scope, order } => InstData::MemoryBarrier {
+            scope: *scope,
+            order: *order,
+        },
+        InstData::SubgroupBallotExclusiveBitCount(v) => {
+            InstData::SubgroupBallotExclusiveBitCount(remap_id(*v, remap))
+        }
+        InstData::SubgroupBallotInclusiveBitCount(v) => {
+            InstData::SubgroupBallotInclusiveBitCount(remap_id(*v, remap))
+        }
+        InstData::SubgroupAdd(v) => InstData::SubgroupAdd(remap_id(*v, remap)),
+        InstData::SubgroupMin(v) => InstData::SubgroupMin(remap_id(*v, remap)),
+        InstData::SubgroupMax(v) => InstData::SubgroupMax(remap_id(*v, remap)),
+        InstData::SubgroupExclusiveAdd(v) => InstData::SubgroupExclusiveAdd(remap_id(*v, remap)),
+        InstData::SubgroupInclusiveAdd(v) => InstData::SubgroupInclusiveAdd(remap_id(*v, remap)),
+        InstData::SubgroupShuffle { value, lane } => InstData::SubgroupShuffle {
+            value: remap_id(*value, remap),
+            lane: remap_id(*lane, remap),
+        },
+        InstData::SubgroupShuffleXor { value, mask } => InstData::SubgroupShuffleXor {
+            value: remap_id(*value, remap),
+            mask: remap_id(*mask, remap),
+        },
+        InstData::SubgroupAny(v) => InstData::SubgroupAny(remap_id(*v, remap)),
+        InstData::SubgroupAll(v) => InstData::SubgroupAll(remap_id(*v, remap)),
+        InstData::SubgroupElect => InstData::SubgroupElect,
+        InstData::QuadSwapHorizontal(v) => InstData::QuadSwapHorizontal(remap_id(*v, remap)),
+        InstData::QuadSwapVertical(v) => InstData::QuadSwapVertical(remap_id(*v, remap)),
+        InstData::QuadSwapDiagonal(v) => InstData::QuadSwapDiagonal(remap_id(*v, remap)),
+        InstData::BitFieldExtract {
+            base,
+            offset,
+            count,
+            signed,
+        } => InstData::BitFieldExtract {
+            base: remap_id(*base, remap),
+            offset: remap_id(*offset, remap),
+            count: remap_id(*count, remap),
+            signed: *signed,
+        },
+        InstData::BitFieldInsert {
+            base,
+            insert,
+            offset,
+            count,
+        } => InstData::BitFieldInsert {
+            base: remap_id(*base, remap),
+            insert: remap_id(*insert, remap),
+            offset: remap_id(*offset, remap),
+            count: remap_id(*count, remap),
+        },
+        InstData::BitCount(v) => InstData::BitCount(remap_id(*v, remap)),
+        InstData::Bitcast { value, target } => InstData::Bitcast {
+            value: remap_id(*value, remap),
+            target: target.clone(),
+        },
+        InstData::IsNan(v) => InstData::IsNan(remap_id(*v, remap)),
+        InstData::IsInf(v) => InstData::IsInf(remap_id(*v, remap)),
+        InstData::DPdx(v) => InstData::DPdx(remap_id(*v, remap)),
+        InstData::DPdy(v) => InstData::DPdy(remap_id(*v, remap)),
+        InstData::Fwidth(v) => InstData::Fwidth(remap_id(*v, remap)),
+        InstData::LoadStageInput { var_index } => InstData::LoadStageInput {
+            var_index: *var_index,
+        },
+        InstData::StoreStageOutput { var_index, value } => InstData::StoreStageOutput {
+            var_index: *var_index,
+            value: remap_id(*value, remap),
+        },
+        InstData::StoreBuiltin { kind, value } => InstData::StoreBuiltin {
+            kind: *kind,
+            value: remap_id(*value, remap),
+        },
+        InstData::DemoteToHelperInvocation => InstData::DemoteToHelperInvocation,
+        InstData::RayQueryCandidateType(rq) => InstData::RayQueryCandidateType(*rq),
+        InstData::RayQueryConfirmIntersection(rq) => InstData::RayQueryConfirmIntersection(*rq),
+        InstData::RayQueryTerminate(rq) => InstData::RayQueryTerminate(*rq),
+        InstData::RayQueryGenerateIntersection {
+            ray_query_id,
+            t_hit,
+        } => InstData::RayQueryGenerateIntersection {
+            ray_query_id: *ray_query_id,
+            t_hit: remap_id(*t_hit, remap),
+        },
+        InstData::RayQueryCommittedT(rq) => InstData::RayQueryCommittedT(*rq),
+        InstData::RayQueryCandidateT(rq) => InstData::RayQueryCandidateT(*rq),
+        InstData::RayQueryCommittedInstanceId(rq) => InstData::RayQueryCommittedInstanceId(*rq),
+        InstData::RayQueryCommittedPrimitiveIndex(rq) => {
+            InstData::RayQueryCommittedPrimitiveIndex(*rq)
+        }
+        InstData::RayQueryCommittedGeometryIndex(rq) => {
+            InstData::RayQueryCommittedGeometryIndex(*rq)
+        }
+        InstData::RayQueryCommittedObjectToWorld(rq) => {
+            InstData::RayQueryCommittedObjectToWorld(*rq)
+        }
+        InstData::RayQueryCommittedWorldToObject(rq) => {
+            InstData::RayQueryCommittedWorldToObject(*rq)
+        }
+        InstData::RayQueryCommittedFrontFace(rq) => InstData::RayQueryCommittedFrontFace(*rq),
         InstData::ExtractComponent { vec, index } => InstData::ExtractComponent {
             vec: remap_id(*vec, remap),
             index: *index,
@@ -1921,7 +2583,11 @@ impl IrPass for PropagateNonUniformPass {
                     }
                     InstData::ResourceAccessChain { index, .. } => func.insts[*index].non_uniform,
                     InstData::ResourceLoad { ptr } => func.insts[*ptr].non_uniform,
-                    InstData::ImageSample { image_inst, .. } => {
+                    InstData::ImageSample { image_inst, .. }
+                    | InstData::ImageSampleImplicitLod { image_inst, .. }
+                    | InstData::ImageSampleGrad { image_inst, .. }
+                    | InstData::ImageSampleDrefExplicitLod { image_inst, .. }
+                    | InstData::ImageGather { image_inst, .. } => {
                         image_inst.is_some_and(|img| func.insts[img].non_uniform)
                     }
                     InstData::Select {
@@ -1930,13 +2596,39 @@ impl IrPass for PropagateNonUniformPass {
                     InstData::Phi { incoming } => {
                         incoming.iter().any(|&(v, _)| func.insts[v].non_uniform)
                     }
-                    InstData::MakeVec2(a, b) => {
-                        func.insts[*a].non_uniform || func.insts[*b].non_uniform
+                    InstData::MakeVec2(a, b)
+                    | InstData::VectorTimesScalar { vec: a, scalar: b }
+                    | InstData::MatrixTimesVector { mat: a, vec: b }
+                    | InstData::MatrixTimesMatrix { lhs: a, rhs: b }
+                    | InstData::VectorShuffle { lhs: a, rhs: b, .. }
+                    | InstData::CompositeInsert {
+                        composite: a,
+                        value: b,
+                        ..
+                    } => func.insts[*a].non_uniform || func.insts[*b].non_uniform,
+                    InstData::CompositeConstruct { elems } => {
+                        elems.iter().any(|&e| func.insts[e].non_uniform)
                     }
+                    InstData::AccessChain { base_ptr, indices } => {
+                        func.insts[*base_ptr].non_uniform
+                            || indices.iter().any(|&i| func.insts[i].non_uniform)
+                    }
+                    InstData::DescriptorAccessChain { indices, .. } => {
+                        indices.iter().any(|&i| func.insts[i].non_uniform)
+                    }
+                    InstData::FConvert { value: v, .. }
+                    | InstData::Bitcast { value: v, .. }
+                    | InstData::BitCount(v)
+                    | InstData::CompositeExtract { composite: v, .. }
+                    | InstData::LocalLoad { ptr: v }
+                    | InstData::DPdx(v)
+                    | InstData::DPdy(v)
+                    | InstData::Fwidth(v) => func.insts[*v].non_uniform,
                     InstData::ConstBool(_)
                     | InstData::ConstI32(_)
                     | InstData::ConstU32(_)
                     | InstData::ConstF32(_)
+                    | InstData::ConstF16(_)
                     | InstData::ConstI64(_)
                     | InstData::ConstU64(_)
                     | InstData::IAdd32(_, _)
@@ -1971,6 +2663,11 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::Shl32(_, _)
                     | InstData::Shr32(_, _)
                     | InstData::CastI64ToU64(_)
+                    | InstData::LocalAddr { .. }
+                    | InstData::LocalStore { .. }
+                    | InstData::DescriptorStore { .. }
+                    | InstData::Param { .. }
+                    | InstData::FunctionCall { .. }
                     | InstData::BdaOffset { .. }
                     | InstData::ConvertPtrToU(_)
                     | InstData::ConvertUToPtr { .. }
@@ -1978,6 +2675,9 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::IAdd64(_, _)
                     | InstData::BdaLoad { .. }
                     | InstData::BdaStore { .. }
+                    | InstData::ImageQuerySize { .. }
+                    | InstData::ImageQueryLevels { .. }
+                    | InstData::ImageTexelPointer { .. }
                     | InstData::ImageStore { .. }
                     | InstData::WorkgroupAddr { .. }
                     | InstData::WorkgroupLoad { .. }
@@ -1987,17 +2687,54 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::AtomicMax { .. }
                     | InstData::AtomicCas { .. }
                     | InstData::WorkgroupBarrier
+                    | InstData::MemoryBarrier { .. }
                     | InstData::SubgroupBallot(_)
                     | InstData::SubgroupBallotBitCount(_)
+                    | InstData::SubgroupBallotExclusiveBitCount(_)
+                    | InstData::SubgroupBallotInclusiveBitCount(_)
                     | InstData::SubgroupBroadcastFirst(_)
+                    | InstData::SubgroupAdd(_)
+                    | InstData::SubgroupMin(_)
+                    | InstData::SubgroupMax(_)
+                    | InstData::SubgroupExclusiveAdd(_)
+                    | InstData::SubgroupInclusiveAdd(_)
+                    | InstData::SubgroupShuffle { .. }
+                    | InstData::SubgroupShuffleXor { .. }
+                    | InstData::SubgroupAny(_)
+                    | InstData::SubgroupAll(_)
+                    | InstData::SubgroupElect
+                    | InstData::QuadSwapHorizontal(_)
+                    | InstData::QuadSwapVertical(_)
+                    | InstData::QuadSwapDiagonal(_)
+                    | InstData::BitFieldExtract { .. }
+                    | InstData::BitFieldInsert { .. }
+                    | InstData::IsNan(_)
+                    | InstData::IsInf(_)
                     | InstData::SpecConstant { .. }
+                    | InstData::SpecConstantOp { .. }
                     | InstData::DescriptorLoad { .. }
                     | InstData::LoadBuiltin { .. }
+                    | InstData::LoadStageInput { .. }
+                    | InstData::StoreStageOutput { .. }
+                    | InstData::StoreBuiltin { .. }
+                    | InstData::DemoteToHelperInvocation
                     | InstData::LoadPushConstant { .. }
                     | InstData::RayQueryInitialize { .. }
                     | InstData::RayQueryProceed(_)
                     | InstData::RayQueryCommittedType(_)
+                    | InstData::RayQueryCandidateType(_)
+                    | InstData::RayQueryConfirmIntersection(_)
+                    | InstData::RayQueryTerminate(_)
+                    | InstData::RayQueryGenerateIntersection { .. }
+                    | InstData::RayQueryCommittedT(_)
+                    | InstData::RayQueryCandidateT(_)
+                    | InstData::RayQueryCommittedInstanceId(_)
                     | InstData::RayQueryCommittedInstanceCustomIndex(_)
+                    | InstData::RayQueryCommittedPrimitiveIndex(_)
+                    | InstData::RayQueryCommittedGeometryIndex(_)
+                    | InstData::RayQueryCommittedObjectToWorld(_)
+                    | InstData::RayQueryCommittedWorldToObject(_)
+                    | InstData::RayQueryCommittedFrontFace(_)
                     | InstData::RayQueryCommittedBarycentrics(_)
                     | InstData::Nop => false,
                 };
@@ -2553,7 +3290,31 @@ impl IrPass for DeadCodeEliminationPass {
                 inst.data,
                 InstData::SubgroupBallot(_)
                     | InstData::SubgroupBallotBitCount(_)
+                    | InstData::SubgroupBallotExclusiveBitCount(_)
+                    | InstData::SubgroupBallotInclusiveBitCount(_)
                     | InstData::SubgroupBroadcastFirst(_)
+                    | InstData::SubgroupAdd(_)
+                    | InstData::SubgroupMin(_)
+                    | InstData::SubgroupMax(_)
+                    | InstData::SubgroupExclusiveAdd(_)
+                    | InstData::SubgroupInclusiveAdd(_)
+                    | InstData::SubgroupShuffle { .. }
+                    | InstData::SubgroupShuffleXor { .. }
+                    | InstData::SubgroupAny(_)
+                    | InstData::SubgroupAll(_)
+                    | InstData::SubgroupElect
+                    | InstData::LoadBuiltin {
+                        kind: BuiltinKind::SubgroupLocalInvocationId | BuiltinKind::SubgroupSize,
+                        ..
+                    }
+            )
+        });
+        func.uses_quad_control = func.insts.iter().any(|(_, inst)| {
+            matches!(
+                inst.data,
+                InstData::QuadSwapHorizontal(_)
+                    | InstData::QuadSwapVertical(_)
+                    | InstData::QuadSwapDiagonal(_)
             )
         });
     }
@@ -2706,19 +3467,1593 @@ fn prune_stmts(stmts: Vec<StructuredStmt>, live: &IndexSet<InstId>) -> Vec<Struc
     out
 }
 
+/// Splits non-dynamically-indexed local struct and small-array (`len <= 8`) [`IrLocalVar`]s into
+/// individual scalar/vector [`IrLocalVar`]s, rewriting `AccessChain` + `LocalLoad`/`LocalStore`
+/// to direct `LocalLoad`/`LocalStore` so [`Mem2RegPass`] can promote them into SSA registers.
+pub struct SroaPass;
+
+impl IrPass for SroaPass {
+    fn name(&self) -> &'static str {
+        "sroa"
+    }
+
+    fn run(&self, func: &mut IrFunction) {
+        let mut changed = true;
+        while changed {
+            changed = sroa_step(func);
+        }
+    }
+}
+
+fn const_non_neg_index(func: &IrFunction, id: InstId) -> Option<u32> {
+    match func.insts[id].data {
+        InstData::ConstU32(k) => Some(k),
+        InstData::ConstI32(k) if k >= 0 => Some(k.cast_unsigned()),
+        _ => None,
+    }
+}
+
+fn sroa_step(func: &mut IrFunction) -> bool {
+    let mut addr_to_local: IndexMap<InstId, u32> = IndexMap::new();
+    for (id, inst) in func.insts.iter() {
+        if let InstData::LocalAddr { local_index } = inst.data {
+            addr_to_local.insert(id, local_index);
+        }
+    }
+    if addr_to_local.is_empty() {
+        return false;
+    }
+
+    // Identify aggregate locals eligible for scalar replacement.
+    let mut eligible: IndexMap<u32, Vec<(SmolStr, IrType)>> = IndexMap::new();
+    for (idx, var) in func.local_vars.iter().enumerate() {
+        let local_idx = idx as u32;
+        match &var.ty {
+            IrType::Struct(layout) if !layout.fields.is_empty() => {
+                let parts = layout
+                    .fields
+                    .iter()
+                    .map(|f| (SmolStr::new(format!("{}.{}", var.name, f.name)), f.ty.clone()))
+                    .collect();
+                eligible.insert(local_idx, parts);
+            }
+            IrType::Array { element, len } if *len > 0 && *len <= 8 => {
+                let parts = (0..*len)
+                    .map(|i| {
+                        (
+                            SmolStr::new(format!("{}[{i}]", var.name)),
+                            element.as_ref().clone(),
+                        )
+                    })
+                    .collect();
+                eligible.insert(local_idx, parts);
+            }
+            _ => {}
+        }
+    }
+    if eligible.is_empty() {
+        return false;
+    }
+
+    // Disqualify any local whose address is used outside a constant-indexed `AccessChain`,
+    // or whose `LocalAddr` is never accessed at all via `AccessChain`.
+    let mut has_access_chain: IndexSet<u32> = IndexSet::new();
+    let mut disqualified: IndexSet<u32> = IndexSet::new();
+    for (_, inst) in func.insts.iter() {
+        match &inst.data {
+            InstData::Nop | InstData::LocalAddr { .. } => {}
+            InstData::AccessChain { base_ptr, indices } => {
+                if let Some(&local_idx) = addr_to_local.get(base_ptr)
+                    && let Some(parts) = eligible.get(&local_idx)
+                {
+                    if let Some(&first_idx) = indices.first()
+                        && let Some(k) = const_non_neg_index(func, first_idx)
+                        && (k as usize) < parts.len()
+                    {
+                        has_access_chain.insert(local_idx);
+                    } else {
+                        disqualified.insert(local_idx);
+                    }
+                }
+                for &idx_id in indices {
+                    if let Some(&local_idx) = addr_to_local.get(&idx_id) {
+                        disqualified.insert(local_idx);
+                    }
+                }
+            }
+            other => {
+                for op in other.operands() {
+                    if let Some(&local_idx) = addr_to_local.get(&op) {
+                        disqualified.insert(local_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Also disqualify any local whose `LocalAddr` is returned directly.
+    let mut ret_ids = IndexSet::new();
+    collect_return_ids(&func.body, &mut ret_ids);
+    for id in ret_ids {
+        if let Some(&local_idx) = addr_to_local.get(&id) {
+            disqualified.insert(local_idx);
+        }
+    }
+
+    let mut split_map: IndexMap<u32, Vec<(u32, IrType)>> = IndexMap::new();
+    for (local_idx, parts) in eligible {
+        if disqualified.contains(&local_idx) || !has_access_chain.contains(&local_idx) {
+            continue;
+        }
+        let mut sub_locals = Vec::with_capacity(parts.len());
+        for (name, ty) in parts {
+            let new_idx = func.local_vars.len() as u32;
+            func.local_vars.push(IrLocalVar {
+                name,
+                ty: ty.clone(),
+            });
+            sub_locals.push((new_idx, ty));
+        }
+        split_map.insert(local_idx, sub_locals);
+    }
+
+    if split_map.is_empty() {
+        return false;
+    }
+
+    let inst_ids: Vec<InstId> = func.insts.iter().map(|(id, _)| id).collect();
+    for id in inst_ids {
+        let InstData::AccessChain { base_ptr, indices } = func.insts[id].data.clone() else {
+            continue;
+        };
+        let Some(&local_idx) = addr_to_local.get(&base_ptr) else {
+            continue;
+        };
+        let Some(sub_locals) = split_map.get(&local_idx) else {
+            continue;
+        };
+        let Some(k) = indices.first().and_then(|&i| const_non_neg_index(func, i)) else {
+            continue;
+        };
+        let (sub_local_idx, sub_ty) = &sub_locals[k as usize];
+        let ptr_ty = IrType::Pointer {
+            pointee: Box::new(sub_ty.clone()),
+            align: 4,
+            storage: IrStorageClass::Function,
+        };
+        if indices.len() == 1 {
+            func.insts[id].data = InstData::LocalAddr {
+                local_index: *sub_local_idx,
+            };
+            func.insts[id].ir_ty = ptr_ty;
+        } else {
+            let new_base = func.emit_typed(
+                ptr_ty,
+                InstData::LocalAddr {
+                    local_index: *sub_local_idx,
+                },
+            );
+            func.insts[id].data = InstData::AccessChain {
+                base_ptr: new_base,
+                indices: indices[1..].to_vec(),
+            };
+        }
+    }
+
+    true
+}
+
+fn collect_return_ids(stmts: &[StructuredStmt], out: &mut IndexSet<InstId>) {
+    for stmt in stmts {
+        match stmt {
+            StructuredStmt::Return(Some(id)) => {
+                out.insert(*id);
+            }
+            StructuredStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_return_ids(then_body, out);
+                collect_return_ids(else_body, out);
+            }
+            StructuredStmt::Switch { cases, default, .. } => {
+                for (_, b) in cases {
+                    collect_return_ids(b, out);
+                }
+                collect_return_ids(default, out);
+            }
+            StructuredStmt::Loop {
+                body, continuing, ..
+            } => {
+                collect_return_ids(body, out);
+                collect_return_ids(continuing, out);
+            }
+            StructuredStmt::Eval(_)
+            | StructuredStmt::Break
+            | StructuredStmt::Continue
+            | StructuredStmt::Return(None) => {}
+        }
+    }
+}
+
+/// Promotes non-address-taken scalar and vector [`IrLocalVar`]s into SSA values across
+/// structured `If`, `Switch`, and `Loop` control flow, merging mutations before `Continue`
+/// into the loop continuing/header `Phi` and before `Break` into post-loop `Phi`s.
+pub struct Mem2RegPass;
+
+impl IrPass for Mem2RegPass {
+    fn name(&self) -> &'static str {
+        "mem2reg"
+    }
+
+    fn run(&self, func: &mut IrFunction) {
+        let mut addr_to_local: IndexMap<InstId, u32> = IndexMap::new();
+        for (id, inst) in func.insts.iter() {
+            if let InstData::LocalAddr { local_index } = inst.data {
+                addr_to_local.insert(id, local_index);
+            }
+        }
+        if addr_to_local.is_empty() {
+            return;
+        }
+
+        let mut promotable: IndexSet<u32> = IndexSet::new();
+        for (idx, var) in func.local_vars.iter().enumerate() {
+            if matches!(var.ty, IrType::Scalar(_) | IrType::Vector { .. }) {
+                promotable.insert(idx as u32);
+            }
+        }
+
+        // Disqualify any local whose address escapes into `AccessChain`, `FunctionCall`,
+        // atomics, `Phi`, `Select`, or as a stored/returned value.
+        for (_, inst) in func.insts.iter() {
+            match &inst.data {
+                InstData::Nop | InstData::LocalAddr { .. } | InstData::LocalLoad { .. } => {}
+                InstData::LocalStore { value, .. } => {
+                    if let Some(&local_idx) = addr_to_local.get(value) {
+                        promotable.shift_remove(&local_idx);
+                    }
+                }
+                other => {
+                    for op in other.operands() {
+                        if let Some(&local_idx) = addr_to_local.get(&op) {
+                            promotable.shift_remove(&local_idx);
+                        }
+                    }
+                }
+            }
+        }
+        let mut ret_ids = IndexSet::new();
+        collect_return_ids(&func.body, &mut ret_ids);
+        for id in ret_ids {
+            if let Some(&local_idx) = addr_to_local.get(&id) {
+                promotable.shift_remove(&local_idx);
+            }
+        }
+
+        // Restrict to locals actually accessed by at least one `LocalLoad` or `LocalStore`.
+        let mut accessed: IndexSet<u32> = IndexSet::new();
+        for (_, inst) in func.insts.iter() {
+            match inst.data {
+                InstData::LocalLoad { ptr } | InstData::LocalStore { ptr, .. } => {
+                    if let Some(&local_idx) = addr_to_local.get(&ptr)
+                        && promotable.contains(&local_idx)
+                    {
+                        accessed.insert(local_idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        promotable.retain(|idx| accessed.contains(idx));
+        if promotable.is_empty() {
+            return;
+        }
+
+        let mut env: IndexMap<u32, InstId> = IndexMap::new();
+        for &local_idx in &promotable {
+            let ty = func.local_vars[local_idx as usize].ty.clone();
+            let zero = emit_zero_const(func, &ty);
+            env.insert(local_idx, zero);
+        }
+
+        let mut state = Mem2RegState {
+            addr_to_local,
+            promotable,
+            remap: IndexMap::new(),
+            removed_insts: IndexSet::new(),
+        };
+
+        let body = std::mem::take(&mut func.body);
+        let (new_body, _) = mem2reg_stmts(func, body, &mut env, &mut state, None);
+
+        let all_ids: Vec<InstId> = func.insts.iter().map(|(id, _)| id).collect();
+        for id in all_ids {
+            if state.removed_insts.contains(&id) || state.remap.contains_key(&id) {
+                func.insts[id].data = InstData::Nop;
+                func.insts[id].non_uniform = false;
+            } else if !state.remap.is_empty() {
+                let updated = remap_inst_data(&func.insts[id].data, &state.remap);
+                func.insts[id].data = updated;
+            }
+        }
+        func.body = if state.remap.is_empty() {
+            new_body
+        } else {
+            remap_stmts_ids(new_body, &state.remap)
+        };
+    }
+}
+
+struct Mem2RegState {
+    addr_to_local: IndexMap<InstId, u32>,
+    promotable: IndexSet<u32>,
+    remap: IndexMap<InstId, InstId>,
+    removed_insts: IndexSet<InstId>,
+}
+
+#[derive(Default)]
+struct LoopMergeState {
+    continue_envs: Vec<IndexMap<u32, InstId>>,
+    break_envs: Vec<IndexMap<u32, InstId>>,
+}
+
+fn emit_zero_const(func: &mut IrFunction, ty: &IrType) -> InstId {
+    match ty {
+        IrType::Scalar(ScalarIrTy::Bool) => func.emit_typed(ty.clone(), InstData::ConstBool(false)),
+        IrType::Scalar(ScalarIrTy::I32) => func.emit_typed(ty.clone(), InstData::ConstI32(0)),
+        IrType::Scalar(ScalarIrTy::U32) => func.emit_typed(ty.clone(), InstData::ConstU32(0)),
+        IrType::Scalar(ScalarIrTy::F32) => {
+            func.emit_typed(ty.clone(), InstData::const_f32(0.0))
+        }
+        IrType::Scalar(ScalarIrTy::F16) => func.emit_typed(ty.clone(), InstData::ConstF16(0)),
+        IrType::Scalar(ScalarIrTy::I64) => func.emit_typed(ty.clone(), InstData::ConstI64(0)),
+        IrType::Scalar(ScalarIrTy::U64) => func.emit_typed(ty.clone(), InstData::ConstU64(0)),
+        IrType::Vector { scalar, len } => {
+            let elem = emit_zero_const(func, &IrType::Scalar(*scalar));
+            let elems = vec![elem; usize::from(*len)];
+            func.emit_typed(ty.clone(), build_vec_inst_data(elems))
+        }
+        _ => func.emit(None, InstData::ConstU32(0)),
+    }
+}
+
+fn mem2reg_resolve_inst(
+    func: &mut IrFunction,
+    id: InstId,
+    env: &IndexMap<u32, InstId>,
+    state: &mut Mem2RegState,
+    visited: &mut IndexSet<InstId>,
+) -> InstId {
+    if let Some(&mapped) = state.remap.get(&id) {
+        return remap_id(mapped, &state.remap);
+    }
+    if !visited.insert(id) {
+        return id;
+    }
+    if let InstData::LocalLoad { ptr } = func.insts[id].data
+        && let Some(&local_idx) = state.addr_to_local.get(&ptr)
+        && state.promotable.contains(&local_idx)
+    {
+        let val = env[&local_idx];
+        state.remap.insert(id, val);
+        state.removed_insts.insert(id);
+        return val;
+    }
+    if matches!(func.insts[id].data, InstData::Phi { .. }) {
+        return id;
+    }
+    let operands = func.insts[id].data.operands();
+    for op in operands {
+        let _ = mem2reg_resolve_inst(func, op, env, state, visited);
+    }
+    if !state.remap.is_empty() {
+        let updated = remap_inst_data(&func.insts[id].data, &state.remap);
+        func.insts[id].data = updated;
+    }
+    id
+}
+
+fn collect_written_promotable_locals(
+    func: &IrFunction,
+    stmts: &[StructuredStmt],
+    state: &Mem2RegState,
+    out: &mut IndexSet<u32>,
+) {
+    for stmt in stmts {
+        match stmt {
+            StructuredStmt::Eval(id) => {
+                if let InstData::LocalStore { ptr, .. } = func.insts[*id].data
+                    && let Some(&local_idx) = state.addr_to_local.get(&ptr)
+                    && state.promotable.contains(&local_idx)
+                {
+                    out.insert(local_idx);
+                }
+            }
+            StructuredStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_written_promotable_locals(func, then_body, state, out);
+                collect_written_promotable_locals(func, else_body, state, out);
+            }
+            StructuredStmt::Switch { cases, default, .. } => {
+                for (_, b) in cases {
+                    collect_written_promotable_locals(func, b, state, out);
+                }
+                collect_written_promotable_locals(func, default, state, out);
+            }
+            StructuredStmt::Loop {
+                body, continuing, ..
+            } => {
+                collect_written_promotable_locals(func, body, state, out);
+                collect_written_promotable_locals(func, continuing, state, out);
+            }
+            StructuredStmt::Break | StructuredStmt::Continue | StructuredStmt::Return(_) => {}
+        }
+    }
+}
+
+fn merge_envs_into_phis(
+    func: &mut IrFunction,
+    locals: &IndexSet<u32>,
+    branch_envs: &[(IndexMap<u32, InstId>, u32)],
+    out_env: &mut IndexMap<u32, InstId>,
+    emit_stmts: &mut Vec<StructuredStmt>,
+) {
+    for &local_idx in locals {
+        let first_val = branch_envs[0].0[&local_idx];
+        let all_same = branch_envs
+            .iter()
+            .all(|(b_env, _)| b_env[&local_idx] == first_val);
+        if all_same {
+            out_env.insert(local_idx, first_val);
+        } else {
+            let incoming: Vec<(InstId, u32)> = branch_envs
+                .iter()
+                .map(|(b_env, tag)| (b_env[&local_idx], *tag))
+                .collect();
+            let ty = func.local_vars[local_idx as usize].ty.clone();
+            let phi = func.emit_typed(ty, InstData::Phi { incoming });
+            emit_stmts.push(StructuredStmt::Eval(phi));
+            out_env.insert(local_idx, phi);
+        }
+    }
+}
+
+fn mem2reg_stmts(
+    func: &mut IrFunction,
+    stmts: Vec<StructuredStmt>,
+    env: &mut IndexMap<u32, InstId>,
+    state: &mut Mem2RegState,
+    mut loop_ctx: Option<&mut LoopMergeState>,
+) -> (Vec<StructuredStmt>, bool) {
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        match stmt {
+            StructuredStmt::Eval(id) => {
+                if let InstData::LocalStore { ptr, value } = func.insts[id].data
+                    && let Some(&local_idx) = state.addr_to_local.get(&ptr)
+                    && state.promotable.contains(&local_idx)
+                {
+                    let mut visited = IndexSet::new();
+                    let resolved_val = mem2reg_resolve_inst(func, value, env, state, &mut visited);
+                    env.insert(local_idx, resolved_val);
+                    state.removed_insts.insert(id);
+                    continue;
+                }
+                if let InstData::LocalLoad { ptr } = func.insts[id].data
+                    && let Some(&local_idx) = state.addr_to_local.get(&ptr)
+                    && state.promotable.contains(&local_idx)
+                {
+                    let val = env[&local_idx];
+                    state.remap.insert(id, val);
+                    state.removed_insts.insert(id);
+                    continue;
+                }
+                let mut visited = IndexSet::new();
+                let resolved = mem2reg_resolve_inst(func, id, env, state, &mut visited);
+                out.push(StructuredStmt::Eval(resolved));
+            }
+            StructuredStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let mut visited = IndexSet::new();
+                let cond = mem2reg_resolve_inst(func, cond, env, state, &mut visited);
+                let pre_env = env.clone();
+
+                let mut then_env = pre_env.clone();
+                let (new_then, then_term) =
+                    mem2reg_stmts(func, then_body, &mut then_env, state, loop_ctx.as_deref_mut());
+
+                let mut else_env = pre_env;
+                let (new_else, else_term) =
+                    mem2reg_stmts(func, else_body, &mut else_env, state, loop_ctx.as_deref_mut());
+
+                out.push(StructuredStmt::If {
+                    cond,
+                    then_body: new_then,
+                    else_body: new_else,
+                });
+
+                match (then_term, else_term) {
+                    (true, true) => return (out, true),
+                    (true, false) => *env = else_env,
+                    (false, true) => *env = then_env,
+                    (false, false) => {
+                        let locals = state.promotable.clone();
+                        merge_envs_into_phis(
+                            func,
+                            &locals,
+                            &[(then_env, 0), (else_env, 1)],
+                            env,
+                            &mut out,
+                        );
+                    }
+                }
+            }
+            StructuredStmt::Switch {
+                selector,
+                cases,
+                default,
+            } => {
+                let mut visited = IndexSet::new();
+                let selector = mem2reg_resolve_inst(func, selector, env, state, &mut visited);
+                let pre_env = env.clone();
+                let mut new_cases = Vec::with_capacity(cases.len());
+                let mut fallthrough_envs: Vec<(IndexMap<u32, InstId>, u32)> = Vec::new();
+
+                for (case_idx, (k, case_body)) in cases.into_iter().enumerate() {
+                    let mut case_env = pre_env.clone();
+                    let (new_b, term) = mem2reg_stmts(
+                        func,
+                        case_body,
+                        &mut case_env,
+                        state,
+                        loop_ctx.as_deref_mut(),
+                    );
+                    new_cases.push((k, new_b));
+                    if !term {
+                        fallthrough_envs.push((case_env, case_idx as u32));
+                    }
+                }
+
+                let default_tag = new_cases.len() as u32;
+                let mut default_env = pre_env;
+                let (new_default, def_term) = mem2reg_stmts(
+                    func,
+                    default,
+                    &mut default_env,
+                    state,
+                    loop_ctx.as_deref_mut(),
+                );
+                if !def_term {
+                    fallthrough_envs.push((default_env, default_tag));
+                }
+
+                out.push(StructuredStmt::Switch {
+                    selector,
+                    cases: new_cases,
+                    default: new_default,
+                });
+
+                if fallthrough_envs.is_empty() {
+                    return (out, true);
+                }
+                if fallthrough_envs.len() == 1 {
+                    *env = fallthrough_envs.remove(0).0;
+                } else {
+                    let locals = state.promotable.clone();
+                    merge_envs_into_phis(func, &locals, &fallthrough_envs, env, &mut out);
+                }
+            }
+            StructuredStmt::Loop {
+                body,
+                continuing,
+                unroll,
+                trip_count,
+                induction_init,
+                induction_step,
+            } => {
+                let induction_init = induction_init.map(|ind| {
+                    let mut visited = IndexSet::new();
+                    mem2reg_resolve_inst(func, ind, env, state, &mut visited)
+                });
+
+                let mut written = IndexSet::new();
+                collect_written_promotable_locals(func, &body, state, &mut written);
+                collect_written_promotable_locals(func, &continuing, state, &mut written);
+
+                let pre_env = env.clone();
+                let mut header_phis: IndexMap<u32, InstId> = IndexMap::new();
+                let mut header_evals: Vec<StructuredStmt> = Vec::with_capacity(written.len());
+                for &local_idx in &written {
+                    let ty = func.local_vars[local_idx as usize].ty.clone();
+                    let phi = func.emit_typed(
+                        ty,
+                        InstData::Phi {
+                            incoming: vec![(pre_env[&local_idx], 0)],
+                        },
+                    );
+                    header_phis.insert(local_idx, phi);
+                    env.insert(local_idx, phi);
+                    header_evals.push(StructuredStmt::Eval(phi));
+                }
+
+                let mut inner_loop = LoopMergeState::default();
+                let (mut new_body, body_term) =
+                    mem2reg_stmts(func, body, env, state, Some(&mut inner_loop));
+
+                // Collect all edges reaching the loop `continuing` block: normal body fallthrough
+                // plus every `Continue` statement targeting this loop.
+                let mut cont_entry_envs: Vec<(IndexMap<u32, InstId>, u32)> = Vec::new();
+                if !body_term {
+                    cont_entry_envs.push((env.clone(), 0));
+                }
+                for cont_env in inner_loop.continue_envs {
+                    let tag = cont_entry_envs.len() as u32;
+                    cont_entry_envs.push((cont_env, tag));
+                }
+
+                let mut cont_phi_stmts = Vec::new();
+                let (mut cont_env, has_continuing_edge) = if cont_entry_envs.is_empty() {
+                    (pre_env.clone(), false)
+                } else if cont_entry_envs.len() == 1 {
+                    (cont_entry_envs.remove(0).0, true)
+                } else {
+                    let mut merged = pre_env.clone();
+                    merge_envs_into_phis(
+                        func,
+                        &written,
+                        &cont_entry_envs,
+                        &mut merged,
+                        &mut cont_phi_stmts,
+                    );
+                    (merged, true)
+                };
+
+                let (mut new_continuing, cont_term) =
+                    mem2reg_stmts(func, continuing, &mut cont_env, state, None);
+
+                if !cont_phi_stmts.is_empty() {
+                    cont_phi_stmts.extend(new_continuing);
+                    new_continuing = cont_phi_stmts;
+                }
+
+                // Patch loop header Phis with their back-edge values from `continuing`.
+                for (&local_idx, &phi_id) in &header_phis {
+                    if has_continuing_edge && !cont_term {
+                        func.insts[phi_id].data = InstData::Phi {
+                            incoming: vec![(pre_env[&local_idx], 0), (cont_env[&local_idx], 1)],
+                        };
+                    } else {
+                        func.insts[phi_id].data = InstData::Phi {
+                            incoming: vec![(pre_env[&local_idx], 0)],
+                        };
+                    }
+                }
+
+                if !header_evals.is_empty() {
+                    header_evals.extend(new_body);
+                    new_body = header_evals;
+                }
+
+                out.push(StructuredStmt::Loop {
+                    body: new_body,
+                    continuing: new_continuing,
+                    unroll,
+                    trip_count,
+                    induction_init,
+                    induction_step,
+                });
+
+                // Merge `Break` edges into post-loop SSA values.
+                if inner_loop.break_envs.is_empty() {
+                    // Preserve header Phi bindings for any code following the loop.
+                    for (&local_idx, &phi_id) in &header_phis {
+                        env.insert(local_idx, phi_id);
+                    }
+                } else if inner_loop.break_envs.len() == 1 {
+                    *env = inner_loop.break_envs.remove(0);
+                } else {
+                    let tagged_breaks: Vec<(IndexMap<u32, InstId>, u32)> = inner_loop
+                        .break_envs
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, b_env)| (b_env, i as u32))
+                        .collect();
+                    merge_envs_into_phis(func, &written, &tagged_breaks, env, &mut out);
+                }
+            }
+            StructuredStmt::Continue => {
+                if let Some(lc) = loop_ctx.as_deref_mut() {
+                    lc.continue_envs.push(env.clone());
+                }
+                out.push(StructuredStmt::Continue);
+                return (out, true);
+            }
+            StructuredStmt::Break => {
+                if let Some(lc) = loop_ctx.as_deref_mut() {
+                    lc.break_envs.push(env.clone());
+                }
+                out.push(StructuredStmt::Break);
+                return (out, true);
+            }
+            StructuredStmt::Return(opt_val) => {
+                let mapped = opt_val.map(|v| {
+                    let mut visited = IndexSet::new();
+                    mem2reg_resolve_inst(func, v, env, state, &mut visited)
+                });
+                out.push(StructuredStmt::Return(mapped));
+                return (out, true);
+            }
+        }
+    }
+    (out, false)
+}
+
+/// Propagates trivial single-input/identical-input `Phi`s and identity
+/// `VectorShuffle`/`CompositeConstruct` copies to a fixed point.
+pub struct CopyPropPass;
+
+impl IrPass for CopyPropPass {
+    fn name(&self) -> &'static str {
+        "copy-prop"
+    }
+
+    fn run(&self, func: &mut IrFunction) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut remap: IndexMap<InstId, InstId> = IndexMap::new();
+            for (id, inst) in func.insts.iter() {
+                let candidate = match &inst.data {
+                    InstData::Phi { incoming } => {
+                        let mut unique: Option<InstId> = None;
+                        let mut trivial = true;
+                        for &(v, _) in incoming {
+                            if v == id {
+                                continue;
+                            }
+                            match unique {
+                                None => unique = Some(v),
+                                Some(prev) if prev == v => {}
+                                Some(_) => {
+                                    trivial = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if trivial { unique } else { None }
+                    }
+                    InstData::VectorShuffle {
+                        lhs,
+                        rhs,
+                        components,
+                    } => {
+                        let lhs_len = vector_len_of(func, *lhs);
+                        let rhs_len = vector_len_of(func, *rhs);
+                        if let Some(l_len) = lhs_len
+                            && components.len() == usize::from(l_len)
+                            && components
+                                .iter()
+                                .enumerate()
+                                .all(|(i, &c)| c == i as u32)
+                        {
+                            Some(*lhs)
+                        } else if let (Some(l_len), Some(r_len)) = (lhs_len, rhs_len)
+                            && components.len() == usize::from(r_len)
+                            && components
+                                .iter()
+                                .enumerate()
+                                .all(|(i, &c)| c == u32::from(l_len) + i as u32)
+                        {
+                            Some(*rhs)
+                        } else {
+                            None
+                        }
+                    }
+                    InstData::CompositeConstruct { elems } => {
+                        identity_reconstruct_source(func, id, elems)
+                    }
+                    InstData::MakeVec2(a, b) => identity_reconstruct_source(func, id, &[*a, *b]),
+                    InstData::MakeVec3(a, b, c) => {
+                        identity_reconstruct_source(func, id, &[*a, *b, *c])
+                    }
+                    InstData::MakeVec4(a, b, c, d) => {
+                        identity_reconstruct_source(func, id, &[*a, *b, *c, *d])
+                    }
+                    _ => None,
+                };
+                if let Some(target) = candidate
+                    && target != id
+                {
+                    remap.insert(id, target);
+                }
+            }
+
+            if !remap.is_empty() {
+                let all_ids: Vec<InstId> = func.insts.iter().map(|(id, _)| id).collect();
+                for id in all_ids {
+                    if remap.contains_key(&id) {
+                        func.insts[id].data = InstData::Nop;
+                        func.insts[id].non_uniform = false;
+                    } else {
+                        let updated = remap_inst_data(&func.insts[id].data, &remap);
+                        func.insts[id].data = updated;
+                    }
+                }
+                let body = std::mem::take(&mut func.body);
+                func.body = remap_stmts_ids(body, &remap);
+                changed = true;
+            }
+        }
+    }
+}
+
+fn vector_len_of(func: &IrFunction, id: InstId) -> Option<u8> {
+    if let Some(len) = func.insts[id].ir_ty.vector_len() {
+        return Some(len);
+    }
+    match &func.insts[id].data {
+        InstData::MakeVec2(_, _) => Some(2),
+        InstData::MakeVec3(_, _, _) => Some(3),
+        InstData::MakeVec4(_, _, _, _) => Some(4),
+        InstData::CompositeConstruct { elems } if (2..=4).contains(&elems.len()) => {
+            Some(elems.len() as u8)
+        }
+        _ => None,
+    }
+}
+
+fn identity_reconstruct_source(
+    func: &IrFunction,
+    construct_id: InstId,
+    elems: &[InstId],
+) -> Option<InstId> {
+    if elems.is_empty() {
+        return None;
+    }
+    let mut source: Option<InstId> = None;
+    for (idx, &elem_id) in elems.iter().enumerate() {
+        let (src, comp) = match &func.insts[elem_id].data {
+            InstData::ExtractComponent { vec, index } => (*vec, *index),
+            InstData::CompositeExtract { composite, indices } if indices.len() == 1 => {
+                (*composite, indices[0])
+            }
+            _ => return None,
+        };
+        if comp != idx as u32 {
+            return None;
+        }
+        match source {
+            None => source = Some(src),
+            Some(prev) if prev == src => {}
+            Some(_) => return None,
+        }
+    }
+    let src = source?;
+    let matches_len = vector_len_of(func, src).is_some_and(|l| usize::from(l) == elems.len());
+    let matches_ty = func.insts[src].ir_ty != IrType::Void
+        && func.insts[src].ir_ty == func.insts[construct_id].ir_ty;
+    (matches_len || matches_ty).then_some(src)
+}
+
+/// Hoists loop-invariant pure instructions whose operands are all defined outside the loop
+/// into statements immediately preceding `StructuredStmt::Loop`.
+pub struct LicmPass;
+
+impl IrPass for LicmPass {
+    fn name(&self) -> &'static str {
+        "licm"
+    }
+
+    fn run(&self, func: &mut IrFunction) {
+        let body = std::mem::take(&mut func.body);
+        func.body = licm_stmts(func, body);
+    }
+}
+
+fn is_licm_hoistable(func: &IrFunction, id: InstId) -> bool {
+    if func.insts[id].has_side_effects() {
+        return false;
+    }
+    !matches!(
+        func.insts[id].data,
+        InstData::Nop
+            | InstData::Phi { .. }
+            | InstData::LocalLoad { .. }
+            | InstData::WorkgroupLoad { .. }
+            | InstData::BdaLoad { .. }
+            | InstData::DescriptorLoad { .. }
+            | InstData::ResourceLoad { .. }
+            | InstData::ImageSample { .. }
+            | InstData::ImageSampleImplicitLod { .. }
+            | InstData::ImageSampleGrad { .. }
+            | InstData::ImageSampleDrefExplicitLod { .. }
+            | InstData::ImageGather { .. }
+            | InstData::DPdx(_)
+            | InstData::DPdy(_)
+            | InstData::Fwidth(_)
+            | InstData::RayQueryCommittedType(_)
+            | InstData::RayQueryCandidateType(_)
+            | InstData::RayQueryCommittedT(_)
+            | InstData::RayQueryCandidateT(_)
+            | InstData::RayQueryCommittedInstanceId(_)
+            | InstData::RayQueryCommittedInstanceCustomIndex(_)
+            | InstData::RayQueryCommittedPrimitiveIndex(_)
+            | InstData::RayQueryCommittedGeometryIndex(_)
+            | InstData::RayQueryCommittedObjectToWorld(_)
+            | InstData::RayQueryCommittedWorldToObject(_)
+            | InstData::RayQueryCommittedFrontFace(_)
+            | InstData::RayQueryCommittedBarycentrics(_)
+    )
+}
+
+fn depends_on_any(
+    func: &IrFunction,
+    id: InstId,
+    loop_defined: &IndexSet<InstId>,
+    visited: &mut IndexSet<InstId>,
+) -> bool {
+    if loop_defined.contains(&id) {
+        return true;
+    }
+    if !visited.insert(id) {
+        return false;
+    }
+    if matches!(func.insts[id].data, InstData::Phi { .. }) {
+        return true;
+    }
+    func.insts[id]
+        .data
+        .operands()
+        .into_iter()
+        .any(|op| depends_on_any(func, op, loop_defined, visited))
+}
+
+fn licm_stmts(func: &IrFunction, stmts: Vec<StructuredStmt>) -> Vec<StructuredStmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        match stmt {
+            StructuredStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => out.push(StructuredStmt::If {
+                cond,
+                then_body: licm_stmts(func, then_body),
+                else_body: licm_stmts(func, else_body),
+            }),
+            StructuredStmt::Switch {
+                selector,
+                cases,
+                default,
+            } => out.push(StructuredStmt::Switch {
+                selector,
+                cases: cases
+                    .into_iter()
+                    .map(|(k, b)| (k, licm_stmts(func, b)))
+                    .collect(),
+                default: licm_stmts(func, default),
+            }),
+            StructuredStmt::Loop {
+                body,
+                continuing,
+                unroll,
+                trip_count,
+                induction_init,
+                induction_step,
+            } => {
+                // Optimize inner loops first so their hoisted statements can be hoisted further.
+                let mut body = licm_stmts(func, body);
+                let continuing = licm_stmts(func, continuing);
+
+                let mut loop_defined = IndexSet::new();
+                collect_eval_ids(&body, &mut loop_defined);
+                collect_eval_ids(&continuing, &mut loop_defined);
+                if let Some(ind) = induction_init {
+                    loop_defined.insert(ind);
+                }
+
+                let mut hoisted: Vec<StructuredStmt> = Vec::new();
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    let mut remaining = Vec::with_capacity(body.len());
+                    for s in body {
+                        if let StructuredStmt::Eval(id) = s
+                            && is_licm_hoistable(func, id)
+                        {
+                            let invariant = func.insts[id].data.operands().into_iter().all(|op| {
+                                let mut visited = IndexSet::new();
+                                !depends_on_any(func, op, &loop_defined, &mut visited)
+                            });
+                            if invariant {
+                                loop_defined.shift_remove(&id);
+                                hoisted.push(StructuredStmt::Eval(id));
+                                changed = true;
+                                continue;
+                            }
+                        }
+                        remaining.push(s);
+                    }
+                    body = remaining;
+                }
+
+                out.extend(hoisted);
+                out.push(StructuredStmt::Loop {
+                    body,
+                    continuing,
+                    unroll,
+                    trip_count,
+                    induction_init,
+                    induction_step,
+                });
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Eliminates dead `LocalStore`s overwritten by a subsequent `LocalStore` to the same
+/// `LocalAddr` in the same block with no intervening load, call, atomic, or barrier.
+pub struct DeadStoreElimPass;
+
+impl IrPass for DeadStoreElimPass {
+    fn name(&self) -> &'static str {
+        "dse"
+    }
+
+    fn run(&self, func: &mut IrFunction) {
+        let body = std::mem::take(&mut func.body);
+        func.body = dse_stmts(func, body);
+    }
+}
+
+fn dse_observe_inst_tree(
+    func: &IrFunction,
+    id: InstId,
+    pending: &mut IndexMap<u32, (usize, InstId)>,
+    visited: &mut IndexSet<InstId>,
+) {
+    if pending.is_empty() || !visited.insert(id) {
+        return;
+    }
+    match &func.insts[id].data {
+        InstData::LocalLoad { ptr } => {
+            if let InstData::LocalAddr { local_index } = func.insts[*ptr].data {
+                pending.shift_remove(&local_index);
+            } else {
+                pending.clear();
+            }
+        }
+        InstData::FunctionCall { .. }
+        | InstData::WorkgroupBarrier
+        | InstData::MemoryBarrier { .. }
+        | InstData::AtomicAdd { .. }
+        | InstData::AtomicMin { .. }
+        | InstData::AtomicMax { .. }
+        | InstData::AtomicCas { .. } => {
+            pending.clear();
+        }
+        other => {
+            for op in other.operands() {
+                dse_observe_inst_tree(func, op, pending, visited);
+            }
+        }
+    }
+}
+
+fn dse_stmts(func: &mut IrFunction, stmts: Vec<StructuredStmt>) -> Vec<StructuredStmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    let mut pending: IndexMap<u32, (usize, InstId)> = IndexMap::new();
+    let mut dead_indices: IndexSet<usize> = IndexSet::new();
+
+    for stmt in stmts {
+        match stmt {
+            StructuredStmt::Eval(id) => {
+                if let InstData::LocalStore { ptr, value } = func.insts[id].data {
+                    let mut visited = IndexSet::new();
+                    dse_observe_inst_tree(func, value, &mut pending, &mut visited);
+                    if let InstData::LocalAddr { local_index } = func.insts[ptr].data {
+                        if let Some((prev_out_idx, prev_store_id)) =
+                            pending.insert(local_index, (out.len(), id))
+                        {
+                            dead_indices.insert(prev_out_idx);
+                            func.insts[prev_store_id].data = InstData::Nop;
+                            func.insts[prev_store_id].non_uniform = false;
+                        }
+                    } else {
+                        pending.clear();
+                    }
+                    out.push(StructuredStmt::Eval(id));
+                } else {
+                    let mut visited = IndexSet::new();
+                    dse_observe_inst_tree(func, id, &mut pending, &mut visited);
+                    out.push(StructuredStmt::Eval(id));
+                }
+            }
+            StructuredStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                pending.clear();
+                out.push(StructuredStmt::If {
+                    cond,
+                    then_body: dse_stmts(func, then_body),
+                    else_body: dse_stmts(func, else_body),
+                });
+            }
+            StructuredStmt::Switch {
+                selector,
+                cases,
+                default,
+            } => {
+                pending.clear();
+                out.push(StructuredStmt::Switch {
+                    selector,
+                    cases: cases
+                        .into_iter()
+                        .map(|(k, b)| (k, dse_stmts(func, b)))
+                        .collect(),
+                    default: dse_stmts(func, default),
+                });
+            }
+            StructuredStmt::Loop {
+                body,
+                continuing,
+                unroll,
+                trip_count,
+                induction_init,
+                induction_step,
+            } => {
+                pending.clear();
+                out.push(StructuredStmt::Loop {
+                    body: dse_stmts(func, body),
+                    continuing: dse_stmts(func, continuing),
+                    unroll,
+                    trip_count,
+                    induction_init,
+                    induction_step,
+                });
+            }
+            other @ (StructuredStmt::Return(_)
+            | StructuredStmt::Break
+            | StructuredStmt::Continue) => {
+                pending.clear();
+                out.push(other);
+            }
+        }
+    }
+
+    if dead_indices.is_empty() {
+        out
+    } else {
+        out.into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| (!dead_indices.contains(&i)).then_some(s))
+            .collect()
+    }
+}
+
+/// Module-level selective inliner that inlines small non-recursive helper [`IrFunction`]s
+/// (up to [`MAX_INLINE_BODY_INSTS`] live instructions) at `FunctionCall` sites while keeping
+/// larger helpers as real `FunctionCall`s.
+pub struct SelectiveInlinePass;
+
+impl SelectiveInlinePass {
+    pub const fn name(&self) -> &'static str {
+        "selective-inline"
+    }
+
+    pub fn run_module(&self, module: &mut IrModule) {
+        const MAX_ROUNDS: usize = 4;
+        for _ in 0..MAX_ROUNDS {
+            let call_graph = build_call_graph(module);
+            let eligible: IndexMap<SmolStr, IrFunction> = module
+                .functions
+                .iter()
+                .filter(|f| is_inline_eligible(f, &call_graph))
+                .map(|f| (f.name.clone(), f.clone()))
+                .collect();
+
+            if eligible.is_empty() {
+                break;
+            }
+
+            let mut any_inlined = false;
+            for func in &mut module.functions {
+                if inline_calls_in_function(func, &eligible) {
+                    any_inlined = true;
+                }
+            }
+            if !any_inlined {
+                break;
+            }
+        }
+    }
+}
+
+fn build_call_graph(module: &IrModule) -> IndexMap<SmolStr, IndexSet<SmolStr>> {
+    let mut graph: IndexMap<SmolStr, IndexSet<SmolStr>> = IndexMap::new();
+    for func in &module.functions {
+        let mut callees = IndexSet::new();
+        for (_, inst) in func.insts.iter() {
+            if let InstData::FunctionCall { callee, .. } = &inst.data {
+                callees.insert(callee.clone());
+            }
+        }
+        graph.insert(func.name.clone(), callees);
+    }
+    graph
+}
+
+fn is_recursive(name: &str, graph: &IndexMap<SmolStr, IndexSet<SmolStr>>) -> bool {
+    let mut visited: IndexSet<SmolStr> = IndexSet::new();
+    let mut stack: Vec<SmolStr> = Vec::new();
+    if let Some(direct) = graph.get(name) {
+        for callee in direct {
+            stack.push(callee.clone());
+        }
+    }
+    while let Some(cur) = stack.pop() {
+        if cur.as_str() == name {
+            return true;
+        }
+        if !visited.insert(cur.clone()) {
+            continue;
+        }
+        if let Some(nexts) = graph.get(&cur) {
+            for n in nexts {
+                stack.push(n.clone());
+            }
+        }
+    }
+    false
+}
+
+fn has_nested_return(stmts: &[StructuredStmt], is_top_level: bool) -> bool {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        match stmt {
+            StructuredStmt::Return(_) => {
+                if !is_top_level || idx + 1 != stmts.len() {
+                    return true;
+                }
+            }
+            StructuredStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if has_nested_return(then_body, false) || has_nested_return(else_body, false) {
+                    return true;
+                }
+            }
+            StructuredStmt::Switch { cases, default, .. } => {
+                if cases.iter().any(|(_, b)| has_nested_return(b, false))
+                    || has_nested_return(default, false)
+                {
+                    return true;
+                }
+            }
+            StructuredStmt::Loop {
+                body, continuing, ..
+            } => {
+                if has_nested_return(body, false) || has_nested_return(continuing, false) {
+                    return true;
+                }
+            }
+            StructuredStmt::Eval(_) | StructuredStmt::Break | StructuredStmt::Continue => {}
+        }
+    }
+    false
+}
+
+fn is_inline_eligible(
+    func: &IrFunction,
+    call_graph: &IndexMap<SmolStr, IndexSet<SmolStr>>,
+) -> bool {
+    if func.stage.is_some() {
+        return false;
+    }
+    let live_inst_count = func
+        .insts
+        .iter()
+        .filter(|(_, inst)| !matches!(inst.data, InstData::Nop))
+        .count();
+    if live_inst_count > MAX_INLINE_BODY_INSTS {
+        return false;
+    }
+    if is_recursive(&func.name, call_graph) {
+        return false;
+    }
+    if has_nested_return(&func.body, true) {
+        return false;
+    }
+    true
+}
+
+fn inline_calls_in_function(
+    caller: &mut IrFunction,
+    eligible: &IndexMap<SmolStr, IrFunction>,
+) -> bool {
+    let mut call_remap: IndexMap<InstId, InstId> = IndexMap::new();
+    let mut inlined_any = false;
+    let body = std::mem::take(&mut caller.body);
+    let new_body = inline_stmts(caller, body, eligible, &mut call_remap, &mut inlined_any);
+
+    if inlined_any && !call_remap.is_empty() {
+        let all_ids: Vec<InstId> = caller.insts.iter().map(|(id, _)| id).collect();
+        for id in all_ids {
+            if call_remap.contains_key(&id) {
+                caller.insts[id].data = InstData::Nop;
+                caller.insts[id].non_uniform = false;
+            } else {
+                let updated = remap_inst_data(&caller.insts[id].data, &call_remap);
+                caller.insts[id].data = updated;
+            }
+        }
+        caller.body = remap_stmts_ids(new_body, &call_remap);
+    } else {
+        caller.body = new_body;
+    }
+    inlined_any
+}
+
+fn inline_call_site(
+    caller: &mut IrFunction,
+    call_id: InstId,
+    callee: &IrFunction,
+    args: &[InstId],
+    call_remap: &mut IndexMap<InstId, InstId>,
+    prefix_stmts: &mut Vec<StructuredStmt>,
+) {
+    let local_offset = caller.local_vars.len() as u32;
+    for lv in &callee.local_vars {
+        caller.local_vars.push(lv.clone());
+    }
+    caller.uses_bda |= callee.uses_bda;
+    caller.uses_subgroups |= callee.uses_subgroups;
+    caller.uses_quad_control |= callee.uses_quad_control;
+    caller.required_caps |= callee.required_caps;
+
+    let mut inst_remap: IndexMap<InstId, InstId> = IndexMap::new();
+    // Pass 1: allocate placeholder slots for every non-Param callee instruction so forward
+    // references (e.g. loop Phis) resolve cleanly.
+    for (cid, cinst) in callee.insts.iter() {
+        if let InstData::Param { index } = cinst.data
+            && let Some(&arg_id) = args.get(index as usize)
+        {
+            inst_remap.insert(cid, arg_id);
+            continue;
+        }
+        let fresh = caller.emit_typed(cinst.ir_ty.clone(), InstData::Nop);
+        caller.insts[fresh].ty = cinst.ty;
+        caller.insts[fresh].non_uniform = cinst.non_uniform;
+        inst_remap.insert(cid, fresh);
+    }
+
+    // Pass 2: populate remapped instruction payloads with offset `LocalAddr` indices.
+    for (cid, cinst) in callee.insts.iter() {
+        if matches!(cinst.data, InstData::Param { .. }) {
+            continue;
+        }
+        let target = inst_remap[&cid];
+        let mut data = remap_inst_data(&cinst.data, &inst_remap);
+        if let InstData::LocalAddr { local_index } = &mut data {
+            *local_index += local_offset;
+        }
+        caller.insts[target].data = data;
+    }
+
+    let mut cloned_body = remap_stmts_ids(callee.body.clone(), &inst_remap);
+    let ret_val = match cloned_body.last() {
+        Some(StructuredStmt::Return(val)) => {
+            let v = *val;
+            cloned_body.pop();
+            v
+        }
+        _ => None,
+    };
+    prefix_stmts.extend(cloned_body);
+
+    if let Some(rv) = ret_val {
+        call_remap.insert(call_id, rv);
+    }
+    caller.insts[call_id].data = InstData::Nop;
+    caller.insts[call_id].non_uniform = false;
+}
+
+fn inline_calls_in_inst_tree(
+    caller: &mut IrFunction,
+    id: InstId,
+    eligible: &IndexMap<SmolStr, IrFunction>,
+    call_remap: &mut IndexMap<InstId, InstId>,
+    visited: &mut IndexSet<InstId>,
+    prefix_stmts: &mut Vec<StructuredStmt>,
+    inlined_any: &mut bool,
+) {
+    if !visited.insert(id) {
+        return;
+    }
+    let operands = caller.insts[id].data.operands();
+    for op in operands {
+        inline_calls_in_inst_tree(
+            caller,
+            op,
+            eligible,
+            call_remap,
+            visited,
+            prefix_stmts,
+            inlined_any,
+        );
+    }
+    if let InstData::FunctionCall { callee, args } = caller.insts[id].data.clone()
+        && callee != caller.name
+        && let Some(callee_fn) = eligible.get(&callee)
+    {
+        let remapped_args: Vec<InstId> = args
+            .iter()
+            .map(|&a| remap_id(a, call_remap))
+            .collect();
+        inline_call_site(caller, id, callee_fn, &remapped_args, call_remap, prefix_stmts);
+        *inlined_any = true;
+    }
+}
+
+fn inline_stmts(
+    caller: &mut IrFunction,
+    stmts: Vec<StructuredStmt>,
+    eligible: &IndexMap<SmolStr, IrFunction>,
+    call_remap: &mut IndexMap<InstId, InstId>,
+    inlined_any: &mut bool,
+) -> Vec<StructuredStmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    let mut visited = IndexSet::new();
+    for stmt in stmts {
+        match stmt {
+            StructuredStmt::Eval(id) => {
+                let was_eligible_call = matches!(
+                    &caller.insts[id].data,
+                    InstData::FunctionCall { callee, .. }
+                        if callee != &caller.name && eligible.contains_key(callee)
+                );
+                inline_calls_in_inst_tree(
+                    caller,
+                    id,
+                    eligible,
+                    call_remap,
+                    &mut visited,
+                    &mut out,
+                    inlined_any,
+                );
+                if !was_eligible_call {
+                    out.push(StructuredStmt::Eval(id));
+                }
+            }
+            StructuredStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                inline_calls_in_inst_tree(
+                    caller,
+                    cond,
+                    eligible,
+                    call_remap,
+                    &mut visited,
+                    &mut out,
+                    inlined_any,
+                );
+                out.push(StructuredStmt::If {
+                    cond,
+                    then_body: inline_stmts(caller, then_body, eligible, call_remap, inlined_any),
+                    else_body: inline_stmts(caller, else_body, eligible, call_remap, inlined_any),
+                });
+            }
+            StructuredStmt::Switch {
+                selector,
+                cases,
+                default,
+            } => {
+                inline_calls_in_inst_tree(
+                    caller,
+                    selector,
+                    eligible,
+                    call_remap,
+                    &mut visited,
+                    &mut out,
+                    inlined_any,
+                );
+                out.push(StructuredStmt::Switch {
+                    selector,
+                    cases: cases
+                        .into_iter()
+                        .map(|(k, b)| {
+                            (
+                                k,
+                                inline_stmts(caller, b, eligible, call_remap, inlined_any),
+                            )
+                        })
+                        .collect(),
+                    default: inline_stmts(caller, default, eligible, call_remap, inlined_any),
+                });
+            }
+            StructuredStmt::Loop {
+                body,
+                continuing,
+                unroll,
+                trip_count,
+                induction_init,
+                induction_step,
+            } => {
+                if let Some(ind) = induction_init {
+                    inline_calls_in_inst_tree(
+                        caller,
+                        ind,
+                        eligible,
+                        call_remap,
+                        &mut visited,
+                        &mut out,
+                        inlined_any,
+                    );
+                }
+                out.push(StructuredStmt::Loop {
+                    body: inline_stmts(caller, body, eligible, call_remap, inlined_any),
+                    continuing: inline_stmts(caller, continuing, eligible, call_remap, inlined_any),
+                    unroll,
+                    trip_count,
+                    induction_init,
+                    induction_step,
+                });
+            }
+            StructuredStmt::Return(opt_val) => {
+                if let Some(v) = opt_val {
+                    inline_calls_in_inst_tree(
+                        caller,
+                        v,
+                        eligible,
+                        call_remap,
+                        &mut visited,
+                        &mut out,
+                        inlined_any,
+                    );
+                }
+                out.push(StructuredStmt::Return(opt_val));
+            }
+            other @ (StructuredStmt::Break | StructuredStmt::Continue) => out.push(other),
+        }
+    }
+    out
+}
+
 /// Executes the mandatory VSL 2.0 Rust SSA legalization pipeline (zero runtime `spirv-opt`).
 pub struct PassPipeline {
+    pre_inline_passes: Vec<Box<dyn IrPass>>,
+    inline_pass: Option<SelectiveInlinePass>,
     passes: Vec<Box<dyn IrPass>>,
 }
 
 impl Default for PassPipeline {
     fn default() -> Self {
         Self {
+            pre_inline_passes: vec![Box::new(SroaPass), Box::new(Mem2RegPass)],
+            inline_pass: Some(SelectiveInlinePass),
             passes: vec![
                 Box::new(UnrollLoopsPass),
                 Box::new(LowerBdaOffsetsPass),
                 Box::new(ConstFoldPass),
+                Box::new(CopyPropPass),
                 Box::new(SimplifyAndGvnPass),
+                Box::new(LicmPass),
+                Box::new(DeadStoreElimPass),
                 Box::new(PropagateNonUniformPass),
                 Box::new(DeadCodeEliminationPass),
             ],
@@ -2728,6 +5063,14 @@ impl Default for PassPipeline {
 
 impl PassPipeline {
     pub fn run_module(&self, module: &mut IrModule) {
+        for func in &mut module.functions {
+            for pass in &self.pre_inline_passes {
+                pass.run(func);
+            }
+        }
+        if let Some(inliner) = &self.inline_pass {
+            inliner.run_module(module);
+        }
         for func in &mut module.functions {
             for pass in &self.passes {
                 pass.run(func);
@@ -3505,5 +5848,528 @@ mod tests {
         assert_eq!(func.body.len(), 1);
         assert!(matches!(func.body[0], StructuredStmt::Return(None)));
         assert_eq!(func.insts[dead_after_ret].data, InstData::Nop);
+    }
+
+    #[test]
+    fn sroa_splits_local_struct_and_small_array_for_mem2reg() {
+        let mut func = IrFunction::new("sroa_test");
+        let struct_ty = IrType::Struct(crate::ssa::IrStructLayout {
+            name: SmolStr::new_static("Pair"),
+            fields: vec![
+                crate::ssa::IrStructFieldLayout {
+                    name: SmolStr::new_static("a"),
+                    byte_offset: 0,
+                    byte_size: 4,
+                    ty: IrType::Scalar(ScalarIrTy::F32),
+                },
+                crate::ssa::IrStructFieldLayout {
+                    name: SmolStr::new_static("b"),
+                    byte_offset: 4,
+                    byte_size: 4,
+                    ty: IrType::Scalar(ScalarIrTy::F32),
+                },
+            ],
+            size: 8,
+            align: 4,
+            layout: vsl_hir::LayoutKind::Scalar,
+        });
+        func.local_vars.push(IrLocalVar {
+            name: SmolStr::new_static("p"),
+            ty: struct_ty,
+        });
+        func.local_vars.push(IrLocalVar {
+            name: SmolStr::new_static("arr"),
+            ty: IrType::Array {
+                element: Box::new(IrType::Scalar(ScalarIrTy::U32)),
+                len: 2,
+            },
+        });
+
+        let p_addr = func.emit(None, InstData::LocalAddr { local_index: 0 });
+        let idx0 = func.emit(None, InstData::ConstU32(0));
+        let idx1 = func.emit(None, InstData::ConstU32(1));
+        let p_a = func.emit_typed(
+            IrType::Pointer {
+                pointee: Box::new(IrType::Scalar(ScalarIrTy::F32)),
+                align: 4,
+                storage: IrStorageClass::Function,
+            },
+            InstData::AccessChain {
+                base_ptr: p_addr,
+                indices: vec![idx0],
+            },
+        );
+        let p_b = func.emit_typed(
+            IrType::Pointer {
+                pointee: Box::new(IrType::Scalar(ScalarIrTy::F32)),
+                align: 4,
+                storage: IrStorageClass::Function,
+            },
+            InstData::AccessChain {
+                base_ptr: p_addr,
+                indices: vec![idx1],
+            },
+        );
+        let c1 = func.emit(None, InstData::const_f32(3.0));
+        let c2 = func.emit(None, InstData::const_f32(4.0));
+        let st_a = func.emit(None, InstData::LocalStore { ptr: p_a, value: c1 });
+        let st_b = func.emit(None, InstData::LocalStore { ptr: p_b, value: c2 });
+        let ld_a = func.emit(None, InstData::LocalLoad { ptr: p_a });
+        let ld_b = func.emit(None, InstData::LocalLoad { ptr: p_b });
+        let sum = func.emit(None, InstData::FAdd32(ld_a, ld_b));
+
+        let arr_addr = func.emit(None, InstData::LocalAddr { local_index: 1 });
+        let arr_1 = func.emit_typed(
+            IrType::Pointer {
+                pointee: Box::new(IrType::Scalar(ScalarIrTy::U32)),
+                align: 4,
+                storage: IrStorageClass::Function,
+            },
+            InstData::AccessChain {
+                base_ptr: arr_addr,
+                indices: vec![idx1],
+            },
+        );
+        let st_arr = func.emit(
+            None,
+            InstData::LocalStore {
+                ptr: arr_1,
+                value: idx1,
+            },
+        );
+
+        func.body.push(StructuredStmt::Eval(st_a));
+        func.body.push(StructuredStmt::Eval(st_b));
+        func.body.push(StructuredStmt::Eval(st_arr));
+        func.body.push(StructuredStmt::Return(Some(sum)));
+
+        SroaPass.run(&mut func);
+        assert!(matches!(func.insts[p_a].data, InstData::LocalAddr { .. }));
+        assert!(matches!(func.insts[p_b].data, InstData::LocalAddr { .. }));
+        assert!(matches!(func.insts[arr_1].data, InstData::LocalAddr { .. }));
+
+        Mem2RegPass.run(&mut func);
+        ConstFoldPass.run(&mut func);
+        let StructuredStmt::Return(Some(ret_id)) = func.body.last().copied().unwrap() else {
+            panic!("expected Return");
+        };
+        assert_eq!(func.insts[ret_id].data, InstData::const_f32(7.0));
+    }
+
+    #[test]
+    fn mem2reg_promotes_locals_across_continue_inside_nested_if_in_loop() {
+        let mut func = IrFunction::new("mem2reg_loop_continue");
+        func.local_vars.push(IrLocalVar {
+            name: SmolStr::new_static("x"),
+            ty: IrType::Scalar(ScalarIrTy::U32),
+        });
+        let x_addr = func.emit(None, InstData::LocalAddr { local_index: 0 });
+        let zero = func.emit(None, InstData::ConstU32(0));
+        let one = func.emit(None, InstData::ConstU32(1));
+        let two = func.emit(None, InstData::ConstU32(2));
+        let init_store = func.emit(
+            None,
+            InstData::LocalStore {
+                ptr: x_addr,
+                value: zero,
+            },
+        );
+
+        let cond_skip = func.emit(None, InstData::LoadPushConstant { field_index: 0 });
+        let cond_done = func.emit(None, InstData::LoadPushConstant { field_index: 1 });
+
+        let ld_in_if = func.emit(None, InstData::LocalLoad { ptr: x_addr });
+        let inc_1 = func.emit(None, InstData::IAdd32(ld_in_if, one));
+        let st_in_if = func.emit(
+            None,
+            InstData::LocalStore {
+                ptr: x_addr,
+                value: inc_1,
+            },
+        );
+
+        let ld_body = func.emit(None, InstData::LocalLoad { ptr: x_addr });
+        let inc_2 = func.emit(None, InstData::IAdd32(ld_body, two));
+        let st_body = func.emit(
+            None,
+            InstData::LocalStore {
+                ptr: x_addr,
+                value: inc_2,
+            },
+        );
+
+        let ld_ret = func.emit(None, InstData::LocalLoad { ptr: x_addr });
+
+        func.body.push(StructuredStmt::Eval(init_store));
+        func.body.push(StructuredStmt::Loop {
+            body: vec![
+                StructuredStmt::If {
+                    cond: cond_skip,
+                    then_body: vec![StructuredStmt::Eval(st_in_if), StructuredStmt::Continue],
+                    else_body: Vec::new(),
+                },
+                StructuredStmt::Eval(st_body),
+                StructuredStmt::If {
+                    cond: cond_done,
+                    then_body: vec![StructuredStmt::Break],
+                    else_body: Vec::new(),
+                },
+            ],
+            continuing: Vec::new(),
+            unroll: false,
+            trip_count: None,
+            induction_init: None,
+            induction_step: 0,
+        });
+        func.body.push(StructuredStmt::Return(Some(ld_ret)));
+
+        Mem2RegPass.run(&mut func);
+
+        // No LocalLoad or LocalStore should remain.
+        assert!(func.insts.iter().all(|(_, inst)| !matches!(
+            inst.data,
+            InstData::LocalLoad { .. } | InstData::LocalStore { .. }
+        )));
+
+        // The loop continuing block must hold a merge Phi combining both `inc_2` (fallthrough)
+        // and `inc_1` (the `continue` inside `if`), and the loop header Phi must take that
+        // continuing Phi as its back-edge.
+        let StructuredStmt::Loop {
+            body: loop_body,
+            continuing,
+            ..
+        } = &func.body[0]
+        else {
+            panic!("expected Loop at body[0]");
+        };
+        let Some(&StructuredStmt::Eval(header_phi)) = loop_body.first() else {
+            panic!("expected header Phi Eval at start of loop body");
+        };
+        let Some(&StructuredStmt::Eval(cont_phi)) = continuing.first() else {
+            panic!("expected continuing Phi Eval capturing continue edge");
+        };
+        let InstData::Phi {
+            incoming: cont_incoming,
+        } = &func.insts[cont_phi].data
+        else {
+            panic!("expected Phi in continuing");
+        };
+        assert_eq!(cont_incoming.len(), 2);
+        assert!(cont_incoming.iter().any(|&(v, _)| v == inc_1));
+        assert!(cont_incoming.iter().any(|&(v, _)| v == inc_2));
+
+        let InstData::Phi {
+            incoming: header_incoming,
+        } = &func.insts[header_phi].data
+        else {
+            panic!("expected header Phi");
+        };
+        assert_eq!(header_incoming, &vec![(zero, 0), (cont_phi, 1)]);
+
+        // Post-loop return must receive `inc_2` from the `Break` edge.
+        assert_eq!(func.body[1], StructuredStmt::Return(Some(inc_2)));
+    }
+
+    #[test]
+    fn licm_hoists_loop_invariant_pure_chain_before_loop() {
+        let mut func = IrFunction::new("licm_test");
+        let pc0 = func.emit(None, InstData::LoadPushConstant { field_index: 0 });
+        let two = func.emit(None, InstData::ConstU32(2));
+        let inv1 = func.emit(None, InstData::IMul32(pc0, two));
+        let inv2 = func.emit(None, InstData::IAdd32(inv1, two));
+        let ind = func.emit(None, InstData::ConstU32(0));
+        let variant = func.emit(None, InstData::IAdd32(inv2, ind));
+        let store = func.emit(
+            None,
+            InstData::WorkgroupStore {
+                var_index: 0,
+                index: Some(ind),
+                value: variant,
+            },
+        );
+
+        func.body.push(StructuredStmt::Loop {
+            body: vec![
+                StructuredStmt::Eval(inv1),
+                StructuredStmt::Eval(inv2),
+                StructuredStmt::Eval(variant),
+                StructuredStmt::Eval(store),
+            ],
+            continuing: Vec::new(),
+            unroll: false,
+            trip_count: None,
+            induction_init: Some(ind),
+            induction_step: 1,
+        });
+
+        LicmPass.run(&mut func);
+
+        assert_eq!(func.body.len(), 3);
+        assert_eq!(func.body[0], StructuredStmt::Eval(inv1));
+        assert_eq!(func.body[1], StructuredStmt::Eval(inv2));
+        let StructuredStmt::Loop { body, .. } = &func.body[2] else {
+            panic!("expected Loop after hoisted statements");
+        };
+        assert_eq!(
+            body,
+            &vec![StructuredStmt::Eval(variant), StructuredStmt::Eval(store)]
+        );
+    }
+
+    #[test]
+    fn copy_prop_eliminates_trivial_phi_and_identity_shuffle_and_reconstruct() {
+        let mut func = IrFunction::new("copy_prop_test");
+        let x = func.emit(None, InstData::const_f32(1.0));
+        let y = func.emit(None, InstData::const_f32(2.0));
+        let v = func.emit_typed(
+            IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 2,
+            },
+            InstData::MakeVec2(x, y),
+        );
+        let trivial_phi = func.emit_typed(
+            IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 2,
+            },
+            InstData::Phi {
+                incoming: vec![(v, 0), (v, 1)],
+            },
+        );
+        let id_shuf = func.emit_typed(
+            IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 2,
+            },
+            InstData::VectorShuffle {
+                lhs: trivial_phi,
+                rhs: trivial_phi,
+                components: vec![0, 1],
+            },
+        );
+        let ex0 = func.emit(
+            None,
+            InstData::ExtractComponent {
+                vec: id_shuf,
+                index: 0,
+            },
+        );
+        let ex1 = func.emit(
+            None,
+            InstData::ExtractComponent {
+                vec: id_shuf,
+                index: 1,
+            },
+        );
+        let rebuilt = func.emit_typed(
+            IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 2,
+            },
+            InstData::CompositeConstruct {
+                elems: vec![ex0, ex1],
+            },
+        );
+        func.body.push(StructuredStmt::Return(Some(rebuilt)));
+
+        CopyPropPass.run(&mut func);
+
+        assert_eq!(func.body, vec![StructuredStmt::Return(Some(v))]);
+        assert_eq!(func.insts[trivial_phi].data, InstData::Nop);
+        assert_eq!(func.insts[id_shuf].data, InstData::Nop);
+        assert_eq!(func.insts[rebuilt].data, InstData::Nop);
+    }
+
+    #[test]
+    fn dse_removes_overwritten_local_store_but_keeps_observed_store() {
+        let mut func = IrFunction::new("dse_test");
+        func.local_vars.push(IrLocalVar {
+            name: SmolStr::new_static("a"),
+            ty: IrType::Scalar(ScalarIrTy::U32),
+        });
+        let addr = func.emit(None, InstData::LocalAddr { local_index: 0 });
+        let c1 = func.emit(None, InstData::ConstU32(1));
+        let c2 = func.emit(None, InstData::ConstU32(2));
+        let c3 = func.emit(None, InstData::ConstU32(3));
+        let st1 = func.emit(None, InstData::LocalStore { ptr: addr, value: c1 });
+        let st2 = func.emit(None, InstData::LocalStore { ptr: addr, value: c2 });
+        let ld = func.emit(None, InstData::LocalLoad { ptr: addr });
+        let st3 = func.emit(None, InstData::LocalStore { ptr: addr, value: c3 });
+
+        func.body.push(StructuredStmt::Eval(st1));
+        func.body.push(StructuredStmt::Eval(st2));
+        func.body.push(StructuredStmt::Eval(ld));
+        func.body.push(StructuredStmt::Eval(st3));
+        func.body.push(StructuredStmt::Return(Some(ld)));
+
+        DeadStoreElimPass.run(&mut func);
+
+        assert_eq!(func.insts[st1].data, InstData::Nop);
+        assert!(matches!(func.insts[st2].data, InstData::LocalStore { .. }));
+        assert!(matches!(func.insts[st3].data, InstData::LocalStore { .. }));
+        assert_eq!(func.body.len(), 4);
+    }
+
+    #[test]
+    fn const_fold_handles_f16_fconvert_and_vector_arithmetic_and_shuffle() {
+        let mut func = IrFunction::new("f16_vec_fold");
+        let f32_val = func.emit(None, InstData::const_f32(1.5));
+        let to_f16 = func.emit(
+            None,
+            InstData::FConvert {
+                value: f32_val,
+                target: ScalarIrTy::F16,
+            },
+        );
+        let back_f32 = func.emit(
+            None,
+            InstData::FConvert {
+                value: to_f16,
+                target: ScalarIrTy::F32,
+            },
+        );
+        let half_two = func.emit(None, InstData::ConstF16(f32_to_f16_bits(2.0)));
+        let half_sum = func.emit(None, InstData::FAdd32(to_f16, half_two));
+
+        let vx = func.emit(None, InstData::const_f32(2.0));
+        let vy = func.emit(None, InstData::const_f32(3.0));
+        let va = func.emit(None, InstData::MakeVec2(vx, vy));
+        let scale = func.emit(None, InstData::const_f32(4.0));
+        let scaled = func.emit(
+            None,
+            InstData::VectorTimesScalar {
+                vec: va,
+                scalar: scale,
+            },
+        );
+        let swapped = func.emit(
+            None,
+            InstData::VectorShuffle {
+                lhs: scaled,
+                rhs: scaled,
+                components: vec![1, 0],
+            },
+        );
+        let comp0 = func.emit(
+            None,
+            InstData::ExtractComponent {
+                vec: swapped,
+                index: 0,
+            },
+        );
+
+        ConstFoldPass.run(&mut func);
+
+        assert_eq!(func.insts[to_f16].data, InstData::ConstF16(0x3E00));
+        assert_eq!(func.insts[back_f32].data, InstData::const_f32(1.5));
+        assert_eq!(
+            func.insts[half_sum].data,
+            InstData::ConstF16(f32_to_f16_bits(3.5))
+        );
+        assert_eq!(func.insts[comp0].data, InstData::const_f32(12.0));
+    }
+
+    #[test]
+    fn unroll_loops_respects_max_unroll_body_insts_cap() {
+        let mut func = IrFunction::new("unroll_body_cap");
+        let mut large_body = Vec::with_capacity(MAX_UNROLL_BODY_INSTS + 2);
+        for _ in 0..=MAX_UNROLL_BODY_INSTS {
+            let b = func.emit(None, InstData::WorkgroupBarrier);
+            large_body.push(StructuredStmt::Eval(b));
+        }
+        func.body.push(StructuredStmt::Loop {
+            body: large_body,
+            continuing: Vec::new(),
+            unroll: true,
+            trip_count: Some(4),
+            induction_init: None,
+            induction_step: 0,
+        });
+
+        UnrollLoopsPass.run(&mut func);
+
+        assert_eq!(func.body.len(), 1);
+        assert!(matches!(
+            func.body[0],
+            StructuredStmt::Loop {
+                unroll: true,
+                trip_count: Some(4),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn selective_inline_inlines_small_helper_and_keeps_large_helper_call() {
+        // Small helper: add_one(x) -> x + 1
+        let mut small_helper = IrFunction::new("add_one");
+        small_helper.params.push(crate::ssa::IrParam {
+            name: SmolStr::new_static("x"),
+            ty: IrType::Scalar(ScalarIrTy::U32),
+            is_inout: false,
+            is_out: false,
+        });
+        small_helper.return_ty = IrType::Scalar(ScalarIrTy::U32);
+        let p0 = small_helper.emit(None, InstData::Param { index: 0 });
+        let one = small_helper.emit(None, InstData::ConstU32(1));
+        let sum = small_helper.emit(None, InstData::IAdd32(p0, one));
+        small_helper.body.push(StructuredStmt::Return(Some(sum)));
+
+        // Large helper: > MAX_INLINE_BODY_INSTS instructions
+        let mut large_helper = IrFunction::new("big_helper");
+        large_helper.return_ty = IrType::Scalar(ScalarIrTy::U32);
+        let mut acc = large_helper.emit(None, InstData::ConstU32(0));
+        let step = large_helper.emit(None, InstData::ConstU32(1));
+        for _ in 0..=MAX_INLINE_BODY_INSTS {
+            acc = large_helper.emit(None, InstData::IAdd32(acc, step));
+            large_helper.body.push(StructuredStmt::Eval(acc));
+        }
+        large_helper.body.push(StructuredStmt::Return(Some(acc)));
+
+        // Entry caller calls both helpers
+        let mut main_fn = IrFunction::new("main");
+        main_fn.stage = Some(vsl_mc::ShaderStage::Compute);
+        let arg = main_fn.emit(None, InstData::ConstU32(41));
+        let small_call = main_fn.emit_typed(
+            IrType::Scalar(ScalarIrTy::U32),
+            InstData::FunctionCall {
+                callee: SmolStr::new_static("add_one"),
+                args: vec![arg],
+            },
+        );
+        let big_call = main_fn.emit_typed(
+            IrType::Scalar(ScalarIrTy::U32),
+            InstData::FunctionCall {
+                callee: SmolStr::new_static("big_helper"),
+                args: Vec::new(),
+            },
+        );
+        let total = main_fn.emit(None, InstData::IAdd32(small_call, big_call));
+        main_fn.body.push(StructuredStmt::Return(Some(total)));
+
+        let mut module = IrModule {
+            name: SmolStr::new_static("inline_mod"),
+            functions: vec![small_helper, large_helper, main_fn],
+        };
+
+        SelectiveInlinePass.run_module(&mut module);
+        ConstFoldPass.run(&mut module.functions[2]);
+
+        let entry = &module.functions[2];
+        // `add_one` call must have been inlined and folded to 42; `big_helper` call must remain.
+        assert_eq!(entry.insts[small_call].data, InstData::Nop);
+        assert!(matches!(
+            &entry.insts[big_call].data,
+            InstData::FunctionCall { callee, .. } if callee == "big_helper"
+        ));
+        let StructuredStmt::Return(Some(ret_id)) = entry.body[0] else {
+            panic!("expected Return");
+        };
+        let InstData::IAdd32(lhs, rhs) = entry.insts[ret_id].data else {
+            panic!("expected IAdd32");
+        };
+        assert_eq!(entry.insts[lhs].data, InstData::ConstU32(42));
+        assert_eq!(rhs, big_call);
     }
 }
