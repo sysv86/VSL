@@ -6494,14 +6494,14 @@ impl FnLowerCtx<'_> {
             GlslStd450Op::PackHalf2x16 => {
                 let ext_id = self.emitter.emit_glsl_std_450_import();
                 let v2_ty = self.emitter.emit_type_vector(f32_ty, 2);
-                let arg0 = args.first().map_or_else(
-                    || self.emit_zero_const(v2_ty),
-                    |&a| {
+                let arg0 = match args.first() {
+                    Some(&a) => {
                         let raw = self.ensure_inst(a);
                         let src_ty = self.inst_types.get(&a).copied().unwrap_or(v2_ty);
                         self.coerce_to_ty(raw, src_ty, v2_ty)
-                    },
-                );
+                    }
+                    None => self.emit_zero_const(v2_ty),
+                };
                 let res = self.emitter.alloc_id();
                 self.emitter
                     .emit_fn_inst(spirv::Op::ExtInst, &[u32_ty, res, ext_id, 58, arg0]);
@@ -6510,14 +6510,14 @@ impl FnLowerCtx<'_> {
             GlslStd450Op::UnpackHalf2x16 => {
                 let ext_id = self.emitter.emit_glsl_std_450_import();
                 let v2_ty = self.emitter.emit_type_vector(f32_ty, 2);
-                let arg0 = args.first().map_or_else(
-                    || self.emit_zero_const(u32_ty),
-                    |&a| {
+                let arg0 = match args.first() {
+                    Some(&a) => {
                         let raw = self.ensure_inst(a);
                         let src_ty = self.inst_types.get(&a).copied().unwrap_or(u32_ty);
                         self.coerce_to_ty(raw, src_ty, u32_ty)
-                    },
-                );
+                    }
+                    None => self.emit_zero_const(u32_ty),
+                };
                 let res = self.emitter.alloc_id();
                 self.emitter
                     .emit_fn_inst(spirv::Op::ExtInst, &[v2_ty, res, ext_id, 60, arg0]);
@@ -6526,14 +6526,14 @@ impl FnLowerCtx<'_> {
             GlslStd450Op::PackUnorm4x8 => {
                 let ext_id = self.emitter.emit_glsl_std_450_import();
                 let v4_ty = self.emitter.emit_type_vector(f32_ty, 4);
-                let arg0 = args.first().map_or_else(
-                    || self.emit_zero_const(v4_ty),
-                    |&a| {
+                let arg0 = match args.first() {
+                    Some(&a) => {
                         let raw = self.ensure_inst(a);
                         let src_ty = self.inst_types.get(&a).copied().unwrap_or(v4_ty);
                         self.coerce_to_ty(raw, src_ty, v4_ty)
-                    },
-                );
+                    }
+                    None => self.emit_zero_const(v4_ty),
+                };
                 let res = self.emitter.alloc_id();
                 self.emitter
                     .emit_fn_inst(spirv::Op::ExtInst, &[u32_ty, res, ext_id, 55, arg0]);
@@ -6542,14 +6542,14 @@ impl FnLowerCtx<'_> {
             GlslStd450Op::UnpackUnorm4x8 => {
                 let ext_id = self.emitter.emit_glsl_std_450_import();
                 let v4_ty = self.emitter.emit_type_vector(f32_ty, 4);
-                let arg0 = args.first().map_or_else(
-                    || self.emit_zero_const(u32_ty),
-                    |&a| {
+                let arg0 = match args.first() {
+                    Some(&a) => {
                         let raw = self.ensure_inst(a);
                         let src_ty = self.inst_types.get(&a).copied().unwrap_or(u32_ty);
                         self.coerce_to_ty(raw, src_ty, u32_ty)
-                    },
-                );
+                    }
+                    None => self.emit_zero_const(u32_ty),
+                };
                 let res = self.emitter.alloc_id();
                 self.emitter
                     .emit_fn_inst(spirv::Op::ExtInst, &[v4_ty, res, ext_id, 64, arg0]);
@@ -6572,14 +6572,14 @@ impl FnLowerCtx<'_> {
                 } else {
                     f32_ty
                 };
-                let lhs = raw_a.map_or_else(
-                    || self.emit_zero_const(res_ty),
-                    |(_, id)| self.coerce_to_ty(id, a_ty, res_ty),
-                );
-                let rhs = raw_b.map_or_else(
-                    || self.emit_zero_const(res_ty),
-                    |(_, id)| self.coerce_to_ty(id, b_ty, res_ty),
-                );
+                let lhs = match raw_a {
+                    Some((_, id)) => self.coerce_to_ty(id, a_ty, res_ty),
+                    None => self.emit_zero_const(res_ty),
+                };
+                let rhs = match raw_b {
+                    Some((_, id)) => self.coerce_to_ty(id, b_ty, res_ty),
+                    None => self.emit_zero_const(res_ty),
+                };
                 let res = self.emitter.alloc_id();
                 self.emitter
                     .emit_fn_inst(spirv::Op::FMod, &[res_ty, res, lhs, rhs]);
