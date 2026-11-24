@@ -1,0 +1,19 @@
+[package]
+name = "vsl-glsl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stage A GLSL 460 oracle backend and Hyaloclast raster G-Buffer hook bridge for VSL 2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+indexmap.workspace = true
+smol_str.workspace = true
+vsl-diagnostics.workspace = true
+vsl-mc.workspace = true
+vsl-syntax.workspace = true

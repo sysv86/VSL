@@ -1,0 +1,25 @@
+[package]
+name = "vsl-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-to-end VSL 2.0 compilation orchestrator, ModuleGraph + L1/L2 BLAKE3 cache, HIR->SSA lowering, GLSL 460 oracle, and CompiledShaderUnit builder"
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3.workspace = true
+indexmap.workspace = true
+smol_str.workspace = true
+vsl-diagnostics.workspace = true
+vsl-glsl.workspace = true
+vsl-hir.workspace = true
+vsl-ir.workspace = true
+vsl-mc.workspace = true
+vsl-pack.workspace = true
+vsl-spirv.workspace = true
+vsl-syntax.workspace = true

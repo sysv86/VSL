@@ -1,0 +1,17 @@
+[package]
+name = "vsl-diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Byte-span tracking, virtual source database, and ariadne diagnostic rendering for VSL 2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+ariadne.workspace = true
+serde.workspace = true
+smol_str.workspace = true

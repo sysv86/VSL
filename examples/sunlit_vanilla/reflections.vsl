@@ -1,0 +1,32 @@
+module pack::reflections;
+
+import mc::{world, tlas, bindless};
+
+#[tier(2..=3)]
+#[cap(ray_query)]
+@stage(compute(8, 8, 1))
+pub fn trace_glossy_reflections(
+    #[builtin(global_invocation_id)] gid: uvec3,
+    gbuffer_normal: Texture2D<f32>,
+    gbuffer_depth: Texture2D<f32>,
+    out_refl: RWImage2D<rgba16f>,
+) {
+    let coord = ivec2(gid.xy);
+    let origin = mc::reconstruct_world_pos(coord, gbuffer_depth);
+    let dir = reflect(mc::view_dir(coord), gbuffer_normal.fetch(coord, 0).xyz);
+
+    let mut rq: RayQuery;
+    rq.initialize(tlas, mc::RayFlags::OPAQUE, 0xFFu, origin + dir * 0.02, 0.001, dir, 128.0);
+    while rq.proceed() {}
+
+    let color = if rq.committed_type() == mc::HitType::Triangle {
+        let inst = mc::instances[rq.committed_instance_custom_index()];
+        let uv = rq.committed_barycentrics();
+        bindless[nonuniform(inst.albedo_slot)].sample_lod(uv, 0.0).rgb
+    } else {
+        mc::sample_sky(dir)
+    };
+
+    out_refl.store(coord, vec4(color, 1.0));
+    mc::debug_write("custom_reflections", coord, color);
+}

@@ -1,0 +1,23 @@
+[package]
+name = "vsl-hir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arena-backed HIR, module graph with BLAKE3 hashing, layout engine, and compile-time SPIR-V legality validation for VSL 2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3.workspace = true
+indexmap.workspace = true
+la-arena.workspace = true
+serde.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+vsl-diagnostics.workspace = true
+vsl-mc.workspace = true
+vsl-syntax.workspace = true

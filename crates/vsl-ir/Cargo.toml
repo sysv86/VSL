@@ -1,0 +1,20 @@
+[package]
+name = "vsl-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Structured SSA IR and deterministic Rust optimization/legalization passes for VSL 2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+indexmap.workspace = true
+la-arena.workspace = true
+serde.workspace = true
+smol_str.workspace = true
+vsl-hir.workspace = true
+vsl-mc.workspace = true

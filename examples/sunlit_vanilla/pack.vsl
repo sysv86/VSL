@@ -1,0 +1,87 @@
+pack "hyaloclast-sunlit-vanilla" {
+    name: "Sunlit Vanilla",
+    version: "2.0.0",
+    author: "VulkanShaders",
+    description: "Vanilla-faithful physically based pack across Tiers 0-3",
+    extends: none,
+    tiers: 0..=3,
+    capabilities: [
+        pbr_labpbr,
+        hdr_output,
+        restir_di,
+        volumetric_clouds,
+        volumetric_fog,
+        distant_horizons_lod,
+    ],
+}
+
+settings {
+    category "Lighting" {
+        param sun_intensity: f32 = 2.75 {
+            label: "Sun Intensity",
+            range: 0.5..=8.0,
+            step: 0.1,
+        }
+        param sun_tint: color_rgb = vec3(1.0, 0.96, 0.90) {
+            label: "Sun Tint",
+        }
+        spec pt_max_bounces: i32 = 2 {
+            label: "Path Trace Max Bounces",
+            range: 1..=4,
+            step: 1,
+            tiers: 3..=3,
+        }
+        param custom_rayquery_refl: bool = false {
+            label: "Custom RayQuery Reflections",
+            tiers: 2..=3,
+        }
+    }
+
+    category "Post" {
+        param tone_mapping: enum { agx, aces, pbr_neutral } = pbr_neutral {
+            label: "Tone Mapper",
+        }
+    }
+}
+
+presets {
+    preset low    (order = 0, tiers: 0..=3, label: "Low")    { pt_max_bounces = 1; custom_rayquery_refl = false; }
+    preset medium (order = 1, tiers: 0..=3, label: "Medium") { pt_max_bounces = 1; custom_rayquery_refl = false; }
+    preset high   (order = 2, tiers: 0..=3, label: "High")   { pt_max_bounces = 2; custom_rayquery_refl = false; }
+    preset ultra  (order = 3, tiers: 2..=3, label: "Ultra")  { pt_max_bounces = 3; custom_rayquery_refl = true;  }
+}
+
+pipeline extend(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+    g.hook(water_waves, hooks::water::sunlit_waves);
+    g.hook(clouds, hooks::clouds::vanilla_volumetric_clouds);
+
+    let blue_noise = g.resource_texture("resources/blue_noise_64x64.png", rgba8, nearest, repeat);
+
+    let fog_froxels = g.target_array::<rgba16f>(
+        "volumetric_fog_volume",
+        scale = 0.125,
+        layers = 16,
+        temporal = true,
+        clear_color = vec4(0.0),
+    );
+
+    g.compute_pass("custom_volumetric_fog", pack::fog::froxel_march)
+        .replaces(mc::passes::volumetric_fog_pass)
+        .after(mc::passes::gbuffer_mrt_pass)
+        .before(mc::passes::lighting_raster_compute_gi)
+        .bind(prev_fog = fog_froxels.history(), out_fog = fog_froxels, noise = blue_noise)
+        .dispatch_for(fog_froxels);
+
+    if cfg.tier >= 2 && cfg.param(custom_rayquery_refl) {
+        let refl_target = g.target::<rgba16f>("custom_refl", scale = 0.5);
+        g.compute_pass("custom_refl_trace", pack::reflections::trace_glossy_reflections)
+            .after(mc::passes::gbuffer_mrt_pass)
+            .before(mc::passes::denoiser_svgf_nrd)
+            .bind(
+                gbuffer_normal = g.builtin_target(mc::targets::RES_GBUFFER_NORMAL),
+                gbuffer_depth = g.builtin_target(mc::targets::RES_DEPTH),
+                out_refl = refl_target,
+            )
+            .dispatch_for(refl_target);
+    }
+}

@@ -1,0 +1,37 @@
+module pack::tiled_lighting;
+
+import std::sync::{workgroup_barrier, atomic_add, Scope, Order};
+
+workgroup var s_tile_lights: [u32; 64];
+workgroup var s_tile_count: u32;
+
+#[push_constant, layout(scalar)]
+pub struct AtrousPush {
+    pub step_size: i32,
+    pub phi_color: f32,
+    pub phi_normal: f32,
+    pub phi_depth: f32,
+}
+
+@stage(compute(8, 8, 1))
+pub fn cull_tile_lights(
+    #[builtin(local_invocation_index)] lid: u32,
+    #[builtin(global_invocation_id)] gid: uvec3,
+    gbuffer_depth: Texture2D<f32>,
+    out_lit: RWImage2D<rgba16f>,
+) {
+    if lid == 0u { s_tile_count = 0u; }
+    workgroup_barrier();
+
+    for i in (lid..mc::lights.count).step_by(64u) {
+        if light_intersects_tile(mc::lights.items[i], gid.xy) {
+            let idx = atomic_add::<Scope::Workgroup, Order::Relaxed>(&s_tile_count, 1u);
+            if idx < 64u { s_tile_lights[idx] = i; }
+        }
+    }
+    workgroup_barrier();
+
+    let total = min(s_tile_count, 64u);
+    let color = shade_tile_pixel(gid.xy, gbuffer_depth, total);
+    out_lit.store(ivec2(gid.xy), vec4(color, 1.0));
+}

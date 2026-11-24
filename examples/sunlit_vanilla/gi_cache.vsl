@@ -1,0 +1,42 @@
+module pack::gi_cache;
+
+import std::sync::{Scope, Order, atomic_cas, atomic_add};
+
+pub const EMPTY_KEY: u64 = 0u64;
+
+#[layout(std430)]
+pub struct CacheCell {
+    pub rad_r: u32,
+    pub rad_g: u32,
+    pub rad_b: u32,
+    pub samples: u32,
+}
+
+#[cap(int64_atomics)]
+pub fn cache_accumulate(
+    keys: ptr_mut<u64, align = 8>,
+    cells: ptr_mut<CacheCell, align = 16>,
+    capacity_mask: u32,
+    hash_key: u64,
+    radiance: vec3,
+) -> bool {
+    let mut slot = u32(hash_key) & capacity_mask;
+
+    #[unroll]
+    for _ in 0u..16u {
+        let key_ptr = keys.offset(i64(slot));
+        let prev = atomic_cas::<Scope::Device, Order::Relaxed>(key_ptr, EMPTY_KEY, hash_key);
+
+        if prev == EMPTY_KEY || prev == hash_key {
+            let cell = cells.offset(i64(slot));
+            let q = uvec3(clamp(radiance, vec3(0.0), vec3(16.0)) * 1024.0);
+            atomic_add::<Scope::Device, Order::Relaxed>(&cell.rad_r, q.x);
+            atomic_add::<Scope::Device, Order::Relaxed>(&cell.rad_g, q.y);
+            atomic_add::<Scope::Device, Order::Relaxed>(&cell.rad_b, q.z);
+            atomic_add::<Scope::Device, Order::Relaxed>(&cell.samples, 1u);
+            return true;
+        }
+        slot = (slot + 1u) & capacity_mask;
+    }
+    return false;
+}

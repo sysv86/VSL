@@ -1,0 +1,25 @@
+[package]
+name = "vsl-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VSL 2.0 Language Server Protocol implementation reusing vsl-syntax, vsl-hir, vsl-pack, and embedded vsl-mc definitions"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "vsl-lsp"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tower-lsp-server.workspace = true
+vsl-diagnostics.workspace = true
+vsl-hir.workspace = true
+vsl-mc.workspace = true
+vsl-pack.workspace = true
+vsl-syntax.workspace = true

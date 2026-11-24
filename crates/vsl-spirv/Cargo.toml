@@ -1,0 +1,18 @@
+[package]
+name = "vsl-spirv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Flat-arena direct SPIR-V 1.6 word emitter using spirv 0.4 constants (zero rspirv Vec overhead)"
+
+[lints]
+workspace = true
+
+[dependencies]
+indexmap.workspace = true
+spirv.workspace = true
+vsl-ir.workspace = true
+vsl-mc.workspace = true

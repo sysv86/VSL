@@ -1,0 +1,64 @@
+module pack::restir;
+
+import std::subgroup::{
+    subgroup_ballot, subgroup_ballot_bit_count,
+    subgroup_ballot_exclusive_bit_count, subgroup_broadcast_first,
+};
+import std::sync::{Scope, Order, atomic_add};
+
+pub trait ResampleTarget {
+    fn target_pdf(self, world_pos: vec3, normal: vec3) -> f32;
+}
+
+#[layout(std430)]
+pub struct Reservoir<S: ResampleTarget> {
+    pub sample: S,
+    pub w_sum: f32,
+    pub m: u32,
+    pub w: f32,
+}
+
+impl<S: ResampleTarget> Reservoir<S> {
+    pub fn update(inout self, candidate: S, weight: f32, rng_u: f32) -> bool {
+        self.w_sum += weight;
+        self.m += 1u;
+        if rng_u * self.w_sum < weight {
+            self.sample = candidate;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn finalize(inout self, world_pos: vec3, normal: vec3) {
+        let p_hat = self.sample.target_pdf(world_pos, normal);
+        self.w = if p_hat > 1e-6 && self.m > 0u {
+            self.w_sum / (f32(self.m) * p_hat)
+        } else {
+            0.0
+        };
+    }
+}
+
+#[maximally_reconverges]
+#[cap(maximal_reconvergence)]
+pub fn append_active_pixels(
+    is_active: bool,
+    pixel_packed: u32,
+    out_list: ptr_mut<u32, align = 4>,
+    counter: ptr_mut<u32, align = 4>,
+) {
+    let mask = subgroup_ballot(is_active);
+    let count = subgroup_ballot_bit_count(mask);
+    if count == 0u { return; }
+
+    let lane_offset = subgroup_ballot_exclusive_bit_count(mask);
+    let mut base = 0u;
+    if lane_offset == 0u && is_active {
+        base = atomic_add::<Scope::Device, Order::Relaxed>(counter, count);
+    }
+    base = subgroup_broadcast_first(base);
+
+    if is_active {
+        out_list.offset(i64(base + lane_offset)).store(pixel_packed);
+    }
+}

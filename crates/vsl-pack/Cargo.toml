@@ -1,0 +1,22 @@
+[package]
+name = "vsl-pack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic sandboxed pack.vsl evaluator, PipelineIR DAG, and pack.toml v2 desugarer"
+
+[lints]
+workspace = true
+
+[dependencies]
+indexmap.workspace = true
+serde.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+vsl-diagnostics.workspace = true
+vsl-mc.workspace = true
+vsl-syntax.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "vsl-mc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hyaloclast virtual mc::* engine contract, canonical passes, RES_* targets, 16 hook stages, and CompiledShaderUnit reflection ABI"
+
+[lints]
+workspace = true
+
+[dependencies]
+bitflags.workspace = true
+serde.workspace = true
+smol_str.workspace = true

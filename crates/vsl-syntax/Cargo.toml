@@ -1,0 +1,18 @@
+[package]
+name = "vsl-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared logos DFA lexer, error-recovering recursive-descent/Pratt parser, and AST for .vsl and pack.vsl"
+
+[lints]
+workspace = true
+
+[dependencies]
+logos.workspace = true
+serde.workspace = true
+smol_str.workspace = true
+vsl-diagnostics.workspace = true
