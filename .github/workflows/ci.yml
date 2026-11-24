@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install spirv-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y spirv-tools
+          spirv-val --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests with mandatory spirv-val
+        env:
+          VSL_REQUIRE_SPIRV_VAL: "1"
+        run: cargo test --workspace
