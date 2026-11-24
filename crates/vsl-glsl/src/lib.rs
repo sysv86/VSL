@@ -4,7 +4,10 @@ pub mod emit;
 pub mod hook_bridge;
 
 pub use emit::emit_glsl_460;
-pub use hook_bridge::{emit_raster_gbuffer_hook_slot, emit_raster_gbuffer_hook_slot_with_types};
+pub use hook_bridge::{
+    emit_raster_gbuffer_hook_slot, emit_raster_gbuffer_hook_slot_with_schema,
+    emit_raster_gbuffer_hook_slot_with_types,
+};
 
 #[cfg(test)]
 mod tests {
@@ -12,7 +15,7 @@ mod tests {
     use indexmap::IndexMap;
     use smol_str::SmolStr;
     use vsl_diagnostics::FileId;
-    use vsl_mc::HookStage;
+    use vsl_mc::{HookStage, PackParamType};
     use vsl_syntax::ast::Item;
     use vsl_syntax::parse_source;
 
@@ -114,7 +117,7 @@ mod tests {
         assert!(
             glsl.contains("layout(set = 1, binding = 1, scalar) readonly buffer InstanceMetaSSBO")
         );
-        assert!(glsl.contains("layout(set = 2, binding = 0) uniform texture2D bindless[];"));
+        assert!(glsl.contains("layout(set = 2, binding = 0) uniform sampler2D bindless[4096];"));
 
         // Helper forward declarations for `mc::*` utilities.
         assert!(glsl.contains("vec3 mc_reconstruct_world_pos(ivec2 coord, texture2D depth_tex);"));
@@ -127,14 +130,14 @@ mod tests {
         );
         assert!(!glsl.contains("\"custom_reflections\""));
 
-        assert!(glsl.contains("textureLod(sampler2D(bindless[nonuniformEXT(inst.albedo_slot)], vsl_default_sampler), uv, 0.0).rgb"));
+        assert!(glsl.contains("textureLod(bindless[nonuniformEXT(inst.albedo_slot)], uv, 0.0).rgb"));
         assert!(glsl.contains("vec3 color;"));
         assert!(glsl.contains("InstanceMeta inst = mc_instances["));
         assert!(glsl.contains("vec2 uv = rayQueryGetIntersectionBarycentricsEXT(rq, true);"));
     }
 
     #[test]
-    fn emits_trait_and_impl_methods_in_restir() {
+    fn emits_trait_and_generic_template_metadata_in_standalone_restir() {
         let parsed = parse_source(FileId(0), RESTIR_VSL);
         assert!(
             !parsed.has_errors(),
@@ -143,18 +146,15 @@ mod tests {
         );
 
         let glsl = emit_glsl_460(&parsed.unit);
-        assert!(glsl.contains("struct VslDefaultTarget {\n    vec3 pos;\n};"));
-        assert!(glsl.contains("VslDefaultTarget _vsl_sample;"));
-        assert!(glsl.contains("self._vsl_sample = candidate;"));
-        assert!(glsl.contains("target_pdf(self._vsl_sample, world_pos, normal)"));
+        assert!(!glsl.contains("VslDefaultTarget"), "got:\n{glsl}");
         assert!(glsl.contains("// trait ResampleTarget"));
-        assert!(
-            glsl.contains("float target_pdf(VslDefaultTarget self, vec3 world_pos, vec3 normal);")
-        );
         assert!(glsl.contains(
-            "bool Reservoir_update(inout Reservoir self, in VslDefaultTarget candidate,"
+            "// generic struct Reservoir<S: ResampleTarget> (no concrete instantiations in this unit)"
         ));
-        assert!(glsl.contains("void Reservoir_finalize(inout Reservoir self,"));
+        assert!(glsl.contains(
+            "// generic impl<S: ResampleTarget> Reservoir<S> (no concrete instantiations in this unit)"
+        ));
+        assert!(!glsl.contains("struct Reservoir {"));
         assert!(!glsl.contains("    S sample;"));
         assert!(!glsl.contains("in S candidate"));
         assert!(glsl.contains("atomicAdd(counter.value, count)"));
@@ -321,9 +321,7 @@ mod tests {
         let parsed = parse_source(FileId(0), RESTIR_VSL);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         let restir_glsl = emit_glsl_460(&parsed.unit);
-        assert!(restir_glsl.contains("VslDefaultTarget _vsl_sample;"));
-        assert!(restir_glsl.contains("self._vsl_sample = candidate;"));
-        assert!(!restir_glsl.contains("VslDefaultTarget sample;"));
+        assert!(!restir_glsl.contains("VslDefaultTarget"));
 
         let src = r"
             pub struct FilterState {
@@ -612,5 +610,192 @@ mod tests {
             "restir.vsl void append_active_pixels() must not emit value return:
 {fn_body}"
         );
+    }
+
+    #[test]
+    fn monomorphizes_generic_struct_and_impl_methods_without_default_target() {
+        let src = r"
+            pub trait ResampleTarget {
+                fn target_pdf(self, world_pos: vec3, normal: vec3) -> f32;
+            }
+
+            #[layout(std430)]
+            pub struct LightSample {
+                pub pos: vec3,
+                pub radiance: vec3,
+            }
+
+            impl ResampleTarget for LightSample {
+                pub fn target_pdf(self, world_pos: vec3, normal: vec3) -> f32 {
+                    let d = normalize(self.pos - world_pos);
+                    max(dot(d, normal), 0.0) * length(self.radiance)
+                }
+            }
+
+            #[layout(std430)]
+            pub struct Reservoir<S: ResampleTarget> {
+                pub sample: S,
+                pub w_sum: f32,
+                pub m: u32,
+                pub w: f32,
+            }
+
+            impl<S: ResampleTarget> Reservoir<S> {
+                pub fn update(inout self, candidate: S, weight: f32, rng_u: f32) -> bool {
+                    self.w_sum += weight;
+                    self.m += 1u;
+                    if rng_u * self.w_sum < weight {
+                        self.sample = candidate;
+                        return true;
+                    }
+                    return false;
+                }
+
+                pub fn finalize(inout self, world_pos: vec3, normal: vec3) {
+                    let p_hat = self.sample.target_pdf(world_pos, normal);
+                    self.w = if p_hat > 1e-6 && self.m > 0u {
+                        self.w_sum / (f32(self.m) * p_hat)
+                    } else {
+                        0.0
+                    };
+                }
+            }
+
+            @stage(compute(8, 8, 1))
+            pub fn restir_cs(out_img: RWImage2D<rgba16f>) {
+                let s = LightSample { pos: vec3(0.0, 10.0, 0.0), radiance: vec3(1.0) };
+                let mut res: Reservoir<LightSample> = Reservoir {
+                    sample: s,
+                    w_sum: 0.0,
+                    m: 0u,
+                    w: 0.0,
+                };
+                let _ = res.update(s, 1.0, 0.25);
+                res.finalize(vec3(0.0), vec3(0.0, 1.0, 0.0));
+                out_img.store(ivec2(0, 0), vec4(res.sample.radiance * res.w, 1.0));
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let glsl = emit_glsl_460(&parsed.unit);
+        assert!(!glsl.contains("VslDefaultTarget"), "got:\n{glsl}");
+        assert!(!glsl.contains("struct Reservoir {"), "got:\n{glsl}");
+        assert!(glsl.contains("struct Reservoir__LightSample {"), "got:\n{glsl}");
+        assert!(glsl.contains("LightSample _vsl_sample;"), "got:\n{glsl}");
+        assert!(
+            glsl.contains("float LightSample_target_pdf(in LightSample self, in vec3 world_pos, in vec3 normal)"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("bool Reservoir__LightSample_update(inout Reservoir__LightSample self, in LightSample candidate,"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("void Reservoir__LightSample_finalize(inout Reservoir__LightSample self, in vec3 world_pos, in vec3 normal)"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("LightSample_target_pdf(self._vsl_sample, world_pos, normal)"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("Reservoir__LightSample res = Reservoir__LightSample(s, 0.0, 0u, 0.0);"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("Reservoir__LightSample_update(res, s, 1.0, 0.25)"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("Reservoir__LightSample_finalize(res, vec3(0.0), vec3(0.0, 1.0, 0.0));"),
+            "got:\n{glsl}"
+        );
+    }
+
+    #[test]
+    fn emits_set2_bindless_combined_sampler_array_without_default_sampler() {
+        let src = r"
+            import mc::{bindless};
+
+            @stage(compute(8, 8, 1))
+            pub fn bindless_only_cs(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let slot = gid.x;
+                let uv = vec2(0.5, 0.5);
+                let a = bindless[nonuniform(slot)].sample_lod(uv, 0.0);
+                let b = bindless[nonuniform(slot)].sample(uv);
+                out_img.store(ivec2(gid.xy), a + b);
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let glsl = emit_glsl_460(&parsed.unit);
+        assert!(
+            glsl.contains("layout(set = 2, binding = 0) uniform sampler2D bindless[4096];"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("textureLod(bindless[nonuniformEXT(slot)], uv, 0.0)"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("texture(bindless[nonuniformEXT(slot)], uv)"),
+            "got:\n{glsl}"
+        );
+        assert!(!glsl.contains("vsl_default_sampler"), "got:\n{glsl}");
+        assert!(!glsl.contains("binding = 14"), "got:\n{glsl}");
+    }
+
+    #[test]
+    fn emits_schema_driven_vs_pack_params_in_hook_bridge() {
+        let src = r"
+            @hook(surface)
+            pub fn stylized_surface(inout albedo: vec3) {
+                let tint = mc::param(sky_tint);
+                let enabled = mc::param(enable_fog);
+                let mode = params.fog_mode;
+                let strength = params.fog_strength;
+                let budget = params.frame_budget;
+                if enabled && mode > 0 {
+                    albedo = albedo * tint * strength + vec3(f32(budget));
+                }
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let func = parsed
+            .unit
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Function(f) => Some(f),
+                _ => None,
+            })
+            .expect("function item");
+
+        let mut schema = IndexMap::new();
+        schema.insert(SmolStr::new_static("sky_tint"), PackParamType::Vec3);
+        schema.insert(SmolStr::new_static("enable_fog"), PackParamType::Bool);
+        schema.insert(SmolStr::new_static("fog_mode"), PackParamType::Enum);
+        schema.insert(SmolStr::new_static("fog_strength"), PackParamType::F32);
+        schema.insert(SmolStr::new_static("frame_budget"), PackParamType::U32);
+
+        let glsl = emit_raster_gbuffer_hook_slot_with_schema(HookStage::Surface, func, &schema)
+            .expect("surface schema slot");
+        assert!(glsl.contains("vec3 sky_tint;"), "got:\n{glsl}");
+        assert!(glsl.contains("bool enable_fog;"), "got:\n{glsl}");
+        assert!(glsl.contains("int fog_mode;"), "got:\n{glsl}");
+        assert!(glsl.contains("float fog_strength;"), "got:\n{glsl}");
+        assert!(glsl.contains("uint frame_budget;"), "got:\n{glsl}");
+        assert!(glsl.contains("vec3 tint = VsMotion.packParams.sky_tint;"), "got:\n{glsl}");
+        assert!(glsl.contains("bool enabled = VsMotion.packParams.enable_fog;"), "got:\n{glsl}");
+        assert!(glsl.contains("int mode = VsMotion.packParams.fog_mode;"), "got:\n{glsl}");
+        assert!(glsl.contains("float strength = VsMotion.packParams.fog_strength;"), "got:\n{glsl}");
+        assert!(glsl.contains("uint budget = VsMotion.packParams.frame_budget;"), "got:\n{glsl}");
     }
 }

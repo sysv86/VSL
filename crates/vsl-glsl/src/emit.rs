@@ -3,12 +3,13 @@ use smol_str::SmolStr;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use vsl_mc::{
-    DESCRIPTOR_SET_BINDLESS, DESCRIPTOR_SET_PER_PASS, DESCRIPTOR_SET_SCENE_GLOBALS, ImageFormat,
+    BINDLESS_IMAGE_COUNT, DESCRIPTOR_SET_BINDLESS, DESCRIPTOR_SET_PER_PASS,
+    DESCRIPTOR_SET_SCENE_GLOBALS, ImageFormat,
 };
 use vsl_syntax::ast::{
-    Attribute, BinaryOp, Block, CallArg, ConstDecl, Expr, FnDecl, FnParam, ImplBlock, ImportTree,
-    Item, ParamMode, Path, SourceUnit, Stmt, StructDecl, TraitDecl, TypeArg, TypeExpr, UnaryOp,
-    WorkgroupVarDecl,
+    Attribute, BinaryOp, Block, CallArg, ConstDecl, Expr, FnDecl, FnParam, GenericParam, Ident,
+    ImplBlock, ImportTree, Item, ParamMode, Path, SourceUnit, Stmt, StructDecl, TraitDecl,
+    TypeArg, TypeExpr, UnaryOp, WorkgroupVarDecl,
 };
 
 /// Lowering options controlling GLSL 460 oracle vs. raster G-Buffer hook bridge behavior.
@@ -38,18 +39,36 @@ impl BdaRefKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MonomorphKey {
+    pub struct_name: SmolStr,
+    pub type_args: Vec<String>,
+}
+
+impl MonomorphKey {
+    pub(crate) fn mangled_name(&self) -> String {
+        mangle_generic_name(&self.struct_name, &self.type_args)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GenericStructMeta {
+    pub generic_param_count: usize,
+    pub param_fields: IndexMap<SmolStr, usize>,
+}
+
 #[derive(Debug, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct FeatureScan {
     pub extensions: BTreeSet<&'static str>,
     pub bda_refs: BTreeSet<BdaRefKey>,
+    pub generic_instantiations: IndexSet<MonomorphKey>,
     pub uses_tlas: bool,
     pub uses_instances: bool,
     pub uses_lights: bool,
     pub uses_bindless: bool,
     pub uses_sampled_textures: bool,
     pub imported_mc_world: bool,
-    pub uses_generic_default_target: bool,
     pub pack_param_keys: BTreeSet<String>,
     pub pack_param_types: IndexMap<SmolStr, String>,
     pub debug_channels: IndexSet<String>,
@@ -63,6 +82,7 @@ pub(crate) struct EmitCtx {
     pub local_types: IndexMap<SmolStr, String>,
     pub bda_types: IndexMap<String, BdaRefKey>,
     pub struct_fields: IndexMap<SmolStr, IndexMap<SmolStr, String>>,
+    pub generic_structs: IndexMap<SmolStr, GenericStructMeta>,
     pub fn_returns: IndexMap<SmolStr, String>,
     pub generic_subst: IndexMap<SmolStr, String>,
     pub pack_param_types: IndexMap<SmolStr, String>,
@@ -78,6 +98,7 @@ impl EmitCtx {
             local_types: IndexMap::new(),
             bda_types: IndexMap::new(),
             struct_fields: IndexMap::new(),
+            generic_structs: IndexMap::new(),
             fn_returns: IndexMap::new(),
             generic_subst: IndexMap::new(),
             pack_param_types: IndexMap::new(),
@@ -120,7 +141,10 @@ pub(crate) fn escape_glsl_ident(name: &str) -> String {
 /// - `trait` / `impl` blocks to mangled GLSL helper functions
 /// - VSL 2.0 statements, structured loops, `switch`, struct literals, and expressions into clean GLSL 460
 pub fn emit_glsl_460(unit: &SourceUnit) -> String {
-    let mut scan = FeatureScan::default();
+    let mut scan = FeatureScan {
+        generic_instantiations: collect_generic_instantiations(unit),
+        ..FeatureScan::default()
+    };
     scan_unit(unit, &mut scan);
     // WorldUBO is emitted for every entry point and uses scalar block layout.
     scan.extensions.insert("GL_EXT_scalar_block_layout");
@@ -143,14 +167,8 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
         ctx.bda_types.insert(bda.type_name(), bda.clone());
     }
     seed_mc_builtin_types(&mut ctx);
-    if scan.uses_generic_default_target {
-        let mut default_fields = IndexMap::new();
-        default_fields.insert(SmolStr::new_static("pos"), "vec3".to_owned());
-        ctx.struct_fields
-            .insert(SmolStr::new_static("VslDefaultTarget"), default_fields);
-    }
 
-    // Pre-collect struct field types, constants, workgroup vars, and function return types.
+    // Pre-collect struct field types, generic struct metadata, constants, workgroup vars, and function return types.
     for item in &unit.items {
         match item {
             Item::Const(c) => {
@@ -162,40 +180,91 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
                     .insert(w.name.name.clone(), type_to_glsl(&w.ty).0);
             }
             Item::Struct(s) => {
-                let mut subst = IndexMap::new();
-                for g in &s.generics {
-                    subst.insert(g.name.name.clone(), "VslDefaultTarget".to_owned());
-                }
-                let mut fields = IndexMap::new();
-                for f in &s.fields {
-                    fields.insert(
-                        f.name.name.clone(),
-                        type_to_glsl_with_subst(&f.ty, &subst).0,
+                if s.generics.is_empty() {
+                    let mut fields = IndexMap::new();
+                    for f in &s.fields {
+                        fields.insert(f.name.name.clone(), type_to_glsl(&f.ty).0);
+                    }
+                    ctx.struct_fields.insert(s.name.name.clone(), fields);
+                } else {
+                    let generic_params: Vec<SmolStr> =
+                        s.generics.iter().map(|g| g.name.name.clone()).collect();
+                    let mut param_fields = IndexMap::new();
+                    for f in &s.fields {
+                        if let TypeExpr::Named { path, args, .. } = &f.ty
+                            && path.segments.len() == 1
+                            && args.is_empty()
+                            && let Some(idx) =
+                                generic_params.iter().position(|gp| gp == &path.segments[0].name)
+                        {
+                            param_fields.insert(f.name.name.clone(), idx);
+                        }
+                    }
+                    ctx.generic_structs.insert(
+                        s.name.name.clone(),
+                        GenericStructMeta {
+                            generic_param_count: generic_params.len(),
+                            param_fields,
+                        },
                     );
+                    for key in scan
+                        .generic_instantiations
+                        .iter()
+                        .filter(|k| k.struct_name == s.name.name)
+                    {
+                        let mut subst = IndexMap::new();
+                        for (g, concrete) in s.generics.iter().zip(&key.type_args) {
+                            subst.insert(g.name.name.clone(), concrete.clone());
+                        }
+                        let mut fields = IndexMap::new();
+                        for f in &s.fields {
+                            fields.insert(
+                                f.name.name.clone(),
+                                type_to_glsl_with_subst(&f.ty, &subst).0,
+                            );
+                        }
+                        ctx.struct_fields
+                            .insert(SmolStr::new(key.mangled_name()), fields);
+                    }
                 }
-                ctx.struct_fields.insert(s.name.name.clone(), fields);
             }
             Item::Function(f) => {
                 ctx.fn_returns
                     .insert(f.name.name.clone(), fn_return_glsl_type(f));
             }
             Item::Impl(imp) => {
-                let target_name = impl_target_name(&imp.target);
-                let mut subst = IndexMap::new();
-                for g in &imp.generics {
-                    subst.insert(g.name.name.clone(), "VslDefaultTarget".to_owned());
-                }
-                for m in &imp.methods {
-                    let mangled = SmolStr::new(format!("{target_name}_{}", m.name.name));
-                    let ret = fn_return_glsl_type_with_subst(m, &subst);
-                    ctx.fn_returns.insert(mangled, ret.clone());
-                    ctx.fn_returns.insert(m.name.name.clone(), ret);
+                if imp.generics.is_empty() {
+                    let empty = IndexMap::new();
+                    let target_name = impl_target_name_with_subst(&imp.target, &empty);
+                    for m in &imp.methods {
+                        let mangled = SmolStr::new(format!("{target_name}_{}", m.name.name));
+                        let ret = fn_return_glsl_type(m);
+                        ctx.fn_returns.insert(mangled, ret.clone());
+                        ctx.fn_returns.entry(m.name.name.clone()).or_insert(ret);
+                    }
+                } else if let Some(base_name) = impl_target_base_name(&imp.target) {
+                    for key in scan
+                        .generic_instantiations
+                        .iter()
+                        .filter(|k| k.struct_name.as_str() == base_name)
+                    {
+                        let mut subst = IndexMap::new();
+                        apply_impl_subst(imp, &key.type_args, &mut subst);
+                        let target_name = impl_target_name_with_subst(&imp.target, &subst);
+                        for m in &imp.methods {
+                            let mangled = SmolStr::new(format!("{target_name}_{}", m.name.name));
+                            let ret = fn_return_glsl_type_with_subst(m, &subst);
+                            ctx.fn_returns.insert(mangled, ret.clone());
+                            ctx.fn_returns.entry(m.name.name.clone()).or_insert(ret);
+                        }
+                    }
                 }
             }
             Item::Trait(t) => {
                 for m in &t.methods {
                     ctx.fn_returns
-                        .insert(m.name.name.clone(), fn_return_glsl_type(m));
+                        .entry(m.name.name.clone())
+                        .or_insert_with(|| fn_return_glsl_type(m));
                 }
             }
             _ => {}
@@ -212,15 +281,19 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
         }
     }
 
-    // 2. Generic default target instantiation and structs / push-constant blocks.
-    if scan.uses_generic_default_target {
-        out.push_str("struct VslDefaultTarget {\n");
-        out.push_str("    vec3 pos;\n");
-        out.push_str("};\n\n");
+    // 2. Concrete structs / push-constant blocks first, then monomorphized generic structs.
+    for item in &unit.items {
+        if let Item::Struct(s) = item
+            && s.generics.is_empty()
+        {
+            emit_struct_decl(s, &scan.generic_instantiations, &mut ctx, &mut out);
+        }
     }
     for item in &unit.items {
-        if let Item::Struct(s) = item {
-            emit_struct_decl(s, &mut ctx, &mut out);
+        if let Item::Struct(s) = item
+            && !s.generics.is_empty()
+        {
+            emit_struct_decl(s, &scan.generic_instantiations, &mut ctx, &mut out);
         }
     }
 
@@ -248,12 +321,25 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
         }
     }
 
-    // 5. Trait interfaces and `impl` methods.
+    // 5. Trait interfaces and `impl` methods (concrete impls before monomorphized generic impls
+    //    so trait method definitions precede monomorphized callers in GLSL).
     for item in &unit.items {
-        match item {
-            Item::Trait(t) => emit_trait_decl(t, scan.uses_generic_default_target, &mut out),
-            Item::Impl(imp) => emit_impl_block(imp, &mut ctx, &mut out),
-            _ => {}
+        if let Item::Trait(t) = item {
+            emit_trait_decl(t, &mut out);
+        }
+    }
+    for item in &unit.items {
+        if let Item::Impl(imp) = item
+            && imp.generics.is_empty()
+        {
+            emit_impl_block(imp, &scan.generic_instantiations, &mut ctx, &mut out);
+        }
+    }
+    for item in &unit.items {
+        if let Item::Impl(imp) = item
+            && !imp.generics.is_empty()
+        {
+            emit_impl_block(imp, &scan.generic_instantiations, &mut ctx, &mut out);
         }
     }
 
@@ -319,9 +405,9 @@ fn seed_mc_builtin_types(ctx: &mut EmitCtx) {
         "EmissiveLightSSBO".to_owned(),
     );
     ctx.local_types
-        .insert(SmolStr::new_static("bindless"), "texture2D".to_owned());
+        .insert(SmolStr::new_static("bindless"), "sampler2D".to_owned());
     ctx.local_types
-        .insert(SmolStr::new_static("mc_bindless"), "texture2D".to_owned());
+        .insert(SmolStr::new_static("mc_bindless"), "sampler2D".to_owned());
 }
 
 fn emit_mc_global_decls(scan: &FeatureScan, out: &mut String) {
@@ -400,11 +486,11 @@ fn emit_mc_global_decls(scan: &FeatureScan, out: &mut String) {
         out.push_str("} mc_lights;\n\n");
         emitted_any = true;
     }
-    // Set 2, binding 0: Global bindless texture array.
+    // Set 2, binding 0: Global bindless combined image-sampler array (Hyaloclast 4-set ABI).
     if scan.uses_bindless {
         let _ = writeln!(
             out,
-            "layout(set = {DESCRIPTOR_SET_BINDLESS}, binding = 0) uniform texture2D bindless[];\n"
+            "layout(set = {DESCRIPTOR_SET_BINDLESS}, binding = 0) uniform sampler2D bindless[{BINDLESS_IMAGE_COUNT}];\n"
         );
         emitted_any = true;
     }
@@ -426,11 +512,19 @@ fn emit_mc_global_decls(scan: &FeatureScan, out: &mut String) {
     }
 }
 
-/// Scans a single [`FnDecl`] for required GLSL extensions and referenced pack parameter keys.
+/// Scans a single [`FnDecl`] for required GLSL extensions and referenced pack parameter keys,
+/// including AST-based pack parameter type inference.
 pub(crate) fn scan_fn_decl(func: &FnDecl) -> FeatureScan {
+    let mut scan = scan_fn_decl_without_param_inference(func);
+    infer_pack_param_types(func, &mut scan);
+    scan
+}
+
+/// Scans a single [`FnDecl`] for required GLSL extensions and referenced pack parameter keys
+/// without AST-based pack parameter type inference (used when a `pack.vsl` schema supplies types).
+pub(crate) fn scan_fn_decl_without_param_inference(func: &FnDecl) -> FeatureScan {
     let mut scan = FeatureScan::default();
     scan_fn_into(func, &mut scan);
-    infer_pack_param_types(func, &mut scan);
     scan
 }
 
@@ -538,49 +632,169 @@ fn fn_return_glsl_type_with_subst(
     )
 }
 
-fn impl_target_name(target: &TypeExpr) -> String {
+fn mangle_generic_name(base: &str, type_args: &[String]) -> String {
+    if type_args.is_empty() {
+        return base.to_owned();
+    }
+    let suffix = type_args
+        .iter()
+        .map(|arg| sanitize_glsl_ident(arg))
+        .collect::<Vec<_>>()
+        .join("__");
+    format!("{base}__{suffix}")
+}
+
+fn format_generic_params(generics: &[GenericParam]) -> String {
+    generics
+        .iter()
+        .map(|g| match &g.bound {
+            Some(bound) => format!("{}: {}", g.name.name, bound.joined()),
+            None => g.name.name.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_type_expr_comment(ty: &TypeExpr) -> String {
+    match ty {
+        TypeExpr::Array { element, .. } => format!("[{}]", format_type_expr_comment(element)),
+        TypeExpr::Named { path, args, .. } => {
+            let base = path.joined();
+            if args.is_empty() {
+                base
+            } else {
+                let rendered: Vec<String> = args
+                    .iter()
+                    .filter_map(|a| match a {
+                        TypeArg::Type(t) => Some(format_type_expr_comment(t)),
+                        TypeArg::NamedExpr { name, .. } => Some(name.name.to_string()),
+                    })
+                    .collect();
+                format!("{base}<{}>", rendered.join(", "))
+            }
+        }
+    }
+}
+
+fn impl_target_base_name(target: &TypeExpr) -> Option<String> {
     match target {
-        TypeExpr::Named { path, .. } => path.joined().replace("::", "_"),
+        TypeExpr::Named { path, .. } => Some(path.joined().replace("::", "_")),
+        TypeExpr::Array { .. } => None,
+    }
+}
+
+fn impl_target_name_with_subst(
+    target: &TypeExpr,
+    generic_subst: &IndexMap<SmolStr, String>,
+) -> String {
+    match target {
+        TypeExpr::Named { .. } => type_to_glsl_with_subst(target, generic_subst).0,
         TypeExpr::Array { .. } => "Array".to_owned(),
     }
 }
 
-fn emit_trait_decl(decl: &TraitDecl, emit_default_decls: bool, out: &mut String) {
+fn apply_impl_subst(
+    imp: &ImplBlock,
+    type_args: &[String],
+    subst: &mut IndexMap<SmolStr, String>,
+) {
+    let mut bound_from_target = false;
+    if let TypeExpr::Named { args, .. } = &imp.target {
+        let target_type_args: Vec<&TypeExpr> = args
+            .iter()
+            .filter_map(|a| match a {
+                TypeArg::Type(t) => Some(t),
+                TypeArg::NamedExpr { .. } => None,
+            })
+            .collect();
+        if target_type_args.len() == type_args.len() {
+            for (target_arg, concrete) in target_type_args.iter().zip(type_args) {
+                if let TypeExpr::Named {
+                    path,
+                    args: inner_args,
+                    ..
+                } = target_arg
+                    && path.segments.len() == 1
+                    && inner_args.is_empty()
+                {
+                    let param_name = &path.segments[0].name;
+                    if imp.generics.iter().any(|g| &g.name.name == param_name) {
+                        subst.insert(param_name.clone(), concrete.clone());
+                        bound_from_target = true;
+                    }
+                }
+            }
+        }
+    }
+    if !bound_from_target {
+        for (g, concrete) in imp.generics.iter().zip(type_args) {
+            subst.insert(g.name.name.clone(), concrete.clone());
+        }
+    }
+}
+
+fn emit_trait_decl(decl: &TraitDecl, out: &mut String) {
     let _ = writeln!(out, "// trait {}", decl.name.name);
     let empty = IndexMap::new();
     for method in &decl.methods {
         let ret = fn_return_glsl_type(method);
-        let params = format_param_list_with_self(&method.params, Some("VslDefaultTarget"), &empty);
+        let params = format_param_list_with_self(&method.params, Some("Self"), &empty);
         let _ = writeln!(out, "//   {ret} {}({params});", method.name.name);
-        if emit_default_decls {
-            let concrete_params = method
-                .params
-                .iter()
-                .map(|p| {
-                    let (ty_str, arr_suffix) = if p.name.name == "self" && p.ty.is_none() {
-                        ("VslDefaultTarget".to_owned(), String::new())
-                    } else {
-                        p.ty.as_ref()
-                            .map_or_else(|| ("float".to_owned(), String::new()), type_to_glsl)
-                    };
-                    let pname = escape_glsl_ident(&p.name.name);
-                    format!("{ty_str} {pname}{arr_suffix}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(out, "{ret} {}({concrete_params});", method.name.name);
-        }
     }
     out.push('\n');
 }
 
-fn emit_impl_block(imp: &ImplBlock, ctx: &mut EmitCtx, out: &mut String) {
-    let saved_subst = ctx.generic_subst.clone();
-    for g in &imp.generics {
-        ctx.generic_subst
-            .insert(g.name.name.clone(), "VslDefaultTarget".to_owned());
+fn emit_impl_block(
+    imp: &ImplBlock,
+    instantiations: &IndexSet<MonomorphKey>,
+    ctx: &mut EmitCtx,
+    out: &mut String,
+) {
+    if !imp.generics.is_empty() {
+        let base_name = impl_target_base_name(&imp.target);
+        let matching: Vec<&MonomorphKey> = base_name.as_deref().map_or_else(Vec::new, |base| {
+            instantiations
+                .iter()
+                .filter(|k| k.struct_name == base)
+                .collect()
+        });
+        if matching.is_empty() {
+            let gen_list = format_generic_params(&imp.generics);
+            let target_desc = format_type_expr_comment(&imp.target);
+            if let Some(ref trait_path) = imp.trait_path {
+                let _ = writeln!(
+                    out,
+                    "// generic impl<{gen_list}> {} for {target_desc} (no concrete instantiations in this unit)\n",
+                    trait_path.joined()
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "// generic impl<{gen_list}> {target_desc} (no concrete instantiations in this unit)\n"
+                );
+            }
+            return;
+        }
+        for key in matching {
+            let saved_subst = ctx.generic_subst.clone();
+            apply_impl_subst(imp, &key.type_args, &mut ctx.generic_subst);
+            let target_name = impl_target_name_with_subst(&imp.target, &ctx.generic_subst);
+            if let Some(ref trait_path) = imp.trait_path {
+                let _ = writeln!(out, "// impl {} for {target_name}", trait_path.joined());
+            } else {
+                let _ = writeln!(out, "// impl {target_name}");
+            }
+            for method in &imp.methods {
+                emit_fn_decl_with_ctx(method, Some(&target_name), ctx, out);
+                out.push('\n');
+            }
+            ctx.generic_subst = saved_subst;
+        }
+        return;
     }
-    let target_name = impl_target_name(&imp.target);
+
+    let empty = IndexMap::new();
+    let target_name = impl_target_name_with_subst(&imp.target, &empty);
     if let Some(ref trait_path) = imp.trait_path {
         let _ = writeln!(out, "// impl {} for {target_name}", trait_path.joined());
     } else {
@@ -590,7 +804,6 @@ fn emit_impl_block(imp: &ImplBlock, ctx: &mut EmitCtx, out: &mut String) {
         emit_fn_decl_with_ctx(method, Some(&target_name), ctx, out);
         out.push('\n');
     }
-    ctx.generic_subst = saved_subst;
 }
 
 fn emit_const_decl(decl: &ConstDecl, ctx: &EmitCtx, out: &mut String) {
@@ -606,21 +819,54 @@ fn emit_workgroup_var(decl: &WorkgroupVarDecl, out: &mut String) {
     let _ = writeln!(out, "shared {ty_str} {name}{arr_suffix};");
 }
 
-fn emit_struct_decl(decl: &StructDecl, ctx: &mut EmitCtx, out: &mut String) {
+fn emit_struct_decl(
+    decl: &StructDecl,
+    instantiations: &IndexSet<MonomorphKey>,
+    ctx: &mut EmitCtx,
+    out: &mut String,
+) {
+    if !decl.generics.is_empty() {
+        let matching: Vec<&MonomorphKey> = instantiations
+            .iter()
+            .filter(|k| k.struct_name == decl.name.name)
+            .collect();
+        if matching.is_empty() {
+            if let Some(layout) = extract_layout_attr(&decl.attrs) {
+                let _ = writeln!(out, "// layout({layout})");
+            }
+            let gen_list = format_generic_params(&decl.generics);
+            let _ = writeln!(
+                out,
+                "// generic struct {}<{gen_list}> (no concrete instantiations in this unit)\n",
+                decl.name.name
+            );
+            return;
+        }
+        for key in matching {
+            let saved_subst = ctx.generic_subst.clone();
+            for (g, concrete) in decl.generics.iter().zip(&key.type_args) {
+                ctx.generic_subst
+                    .insert(g.name.name.clone(), concrete.clone());
+            }
+            let mangled = key.mangled_name();
+            emit_concrete_struct_decl(decl, &mangled, ctx, out);
+            ctx.generic_subst = saved_subst;
+        }
+        return;
+    }
+
+    emit_concrete_struct_decl(decl, &decl.name.name, ctx, out);
+}
+
+fn emit_concrete_struct_decl(decl: &StructDecl, glsl_name: &str, ctx: &EmitCtx, out: &mut String) {
     let is_push_constant = has_attr(&decl.attrs, "push_constant");
     let layout_mode = extract_layout_attr(&decl.attrs);
-    let saved_subst = ctx.generic_subst.clone();
-    for g in &decl.generics {
-        ctx.generic_subst
-            .insert(g.name.name.clone(), "VslDefaultTarget".to_owned());
-    }
 
     if is_push_constant {
         let layout_qual = layout_mode.unwrap_or("scalar");
         let _ = writeln!(
             out,
-            "layout(push_constant, {layout_qual}) uniform {} {{",
-            decl.name.name
+            "layout(push_constant, {layout_qual}) uniform {glsl_name} {{"
         );
         for field in &decl.fields {
             let (ty_str, arr_suffix) = type_to_glsl_with_subst(&field.ty, &ctx.generic_subst);
@@ -628,29 +874,19 @@ fn emit_struct_decl(decl: &StructDecl, ctx: &mut EmitCtx, out: &mut String) {
             let _ = writeln!(out, "    {ty_str} {fname}{arr_suffix};");
         }
         out.push_str("};\n\n");
-        ctx.generic_subst = saved_subst;
         return;
     }
 
     if let Some(layout) = layout_mode {
         let _ = writeln!(out, "// layout({layout})");
     }
-    if !decl.generics.is_empty() {
-        let gen_names: Vec<&str> = decl.generics.iter().map(|g| g.name.name.as_str()).collect();
-        let _ = writeln!(
-            out,
-            "// generic<{}> (default concrete instantiation: VslDefaultTarget)",
-            gen_names.join(", ")
-        );
-    }
-    let _ = writeln!(out, "struct {} {{", decl.name.name);
+    let _ = writeln!(out, "struct {glsl_name} {{");
     for field in &decl.fields {
         let (ty_str, arr_suffix) = type_to_glsl_with_subst(&field.ty, &ctx.generic_subst);
         let fname = escape_glsl_ident(&field.name.name);
         let _ = writeln!(out, "    {ty_str} {fname}{arr_suffix};");
     }
     out.push_str("};\n\n");
-    ctx.generic_subst = saved_subst;
 }
 
 fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
@@ -1273,6 +1509,7 @@ fn emit_expr_const(expr: &Expr, ctx: &EmitCtx) -> String {
         local_types: ctx.local_types.clone(),
         bda_types: ctx.bda_types.clone(),
         struct_fields: ctx.struct_fields.clone(),
+        generic_structs: ctx.generic_structs.clone(),
         fn_returns: ctx.fn_returns.clone(),
         generic_subst: ctx.generic_subst.clone(),
         pack_param_types: ctx.pack_param_types.clone(),
@@ -1311,7 +1548,7 @@ fn emit_expr_with_hoist(
             format!("{{{}}}", items.join(", "))
         }
         Expr::StructLit { path, fields, .. } => {
-            let struct_name = path.joined().replace("::", "_");
+            let struct_name = resolve_struct_lit_name(path, fields, ctx);
             let decl_keys: Option<Vec<SmolStr>> = ctx
                 .struct_fields
                 .get(struct_name.as_str())
@@ -1546,6 +1783,10 @@ fn emit_call_expr_with_hoist(
     format!("{c}({})", rendered_args.join(", "))
 }
 
+fn is_combined_sampler_type(ty: &str) -> bool {
+    matches!(ty, "sampler2D" | "sampler3D" | "sampler2DArray" | "samplerCube")
+}
+
 fn combined_sampler_ctor(tex_ty: &str) -> &'static str {
     match tex_ty {
         "texture3D" | "sampler3D" => "sampler3D",
@@ -1620,38 +1861,61 @@ fn emit_method_call_expr_with_hoist(
             }
         }
         "fetch" => {
-            let ctor = combined_sampler_ctor(&recv_ty);
-            format!(
-                "texelFetch({ctor}({recv}, vsl_default_sampler), {})",
-                rendered_args.join(", ")
-            )
-        }
-        "sample_lod" => {
-            let ctor = combined_sampler_ctor(&recv_ty);
-            if args.len() == 3 && infer_glsl_type(&args[0].value, ctx) == "sampler" {
-                format!(
-                    "textureLod({ctor}({recv}, {}), {}, {})",
-                    rendered_args[0], rendered_args[1], rendered_args[2]
-                )
+            if is_combined_sampler_type(&recv_ty) {
+                format!("texelFetch({recv}, {})", rendered_args.join(", "))
             } else {
+                let ctor = combined_sampler_ctor(&recv_ty);
                 format!(
-                    "textureLod({ctor}({recv}, vsl_default_sampler), {})",
+                    "texelFetch({ctor}({recv}, vsl_default_sampler), {})",
                     rendered_args.join(", ")
                 )
             }
         }
-        "sample" => {
-            let ctor = combined_sampler_ctor(&recv_ty);
-            if args.len() == 2 && infer_glsl_type(&args[0].value, ctx) == "sampler" {
-                format!(
-                    "texture({ctor}({recv}, {}), {})",
-                    rendered_args[0], rendered_args[1]
-                )
+        "sample_lod" => {
+            if is_combined_sampler_type(&recv_ty) {
+                if args.len() == 3 && infer_glsl_type(&args[0].value, ctx) == "sampler" {
+                    format!(
+                        "textureLod({recv}, {}, {})",
+                        rendered_args[1], rendered_args[2]
+                    )
+                } else {
+                    format!("textureLod({recv}, {})", rendered_args.join(", "))
+                }
             } else {
-                format!(
-                    "texture({ctor}({recv}, vsl_default_sampler), {})",
-                    rendered_args.join(", ")
-                )
+                let ctor = combined_sampler_ctor(&recv_ty);
+                if args.len() == 3 && infer_glsl_type(&args[0].value, ctx) == "sampler" {
+                    format!(
+                        "textureLod({ctor}({recv}, {}), {}, {})",
+                        rendered_args[0], rendered_args[1], rendered_args[2]
+                    )
+                } else {
+                    format!(
+                        "textureLod({ctor}({recv}, vsl_default_sampler), {})",
+                        rendered_args.join(", ")
+                    )
+                }
+            }
+        }
+        "sample" => {
+            if is_combined_sampler_type(&recv_ty) {
+                if args.len() == 2 && infer_glsl_type(&args[0].value, ctx) == "sampler" {
+                    format!("texture({recv}, {})", rendered_args[1])
+                } else {
+                    format!("texture({recv}, {})", rendered_args.join(", "))
+                }
+            } else {
+                let ctor = combined_sampler_ctor(&recv_ty);
+                if args.len() == 2 && infer_glsl_type(&args[0].value, ctx) == "sampler" {
+                    format!(
+                        "texture({ctor}({recv}, {}), {})",
+                        rendered_args[0], rendered_args[1]
+                    )
+                } else {
+                    format!(
+                        "texture({ctor}({recv}, vsl_default_sampler), {})",
+                        rendered_args.join(", ")
+                    )
+                }
             }
         }
         "offset" => {
@@ -1725,10 +1989,22 @@ fn type_to_glsl_with_subst(
                 };
                 return (subst_ty.clone(), suffix);
             }
-            if let Some(bda) = parse_bda_type(&joined, args) {
+            if let Some(bda) = parse_bda_type_with_subst(&joined, args, generic_subst) {
                 return (bda.type_name(), String::new());
             }
-            let base = match joined.as_str() {
+            let is_builtin_generic = matches!(
+                joined.as_str(),
+                "Texture2D"
+                    | "Texture3D"
+                    | "Texture2DArray"
+                    | "TextureCube"
+                    | "RWImage2D"
+                    | "RWImage2DArray"
+                    | "RWImage3D"
+                    | "Buffer"
+                    | "RWBuffer"
+            );
+            let mut base = match joined.as_str() {
                 "f32" => "float".to_owned(),
                 "f64" => "double".to_owned(),
                 "f16" => "float16_t".to_owned(),
@@ -1748,6 +2024,18 @@ fn type_to_glsl_with_subst(
                 "RWImage3D" => "image3D".to_owned(),
                 other => other.replace("::", "_"),
             };
+            if !is_builtin_generic && !args.is_empty() {
+                let resolved_args: Vec<String> = args
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        TypeArg::Type(inner) => Some(type_to_glsl_with_subst(inner, generic_subst).0),
+                        TypeArg::NamedExpr { .. } => None,
+                    })
+                    .collect();
+                if !resolved_args.is_empty() {
+                    base = mangle_generic_name(&base, &resolved_args);
+                }
+            }
             let suffix = if *unsized_array {
                 "[]".to_owned()
             } else {
@@ -1758,14 +2046,18 @@ fn type_to_glsl_with_subst(
     }
 }
 
-fn parse_bda_type(name: &str, args: &[TypeArg]) -> Option<BdaRefKey> {
+fn parse_bda_type_with_subst(
+    name: &str,
+    args: &[TypeArg],
+    generic_subst: &IndexMap<SmolStr, String>,
+) -> Option<BdaRefKey> {
     let is_mut = match name {
         "ptr" => false,
         "ptr_mut" => true,
         _ => return None,
     };
     let elem_glsl = if let Some(TypeArg::Type(t)) = args.first() {
-        type_to_glsl(t).0
+        type_to_glsl_with_subst(t, generic_subst).0
     } else {
         "uint".to_owned()
     };
@@ -1811,6 +2103,27 @@ fn swizzle_result_type(base_ty: &str, field: &str) -> Option<String> {
     }
 }
 
+fn resolve_struct_lit_name(path: &Path, fields: &[(Ident, Expr)], ctx: &EmitCtx) -> String {
+    let base = path.joined().replace("::", "_");
+    let Some(meta) = ctx.generic_structs.get(base.as_str()) else {
+        return base;
+    };
+    let mut resolved: Vec<Option<String>> = vec![None; meta.generic_param_count];
+    for (field_name, field_idx) in &meta.param_fields {
+        if let Some((_, val_expr)) = fields.iter().find(|(id, _)| &id.name == field_name) {
+            let ty = infer_glsl_type(val_expr, ctx);
+            if !ty.is_empty() {
+                resolved[*field_idx] = Some(ty);
+            }
+        }
+    }
+    if resolved.iter().all(Option::is_some) {
+        let args: Vec<String> = resolved.into_iter().flatten().collect();
+        return mangle_generic_name(&base, &args);
+    }
+    base
+}
+
 fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
     match expr {
         Expr::BoolLit(_, _) => "bool".to_owned(),
@@ -1844,7 +2157,7 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
             }
             "float".to_owned()
         }
-        Expr::StructLit { path, .. } => path.joined().replace("::", "_"),
+        Expr::StructLit { path, fields, .. } => resolve_struct_lit_name(path, fields, ctx),
         Expr::Field {
             receiver, field, ..
         } => {
@@ -1891,11 +2204,14 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
                 "committed_type" | "committed_instance_custom_index" => "uint".to_owned(),
                 "committed_barycentrics" => "vec2".to_owned(),
                 "proceed" => "bool".to_owned(),
-                other => ctx
-                    .fn_returns
-                    .get(other)
-                    .cloned()
-                    .unwrap_or_else(|| "float".to_owned()),
+                other => {
+                    let mangled = format!("{recv_ty}_{other}");
+                    ctx.fn_returns
+                        .get(mangled.as_str())
+                        .or_else(|| ctx.fn_returns.get(other))
+                        .cloned()
+                        .unwrap_or_else(|| "float".to_owned())
+                }
             }
         }
         Expr::Call { callee, args, .. } => {
@@ -2325,16 +2641,31 @@ fn scan_unit(unit: &SourceUnit, scan: &mut FeatureScan) {
             }
             Item::Struct(s) => {
                 scan_attrs(&s.attrs, scan);
-                if !s.generics.is_empty() {
-                    scan.uses_generic_default_target = true;
-                }
                 if has_attr(&s.attrs, "push_constant")
                     || extract_layout_attr(&s.attrs) == Some("scalar")
                 {
                     scan.extensions.insert("GL_EXT_scalar_block_layout");
                 }
-                for f in &s.fields {
-                    scan_type(&f.ty, scan);
+                if s.generics.is_empty() {
+                    for f in &s.fields {
+                        scan_type(&f.ty, scan);
+                    }
+                } else {
+                    let matching: Vec<MonomorphKey> = scan
+                        .generic_instantiations
+                        .iter()
+                        .filter(|k| k.struct_name == s.name.name)
+                        .cloned()
+                        .collect();
+                    for key in matching {
+                        let mut subst = IndexMap::new();
+                        for (g, concrete) in s.generics.iter().zip(&key.type_args) {
+                            subst.insert(g.name.name.clone(), concrete.clone());
+                        }
+                        for f in &s.fields {
+                            scan_type_with_subst(&f.ty, &subst, scan);
+                        }
+                    }
                 }
             }
             Item::Trait(t) => {
@@ -2343,11 +2674,24 @@ fn scan_unit(unit: &SourceUnit, scan: &mut FeatureScan) {
                 }
             }
             Item::Impl(imp) => {
-                if !imp.generics.is_empty() {
-                    scan.uses_generic_default_target = true;
-                }
-                for m in &imp.methods {
-                    scan_fn_into(m, scan);
+                if imp.generics.is_empty() {
+                    for m in &imp.methods {
+                        scan_fn_into(m, scan);
+                    }
+                } else if let Some(base_name) = impl_target_base_name(&imp.target) {
+                    let matching: Vec<MonomorphKey> = scan
+                        .generic_instantiations
+                        .iter()
+                        .filter(|k| k.struct_name.as_str() == base_name)
+                        .cloned()
+                        .collect();
+                    for key in matching {
+                        let mut subst = IndexMap::new();
+                        apply_impl_subst(imp, &key.type_args, &mut subst);
+                        for m in &imp.methods {
+                            scan_fn_into_with_subst(m, &subst, scan);
+                        }
+                    }
                 }
             }
             Item::Function(f) => {
@@ -2406,17 +2750,26 @@ fn mark_mc_global(name: &str, scan: &mut FeatureScan) {
 }
 
 fn scan_fn_into(f: &FnDecl, scan: &mut FeatureScan) {
+    let empty = IndexMap::new();
+    scan_fn_into_with_subst(f, &empty, scan);
+}
+
+fn scan_fn_into_with_subst(
+    f: &FnDecl,
+    subst: &IndexMap<SmolStr, String>,
+    scan: &mut FeatureScan,
+) {
     scan_attrs(&f.attrs, scan);
     for p in &f.params {
         if let Some(ref ty) = p.ty {
-            scan_type(ty, scan);
+            scan_type_with_subst(ty, subst, scan);
         }
     }
     if let Some(ref ret) = f.return_ty {
-        scan_type(ret, scan);
+        scan_type_with_subst(ret, subst, scan);
     }
     if let Some(ref body) = f.body {
-        scan_block(body, scan);
+        scan_block_with_subst(body, subst, scan);
     }
 }
 
@@ -2464,11 +2817,20 @@ fn scan_attrs(attrs: &[Attribute], scan: &mut FeatureScan) {
 }
 
 fn scan_type(ty: &TypeExpr, scan: &mut FeatureScan) {
+    let empty = IndexMap::new();
+    scan_type_with_subst(ty, &empty, scan);
+}
+
+fn scan_type_with_subst(
+    ty: &TypeExpr,
+    subst: &IndexMap<SmolStr, String>,
+    scan: &mut FeatureScan,
+) {
     match ty {
-        TypeExpr::Array { element, .. } => scan_type(element, scan),
+        TypeExpr::Array { element, .. } => scan_type_with_subst(element, subst, scan),
         TypeExpr::Named { path, args, .. } => {
             let joined = path.joined();
-            if let Some(bda) = parse_bda_type(&joined, args) {
+            if let Some(bda) = parse_bda_type_with_subst(&joined, args, subst) {
                 scan.extensions.insert("GL_EXT_scalar_block_layout");
                 scan.extensions.insert("GL_EXT_buffer_reference");
                 scan.extensions.insert("GL_EXT_buffer_reference2");
@@ -2495,46 +2857,50 @@ fn scan_type(ty: &TypeExpr, scan: &mut FeatureScan) {
             }
             for arg in args {
                 if let TypeArg::Type(inner) = arg {
-                    scan_type(inner, scan);
+                    scan_type_with_subst(inner, subst, scan);
                 }
             }
         }
     }
 }
 
-fn scan_block(block: &Block, scan: &mut FeatureScan) {
+fn scan_block_with_subst(
+    block: &Block,
+    subst: &IndexMap<SmolStr, String>,
+    scan: &mut FeatureScan,
+) {
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let { ty, init, .. } => {
                 if let Some(t) = ty {
-                    scan_type(t, scan);
+                    scan_type_with_subst(t, subst, scan);
                 }
                 if let Some(e) = init {
-                    scan_expr(e, scan);
+                    scan_expr_with_subst(e, subst, scan);
                 }
             }
             Stmt::Return { value, .. } => {
                 if let Some(e) = value {
-                    scan_expr(e, scan);
+                    scan_expr_with_subst(e, subst, scan);
                 }
             }
             Stmt::For {
                 attrs, iter, body, ..
             } => {
                 scan_attrs(attrs, scan);
-                scan_expr(iter, scan);
-                scan_block(body, scan);
+                scan_expr_with_subst(iter, subst, scan);
+                scan_block_with_subst(body, subst, scan);
             }
             Stmt::While {
                 attrs, cond, body, ..
             } => {
                 scan_attrs(attrs, scan);
-                scan_expr(cond, scan);
-                scan_block(body, scan);
+                scan_expr_with_subst(cond, subst, scan);
+                scan_block_with_subst(body, subst, scan);
             }
             Stmt::Loop { attrs, body, .. } => {
                 scan_attrs(attrs, scan);
-                scan_block(body, scan);
+                scan_block_with_subst(body, subst, scan);
             }
             Stmt::Switch {
                 selector,
@@ -2542,25 +2908,42 @@ fn scan_block(block: &Block, scan: &mut FeatureScan) {
                 default,
                 ..
             } => {
-                scan_expr(selector, scan);
+                scan_expr_with_subst(selector, subst, scan);
                 for case in cases {
-                    scan_expr(&case.value, scan);
-                    scan_block(&case.body, scan);
+                    scan_expr_with_subst(&case.value, subst, scan);
+                    scan_block_with_subst(&case.body, subst, scan);
                 }
                 if let Some(def) = default {
-                    scan_block(def, scan);
+                    scan_block_with_subst(def, subst, scan);
                 }
             }
-            Stmt::Expr { expr, .. } => scan_expr(expr, scan),
+            Stmt::Expr { expr, .. } => scan_expr_with_subst(expr, subst, scan),
             Stmt::Break(_) | Stmt::Continue(_) => {}
         }
     }
     if let Some(ref tail) = block.tail_expr {
-        scan_expr(tail, scan);
+        scan_expr_with_subst(tail, subst, scan);
+    }
+}
+
+fn is_bindless_receiver(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path { path, .. } => matches!(path.joined().as_str(), "bindless" | "mc::bindless"),
+        Expr::Index { receiver, .. } => is_bindless_receiver(receiver),
+        _ => false,
     }
 }
 
 fn scan_expr(expr: &Expr, scan: &mut FeatureScan) {
+    let empty = IndexMap::new();
+    scan_expr_with_subst(expr, &empty, scan);
+}
+
+fn scan_expr_with_subst(
+    expr: &Expr,
+    subst: &IndexMap<SmolStr, String>,
+    scan: &mut FeatureScan,
+) {
     match expr {
         Expr::IntLit(raw, _) => {
             if raw.ends_with("u64") || raw.ends_with("i64") {
@@ -2587,18 +2970,18 @@ fn scan_expr(expr: &Expr, scan: &mut FeatureScan) {
         }
         Expr::ArrayLit { elements, .. } => {
             for e in elements {
-                scan_expr(e, scan);
+                scan_expr_with_subst(e, subst, scan);
             }
         }
         Expr::StructLit { fields, .. } => {
             for (_, v) in fields {
-                scan_expr(v, scan);
+                scan_expr_with_subst(v, subst, scan);
             }
         }
-        Expr::Unary { operand, .. } => scan_expr(operand, scan),
+        Expr::Unary { operand, .. } => scan_expr_with_subst(operand, subst, scan),
         Expr::Binary { lhs, rhs, .. } => {
-            scan_expr(lhs, scan);
-            scan_expr(rhs, scan);
+            scan_expr_with_subst(lhs, subst, scan);
+            scan_expr_with_subst(rhs, subst, scan);
         }
         Expr::Call { callee, args, .. } => {
             if let Expr::Path { path, .. } = callee.as_ref() {
@@ -2626,9 +3009,9 @@ fn scan_expr(expr: &Expr, scan: &mut FeatureScan) {
                     }
                 }
             }
-            scan_expr(callee, scan);
+            scan_expr_with_subst(callee, subst, scan);
             for a in args {
-                scan_expr(&a.value, scan);
+                scan_expr_with_subst(&a.value, subst, scan);
             }
         }
         Expr::MethodCall {
@@ -2637,12 +3020,14 @@ fn scan_expr(expr: &Expr, scan: &mut FeatureScan) {
             args,
             ..
         } => {
-            if matches!(method.name.as_str(), "sample" | "sample_lod" | "fetch") {
+            if matches!(method.name.as_str(), "sample" | "sample_lod" | "fetch")
+                && !is_bindless_receiver(receiver)
+            {
                 scan.uses_sampled_textures = true;
             }
-            scan_expr(receiver, scan);
+            scan_expr_with_subst(receiver, subst, scan);
             for a in args {
-                scan_expr(&a.value, scan);
+                scan_expr_with_subst(&a.value, subst, scan);
             }
         }
         Expr::Field {
@@ -2656,13 +3041,13 @@ fn scan_expr(expr: &Expr, scan: &mut FeatureScan) {
             {
                 scan.pack_param_keys.insert(field.name.to_string());
             }
-            scan_expr(receiver, scan);
+            scan_expr_with_subst(receiver, subst, scan);
         }
         Expr::Index {
             receiver, index, ..
         } => {
-            scan_expr(receiver, scan);
-            scan_expr(index, scan);
+            scan_expr_with_subst(receiver, subst, scan);
+            scan_expr_with_subst(index, subst, scan);
         }
         Expr::If {
             cond,
@@ -2670,14 +3055,628 @@ fn scan_expr(expr: &Expr, scan: &mut FeatureScan) {
             else_branch,
             ..
         } => {
-            scan_expr(cond, scan);
-            scan_block(then_branch, scan);
+            scan_expr_with_subst(cond, subst, scan);
+            scan_block_with_subst(then_branch, subst, scan);
             if let Some(eb) = else_branch {
-                scan_expr(eb, scan);
+                scan_expr_with_subst(eb, subst, scan);
             }
         }
-        Expr::Block(b) => scan_block(b, scan),
+        Expr::Block(b) => scan_block_with_subst(b, subst, scan),
         Expr::BoolLit(_, _) | Expr::StringLit(_, _) | Expr::NoneLit(_) => {}
+    }
+}
+
+// ============================================================================
+// Generic Struct Monomorphization Discovery
+// ============================================================================
+
+fn collect_generic_instantiations(unit: &SourceUnit) -> IndexSet<MonomorphKey> {
+    let mut generic_structs: IndexMap<SmolStr, &StructDecl> = IndexMap::new();
+    for item in &unit.items {
+        if let Item::Struct(s) = item
+            && !s.generics.is_empty()
+        {
+            generic_structs.insert(s.name.name.clone(), s);
+        }
+    }
+    if generic_structs.is_empty() {
+        return IndexSet::new();
+    }
+
+    let mut out: IndexSet<MonomorphKey> = IndexSet::new();
+
+    // 1. Collect concrete `impl Trait for ConcreteStruct` definitions to satisfy bounded generics.
+    let mut trait_impls: IndexMap<SmolStr, IndexSet<String>> = IndexMap::new();
+    for item in &unit.items {
+        if let Item::Impl(imp) = item
+            && imp.generics.is_empty()
+            && let Some(ref trait_path) = imp.trait_path
+        {
+            let concrete_ty = type_to_glsl(&imp.target).0;
+            if let Some(last) = trait_path.segments.last() {
+                trait_impls
+                    .entry(last.name.clone())
+                    .or_default()
+                    .insert(concrete_ty.clone());
+            }
+            trait_impls
+                .entry(SmolStr::new(trait_path.joined()))
+                .or_default()
+                .insert(concrete_ty);
+        }
+    }
+
+    for (struct_name, s_decl) in &generic_structs {
+        let mut param_candidates: Vec<Vec<String>> = Vec::with_capacity(s_decl.generics.len());
+        let mut all_bounded = true;
+        for g in &s_decl.generics {
+            let Some(ref bound) = g.bound else {
+                all_bounded = false;
+                break;
+            };
+            let key = bound.joined();
+            let impls = trait_impls.get(key.as_str()).or_else(|| {
+                bound
+                    .segments
+                    .last()
+                    .and_then(|seg| trait_impls.get(&seg.name))
+            });
+            if let Some(types) = impls
+                && !types.is_empty()
+            {
+                param_candidates.push(types.iter().cloned().collect());
+            } else {
+                all_bounded = false;
+                break;
+            }
+        }
+        if all_bounded {
+            let mut acc = Vec::with_capacity(param_candidates.len());
+            emit_cartesian_instantiations(struct_name, &param_candidates, 0, &mut acc, &mut out);
+        }
+    }
+
+    // 2. Scan all type annotations, fields, signatures, and struct literals across the unit.
+    let empty_generics: IndexSet<SmolStr> = IndexSet::new();
+    for item in &unit.items {
+        match item {
+            Item::Const(c) => {
+                collect_instantiations_in_type(&c.ty, &generic_structs, &empty_generics, &mut out);
+            }
+            Item::WorkgroupVar(w) => {
+                collect_instantiations_in_type(&w.ty, &generic_structs, &empty_generics, &mut out);
+            }
+            Item::Struct(s) => {
+                let active: IndexSet<SmolStr> =
+                    s.generics.iter().map(|g| g.name.name.clone()).collect();
+                for f in &s.fields {
+                    collect_instantiations_in_type(&f.ty, &generic_structs, &active, &mut out);
+                }
+            }
+            Item::Trait(t) => {
+                for m in &t.methods {
+                    collect_instantiations_in_fn(m, &generic_structs, &empty_generics, &mut out);
+                }
+            }
+            Item::Impl(imp) => {
+                let active: IndexSet<SmolStr> =
+                    imp.generics.iter().map(|g| g.name.name.clone()).collect();
+                collect_instantiations_in_type(&imp.target, &generic_structs, &active, &mut out);
+                for m in &imp.methods {
+                    collect_instantiations_in_fn(m, &generic_structs, &active, &mut out);
+                }
+            }
+            Item::Function(f) => {
+                collect_instantiations_in_fn(f, &generic_structs, &empty_generics, &mut out);
+            }
+            _ => {}
+        }
+    }
+
+    // 3. Fixed-point expansion for generic structs referencing other generic structs in fields.
+    let mut cursor = 0usize;
+    while cursor < out.len() {
+        let Some(key) = out.get_index(cursor).cloned() else {
+            break;
+        };
+        cursor += 1;
+        if let Some(s_decl) = generic_structs.get(&key.struct_name) {
+            let mut subst = IndexMap::new();
+            for (g, concrete) in s_decl.generics.iter().zip(&key.type_args) {
+                subst.insert(g.name.name.clone(), concrete.clone());
+            }
+            for f in &s_decl.fields {
+                collect_instantiations_in_type_with_subst(
+                    &f.ty,
+                    &generic_structs,
+                    &subst,
+                    &mut out,
+                );
+            }
+        }
+    }
+
+    out
+}
+
+fn emit_cartesian_instantiations(
+    struct_name: &SmolStr,
+    candidates: &[Vec<String>],
+    depth: usize,
+    current: &mut Vec<String>,
+    out: &mut IndexSet<MonomorphKey>,
+) {
+    if depth == candidates.len() {
+        out.insert(MonomorphKey {
+            struct_name: struct_name.clone(),
+            type_args: current.clone(),
+        });
+        return;
+    }
+    for ty in &candidates[depth] {
+        current.push(ty.clone());
+        emit_cartesian_instantiations(struct_name, candidates, depth + 1, current, out);
+        current.pop();
+    }
+}
+
+fn type_contains_generic_param(ty: &TypeExpr, active_generics: &IndexSet<SmolStr>) -> bool {
+    if active_generics.is_empty() {
+        return false;
+    }
+    match ty {
+        TypeExpr::Array { element, .. } => type_contains_generic_param(element, active_generics),
+        TypeExpr::Named { path, args, .. } => {
+            if path.segments.len() == 1 && active_generics.contains(&path.segments[0].name) {
+                return true;
+            }
+            args.iter().any(|arg| match arg {
+                TypeArg::Type(inner) => type_contains_generic_param(inner, active_generics),
+                TypeArg::NamedExpr { .. } => false,
+            })
+        }
+    }
+}
+
+fn collect_instantiations_in_type(
+    ty: &TypeExpr,
+    generic_structs: &IndexMap<SmolStr, &StructDecl>,
+    active_generics: &IndexSet<SmolStr>,
+    out: &mut IndexSet<MonomorphKey>,
+) {
+    match ty {
+        TypeExpr::Array { element, .. } => {
+            collect_instantiations_in_type(element, generic_structs, active_generics, out);
+        }
+        TypeExpr::Named { path, args, .. } => {
+            for arg in args {
+                if let TypeArg::Type(inner) = arg {
+                    collect_instantiations_in_type(inner, generic_structs, active_generics, out);
+                }
+            }
+            if args.is_empty() {
+                return;
+            }
+            let base = path.joined().replace("::", "_");
+            let Some(s_decl) = generic_structs.get(base.as_str()) else {
+                return;
+            };
+            let type_arg_exprs: Vec<&TypeExpr> = args
+                .iter()
+                .filter_map(|a| match a {
+                    TypeArg::Type(t) => Some(t),
+                    TypeArg::NamedExpr { .. } => None,
+                })
+                .collect();
+            if type_arg_exprs.len() != s_decl.generics.len() {
+                return;
+            }
+            if type_arg_exprs
+                .iter()
+                .any(|t| type_contains_generic_param(t, active_generics))
+            {
+                return;
+            }
+            let concrete_args: Vec<String> =
+                type_arg_exprs.iter().map(|t| type_to_glsl(t).0).collect();
+            out.insert(MonomorphKey {
+                struct_name: s_decl.name.name.clone(),
+                type_args: concrete_args,
+            });
+        }
+    }
+}
+
+fn collect_instantiations_in_type_with_subst(
+    ty: &TypeExpr,
+    generic_structs: &IndexMap<SmolStr, &StructDecl>,
+    subst: &IndexMap<SmolStr, String>,
+    out: &mut IndexSet<MonomorphKey>,
+) {
+    match ty {
+        TypeExpr::Array { element, .. } => {
+            collect_instantiations_in_type_with_subst(element, generic_structs, subst, out);
+        }
+        TypeExpr::Named { path, args, .. } => {
+            for arg in args {
+                if let TypeArg::Type(inner) = arg {
+                    collect_instantiations_in_type_with_subst(inner, generic_structs, subst, out);
+                }
+            }
+            if args.is_empty() {
+                return;
+            }
+            let base = path.joined().replace("::", "_");
+            let Some(s_decl) = generic_structs.get(base.as_str()) else {
+                return;
+            };
+            let concrete_args: Vec<String> = args
+                .iter()
+                .filter_map(|a| match a {
+                    TypeArg::Type(t) => Some(type_to_glsl_with_subst(t, subst).0),
+                    TypeArg::NamedExpr { .. } => None,
+                })
+                .collect();
+            if concrete_args.len() == s_decl.generics.len() {
+                out.insert(MonomorphKey {
+                    struct_name: s_decl.name.name.clone(),
+                    type_args: concrete_args,
+                });
+            }
+        }
+    }
+}
+
+fn collect_instantiations_in_fn(
+    f: &FnDecl,
+    generic_structs: &IndexMap<SmolStr, &StructDecl>,
+    parent_generics: &IndexSet<SmolStr>,
+    out: &mut IndexSet<MonomorphKey>,
+) {
+    let mut active = parent_generics.clone();
+    for g in &f.generics {
+        active.insert(g.name.name.clone());
+    }
+    let mut local_types: IndexMap<SmolStr, String> = IndexMap::new();
+    for p in &f.params {
+        if let Some(ref ty) = p.ty {
+            collect_instantiations_in_type(ty, generic_structs, &active, out);
+            if !type_contains_generic_param(ty, &active) {
+                local_types.insert(p.name.name.clone(), type_to_glsl(ty).0);
+            }
+        }
+    }
+    if let Some(ref ret) = f.return_ty {
+        collect_instantiations_in_type(ret, generic_structs, &active, out);
+    }
+    if let Some(ref body) = f.body {
+        collect_instantiations_in_block(body, generic_structs, &active, &mut local_types, out);
+    }
+}
+
+fn collect_instantiations_in_block(
+    block: &Block,
+    generic_structs: &IndexMap<SmolStr, &StructDecl>,
+    active_generics: &IndexSet<SmolStr>,
+    local_types: &mut IndexMap<SmolStr, String>,
+    out: &mut IndexSet<MonomorphKey>,
+) {
+    let saved_locals = local_types.clone();
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Let { name, ty, init, .. } => {
+                if let Some(t) = ty {
+                    collect_instantiations_in_type(t, generic_structs, active_generics, out);
+                    if !type_contains_generic_param(t, active_generics) {
+                        local_types.insert(name.name.clone(), type_to_glsl(t).0);
+                    }
+                }
+                if let Some(e) = init {
+                    collect_instantiations_in_expr(
+                        e,
+                        generic_structs,
+                        active_generics,
+                        local_types,
+                        out,
+                    );
+                    if ty.is_none()
+                        && let Some(inferred) =
+                            infer_simple_concrete_expr_type(e, generic_structs, local_types)
+                    {
+                        local_types.insert(name.name.clone(), inferred);
+                    }
+                }
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(e) = value {
+                    collect_instantiations_in_expr(
+                        e,
+                        generic_structs,
+                        active_generics,
+                        local_types,
+                        out,
+                    );
+                }
+            }
+            Stmt::For { iter, body, .. } => {
+                collect_instantiations_in_expr(
+                    iter,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+                collect_instantiations_in_block(
+                    body,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+            }
+            Stmt::While { cond, body, .. } => {
+                collect_instantiations_in_expr(
+                    cond,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+                collect_instantiations_in_block(
+                    body,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+            }
+            Stmt::Loop { body, .. } => {
+                collect_instantiations_in_block(
+                    body,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+            }
+            Stmt::Switch {
+                selector,
+                cases,
+                default,
+                ..
+            } => {
+                collect_instantiations_in_expr(
+                    selector,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+                for c in cases {
+                    collect_instantiations_in_expr(
+                        &c.value,
+                        generic_structs,
+                        active_generics,
+                        local_types,
+                        out,
+                    );
+                    collect_instantiations_in_block(
+                        &c.body,
+                        generic_structs,
+                        active_generics,
+                        local_types,
+                        out,
+                    );
+                }
+                if let Some(d) = default {
+                    collect_instantiations_in_block(
+                        d,
+                        generic_structs,
+                        active_generics,
+                        local_types,
+                        out,
+                    );
+                }
+            }
+            Stmt::Expr { expr, .. } => {
+                collect_instantiations_in_expr(
+                    expr,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+            }
+            Stmt::Break(_) | Stmt::Continue(_) => {}
+        }
+    }
+    if let Some(ref tail) = block.tail_expr {
+        collect_instantiations_in_expr(tail, generic_structs, active_generics, local_types, out);
+    }
+    *local_types = saved_locals;
+}
+
+fn infer_simple_concrete_expr_type(
+    expr: &Expr,
+    generic_structs: &IndexMap<SmolStr, &StructDecl>,
+    local_types: &IndexMap<SmolStr, String>,
+) -> Option<String> {
+    match expr {
+        Expr::StructLit { path, fields, .. } => {
+            let base = path.joined().replace("::", "_");
+            if let Some(s_decl) = generic_structs.get(base.as_str()) {
+                let args = infer_generic_struct_lit_args(s_decl, fields, generic_structs, local_types)?;
+                return Some(mangle_generic_name(&base, &args));
+            }
+            Some(base)
+        }
+        Expr::Path { path, .. } if path.segments.len() == 1 => {
+            local_types.get(&path.segments[0].name).cloned()
+        }
+        Expr::BoolLit(_, _) => Some("bool".to_owned()),
+        Expr::FloatLit(_, _) => Some("float".to_owned()),
+        Expr::IntLit(raw, _) => {
+            if raw.ends_with("u64") {
+                Some("uint64_t".to_owned())
+            } else if raw.ends_with("i64") {
+                Some("int64_t".to_owned())
+            } else if raw.ends_with('u') || raw.ends_with("u32") {
+                Some("uint".to_owned())
+            } else {
+                Some("int".to_owned())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn infer_generic_struct_lit_args(
+    s_decl: &StructDecl,
+    fields: &[(Ident, Expr)],
+    generic_structs: &IndexMap<SmolStr, &StructDecl>,
+    local_types: &IndexMap<SmolStr, String>,
+) -> Option<Vec<String>> {
+    let mut resolved: Vec<Option<String>> = vec![None; s_decl.generics.len()];
+    for f in &s_decl.fields {
+        if let TypeExpr::Named { path, args, .. } = &f.ty
+            && path.segments.len() == 1
+            && args.is_empty()
+            && let Some(idx) = s_decl
+                .generics
+                .iter()
+                .position(|g| g.name.name == path.segments[0].name)
+            && let Some((_, val_expr)) = fields.iter().find(|(id, _)| id.name == f.name.name)
+            && let Some(ty) =
+                infer_simple_concrete_expr_type(val_expr, generic_structs, local_types)
+        {
+            resolved[idx] = Some(ty);
+        }
+    }
+    if resolved.iter().all(Option::is_some) {
+        Some(resolved.into_iter().flatten().collect())
+    } else {
+        None
+    }
+}
+
+fn collect_instantiations_in_expr(
+    expr: &Expr,
+    generic_structs: &IndexMap<SmolStr, &StructDecl>,
+    active_generics: &IndexSet<SmolStr>,
+    local_types: &mut IndexMap<SmolStr, String>,
+    out: &mut IndexSet<MonomorphKey>,
+) {
+    match expr {
+        Expr::StructLit { path, fields, .. } => {
+            for (_, v) in fields {
+                collect_instantiations_in_expr(v, generic_structs, active_generics, local_types, out);
+            }
+            let base = path.joined().replace("::", "_");
+            if let Some(s_decl) = generic_structs.get(base.as_str())
+                && let Some(type_args) =
+                    infer_generic_struct_lit_args(s_decl, fields, generic_structs, local_types)
+                && !type_args.iter().any(|t| active_generics.contains(t.as_str()))
+            {
+                out.insert(MonomorphKey {
+                    struct_name: s_decl.name.name.clone(),
+                    type_args,
+                });
+            }
+        }
+        Expr::Path { turbofish, .. } => {
+            for arg in turbofish {
+                if let TypeArg::Type(t) = arg {
+                    collect_instantiations_in_type(t, generic_structs, active_generics, out);
+                }
+            }
+        }
+        Expr::ArrayLit { elements, .. } => {
+            for e in elements {
+                collect_instantiations_in_expr(e, generic_structs, active_generics, local_types, out);
+            }
+        }
+        Expr::Unary { operand, .. } => {
+            collect_instantiations_in_expr(operand, generic_structs, active_generics, local_types, out);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_instantiations_in_expr(lhs, generic_structs, active_generics, local_types, out);
+            collect_instantiations_in_expr(rhs, generic_structs, active_generics, local_types, out);
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_instantiations_in_expr(callee, generic_structs, active_generics, local_types, out);
+            for a in args {
+                collect_instantiations_in_expr(
+                    &a.value,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+            }
+        }
+        Expr::MethodCall {
+            receiver,
+            turbofish,
+            args,
+            ..
+        } => {
+            collect_instantiations_in_expr(receiver, generic_structs, active_generics, local_types, out);
+            for arg in turbofish {
+                if let TypeArg::Type(t) = arg {
+                    collect_instantiations_in_type(t, generic_structs, active_generics, out);
+                }
+            }
+            for a in args {
+                collect_instantiations_in_expr(
+                    &a.value,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+            }
+        }
+        Expr::Field { receiver, .. } => {
+            collect_instantiations_in_expr(receiver, generic_structs, active_generics, local_types, out);
+        }
+        Expr::Index {
+            receiver, index, ..
+        } => {
+            collect_instantiations_in_expr(receiver, generic_structs, active_generics, local_types, out);
+            collect_instantiations_in_expr(index, generic_structs, active_generics, local_types, out);
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_instantiations_in_expr(cond, generic_structs, active_generics, local_types, out);
+            collect_instantiations_in_block(
+                then_branch,
+                generic_structs,
+                active_generics,
+                local_types,
+                out,
+            );
+            if let Some(eb) = else_branch {
+                collect_instantiations_in_expr(
+                    eb,
+                    generic_structs,
+                    active_generics,
+                    local_types,
+                    out,
+                );
+            }
+        }
+        Expr::Block(b) => {
+            collect_instantiations_in_block(b, generic_structs, active_generics, local_types, out);
+        }
+        Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::NoneLit(_) => {}
     }
 }
 

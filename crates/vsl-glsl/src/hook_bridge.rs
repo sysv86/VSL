@@ -1,11 +1,11 @@
 use crate::emit::{
     EmitOptions, emit_fn_decl_with_param_types, escape_glsl_ident, fn_return_glsl_type,
-    format_param_list, scan_fn_decl,
+    format_param_list, scan_fn_decl, scan_fn_decl_without_param_inference,
 };
 use indexmap::IndexMap;
 use smol_str::SmolStr;
 use std::fmt::Write as _;
-use vsl_mc::{DESCRIPTOR_SET_PER_PASS, HookAbiRoute, HookStage};
+use vsl_mc::{DESCRIPTOR_SET_PER_PASS, HookAbiRoute, HookStage, PackParamType};
 use vsl_syntax::ast::FnDecl;
 
 /// Emits a Hyaloclast raster G-Buffer GLSL hook slot wrapper for a VSL 2.0 `@hook` function.
@@ -17,9 +17,9 @@ use vsl_syntax::ast::FnDecl;
 /// SPIR-V backend never inherits legacy raster G-Buffer ABI coupling.
 ///
 /// Each referenced pack parameter's GLSL field type (`bool`, `int`, `uint`, `vec3`, `vec4`,
-/// `float`) is inferred automatically from usage context inside `func`. To override or supply
-/// explicit pack parameter types from `pack.vsl` settings metadata, use
-/// [`emit_raster_gbuffer_hook_slot_with_types`].
+/// `float`) is inferred automatically from usage context inside `func`. To supply schema types
+/// directly from `pack.vsl` settings metadata, use [`emit_raster_gbuffer_hook_slot_with_schema`]
+/// or [`emit_raster_gbuffer_hook_slot_with_types`].
 pub fn emit_raster_gbuffer_hook_slot(stage: HookStage, func: &FnDecl) -> Result<String, String> {
     let empty = IndexMap::new();
     emit_raster_gbuffer_hook_slot_with_types(stage, func, &empty)
@@ -35,6 +35,32 @@ pub fn emit_raster_gbuffer_hook_slot_with_types(
     stage: HookStage,
     func: &FnDecl,
     param_types: &IndexMap<SmolStr, String>,
+) -> Result<String, String> {
+    emit_raster_gbuffer_hook_slot_inner(stage, func, param_types, true)
+}
+
+/// Emits a Hyaloclast raster G-Buffer GLSL hook slot wrapper with `VsPackParams` fields typed
+/// strictly from a `pack.vsl` [`PackParamType`] schema.
+///
+/// Referenced pack parameters present in `param_types` use [`PackParamType::glsl_type_name`]
+/// directly without AST-based type inference; unmapped keys default to `float`.
+pub fn emit_raster_gbuffer_hook_slot_with_schema(
+    stage: HookStage,
+    func: &FnDecl,
+    param_types: &IndexMap<SmolStr, PackParamType>,
+) -> Result<String, String> {
+    let schema_types: IndexMap<SmolStr, String> = param_types
+        .iter()
+        .map(|(k, ty)| (k.clone(), ty.glsl_type_name().to_owned()))
+        .collect();
+    emit_raster_gbuffer_hook_slot_inner(stage, func, &schema_types, false)
+}
+
+fn emit_raster_gbuffer_hook_slot_inner(
+    stage: HookStage,
+    func: &FnDecl,
+    param_types: &IndexMap<SmolStr, String>,
+    infer_param_types: bool,
 ) -> Result<String, String> {
     if stage.abi_route() != HookAbiRoute::RasterGbufferGlslBridge {
         return Err(format!(
@@ -55,14 +81,24 @@ pub fn emit_raster_gbuffer_hook_slot_with_types(
         }
     };
 
-    let mut scan = scan_fn_decl(func);
+    let mut scan = if infer_param_types {
+        scan_fn_decl(func)
+    } else {
+        scan_fn_decl_without_param_inference(func)
+    };
     scan.extensions.insert("GL_EXT_scalar_block_layout");
 
-    // Merge caller-supplied parameter types on top of usage-inferred types.
-    let mut resolved_param_types = scan.pack_param_types.clone();
-    for (k, v) in param_types {
-        resolved_param_types.insert(k.clone(), v.clone());
-    }
+    let resolved_param_types = if infer_param_types {
+        // Merge caller-supplied parameter types on top of usage-inferred types.
+        let mut merged = scan.pack_param_types.clone();
+        for (k, v) in param_types {
+            merged.insert(k.clone(), v.clone());
+        }
+        merged
+    } else {
+        // Schema-driven path: use only caller-supplied schema types without AST inference.
+        param_types.clone()
+    };
 
     let opts = EmitOptions {
         route_params_to_vs_motion: true,
