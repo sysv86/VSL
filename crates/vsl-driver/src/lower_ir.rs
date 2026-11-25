@@ -2383,6 +2383,147 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             .map(|i| i as u32)
     }
 
+    /// Loads a `WorldUBO` member using the type and offset declared by the canonical engine
+    /// layout, so every `mc::world.*` read is typed from the same 544-byte schema.
+    fn load_world_field(&mut self, field_name: &str, span: Span) -> InstId {
+        let Some(world_desc) = self.find_world_descriptor() else {
+            return self.emit_diag(
+                "E0525",
+                format!("cannot load `WorldUBO::{field_name}`: Set 0 binding 0 is not bound"),
+                span,
+            );
+        };
+        self.emit_builtin_struct_field_load(
+            world_desc,
+            &WORLD_UBO_LAYOUT,
+            field_name,
+            IrStorageClass::Uniform,
+            span,
+        )
+    }
+
+    fn world_game_time_sec(&mut self, span: Span) -> InstId {
+        self.load_world_field("game_time_sec", span)
+    }
+
+    fn world_rain(&mut self, span: Span) -> InstId {
+        self.load_world_field("rain", span)
+    }
+
+    fn world_thunder(&mut self, span: Span) -> InstId {
+        self.load_world_field("thunder", span)
+    }
+
+    fn world_eye_in_fluid(&mut self, span: Span) -> InstId {
+        self.load_world_field("eye_in_fluid", span)
+    }
+
+    fn world_sun_dir(&mut self, span: Span) -> InstId {
+        self.load_world_field("sun_dir", span)
+    }
+
+    /// Reads one `vec4` slot of the engine's `packParams[12]` array.
+    fn world_pack_param_slot(&mut self, slot: u32, span: Span) -> InstId {
+        if slot >= 12 {
+            return self.emit_diag(
+                "E0526",
+                format!("`packParams[{slot}]` is out of range (expected 0..=11)"),
+                span,
+            );
+        }
+        self.load_world_field(world_pack_param_field_name(slot), span)
+    }
+
+    /// `WorldStateCollector.kt` writes a non-zero atmosphere density into `packParams[11].w`
+    /// only when the biome/dimension telemetry tail is valid.
+    fn lower_mc_has_biome_telemetry(&mut self, span: Span) -> InstId {
+        let f32_ty = IrType::Scalar(ScalarIrTy::F32);
+        let validity = self.world_pack_param_slot(11, span);
+        let density = self.ir_fn.emit_typed(
+            f32_ty.clone(),
+            InstData::CompositeExtract {
+                composite: validity,
+                indices: vec![3],
+            },
+        );
+        let threshold = self.ir_fn.emit_typed(f32_ty, InstData::const_f32(0.001));
+        self.ir_fn.emit_typed(
+            IrType::Scalar(ScalarIrTy::Bool),
+            InstData::FCmpGt(density, threshold),
+        )
+    }
+
+    /// `mc::dimension_id()`: mirrors `vsDimensionId()`, round-to-nearest on
+    /// `packParams[10].z`, with 0 (Overworld) when telemetry is absent.
+    fn lower_mc_dimension_id(&mut self, span: Span) -> InstId {
+        let f32_ty = IrType::Scalar(ScalarIrTy::F32);
+        let i32_ty = IrType::Scalar(ScalarIrTy::I32);
+        let valid = self.lower_mc_has_biome_telemetry(span);
+        let telemetry = self.world_pack_param_slot(10, span);
+        let raw = self.ir_fn.emit_typed(
+            f32_ty.clone(),
+            InstData::CompositeExtract {
+                composite: telemetry,
+                indices: vec![2],
+            },
+        );
+        let half = self
+            .ir_fn
+            .emit_typed(f32_ty.clone(), InstData::const_f32(0.5));
+        let rounded = self.ir_fn.emit_typed(f32_ty, InstData::FAdd32(raw, half));
+        let id = self
+            .ir_fn
+            .emit_typed(i32_ty.clone(), InstData::CastToI32(rounded));
+        let overworld = self.ir_fn.emit_typed(i32_ty, InstData::ConstI32(0));
+        self.ir_fn.emit_typed(
+            IrType::Scalar(ScalarIrTy::I32),
+            InstData::Select {
+                cond: valid,
+                on_true: id,
+                on_false: overworld,
+            },
+        )
+    }
+
+    /// `mc::biome_cloud_scale()`: mirrors `vsBiomeCloudScale()`, clamped to `0.0..=1.5`,
+    /// with the neutral `1.0` fallback when telemetry is absent.
+    fn lower_mc_biome_cloud_scale(&mut self, span: Span) -> InstId {
+        let f32_ty = IrType::Scalar(ScalarIrTy::F32);
+        let valid = self.lower_mc_has_biome_telemetry(span);
+        let telemetry = self.world_pack_param_slot(10, span);
+        let raw = self.ir_fn.emit_typed(
+            f32_ty.clone(),
+            InstData::CompositeExtract {
+                composite: telemetry,
+                indices: vec![3],
+            },
+        );
+        let zero = self
+            .ir_fn
+            .emit_typed(f32_ty.clone(), InstData::const_f32(0.0));
+        let one = self
+            .ir_fn
+            .emit_typed(f32_ty.clone(), InstData::const_f32(1.0));
+        let max_scale = self
+            .ir_fn
+            .emit_typed(f32_ty.clone(), InstData::const_f32(1.5));
+        let clamped = self.ir_fn.emit_typed(
+            f32_ty.clone(),
+            InstData::GlslStd450 {
+                op: GlslStd450Op::FClamp,
+                args: vec![raw, zero, max_scale],
+            },
+        );
+        self.ir_fn.emit_typed(
+            f32_ty,
+            InstData::Select {
+                cond: valid,
+                on_true: clamped,
+                on_false: one,
+            },
+        )
+    }
+
     fn resolve_descriptor_path(&self, path: &str) -> Option<u32> {
         if let Some(res_name) = path.strip_prefix("mc::resources::")
             && let Some(slot) = self
@@ -2645,12 +2786,33 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             && let Some(desc_idx) = self.resolve_descriptor_path(path)
         {
             let desc = &self.ir_fn.descriptors[desc_idx as usize];
-            if let Some(builtin_layout) = builtin_descriptor_layout(desc.set, desc.binding) {
-                let storage = if desc.kind == DescriptorKind::UniformBuffer {
+            let (set, binding, is_uniform) = (
+                desc.set,
+                desc.binding,
+                desc.kind == DescriptorKind::UniformBuffer,
+            );
+            if let Some(builtin_layout) = builtin_descriptor_layout(set, binding) {
+                let storage = if is_uniform {
                     IrStorageClass::Uniform
                 } else {
                     IrStorageClass::StorageBuffer
                 };
+                if builtin_layout.name == "WorldUBO" && is_uniform {
+                    return match canonicalize_builtin_field_name(builtin_layout, field.as_str()) {
+                        "game_time_sec" => self.world_game_time_sec(span),
+                        "rain" => self.world_rain(span),
+                        "thunder" => self.world_thunder(span),
+                        "eye_in_fluid" => self.world_eye_in_fluid(span),
+                        "sun_dir" => self.world_sun_dir(span),
+                        _ => self.emit_builtin_struct_field_load(
+                            desc_idx,
+                            builtin_layout,
+                            field.as_str(),
+                            storage,
+                            span,
+                        ),
+                    };
+                }
                 return self.emit_builtin_struct_field_load(
                     desc_idx,
                     builtin_layout,
@@ -3033,6 +3195,15 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             }
             "mc::sample_sky" => {
                 return Ok(self.lower_mc_sample_sky(args, span, out));
+            }
+            "mc::has_biome_telemetry" => {
+                return Ok(self.lower_mc_has_biome_telemetry(span));
+            }
+            "mc::dimension_id" => {
+                return Ok(self.lower_mc_dimension_id(span));
+            }
+            "mc::biome_cloud_scale" => {
+                return Ok(self.lower_mc_biome_cloud_scale(span));
             }
             "mc::debug_write" | "debug_write" => {
                 return Ok(self.lower_mc_debug_write(args, span, out));
@@ -3800,7 +3971,8 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
 
     /// `mc::reconstruct_world_pos(uv, depth)` or `mc::reconstruct_world_pos(coord, depth_tex)`:
     /// reconstructs NDC `vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth, 1.0)`, multiplies by
-    /// `world.inv_view_proj` (`MatrixTimesVector`), and divides `.xyz` by `.w`.
+    /// `world.inv_proj` (`MatrixTimesVector`), and divides `.xyz` by `.w`. The legacy
+    /// `inv_view_proj` alias maps to the engine's `inv_proj` member.
     fn lower_mc_reconstruct_world_pos(
         &mut self,
         args: &[HirCallArg],
@@ -3855,14 +4027,14 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     indices: vec![0],
                 },
             );
-            let uv_val = self.coord_to_uv(first_arg, world_desc, span);
+            let uv_val = self.coord_to_uv(first_arg);
             (uv_val, depth_val)
         } else {
             let depth_val = self.lower_expr(&second_expr.value, out);
             let uv_val = if self.inst_ty(first_arg).is_float() {
                 first_arg
             } else {
-                self.coord_to_uv(first_arg, world_desc, span)
+                self.coord_to_uv(first_arg)
             };
             (uv_val, depth_val)
         };
@@ -3870,9 +4042,12 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         self.emit_ndc_to_world(uv, depth, world_desc, span)
     }
 
-    /// Converts an integer pixel coordinate `ivec2`/`uvec2` to normalized `[0, 1]` UV using
-    /// `WorldUBO::inv_screen_size`.
-    fn coord_to_uv(&mut self, coord: InstId, world_desc: u32, span: Span) -> InstId {
+    /// Converts an integer pixel coordinate `ivec2`/`uvec2` to normalized `[0, 1]` UV.
+    ///
+    /// The 544-byte engine UBO has no screen-size member, so coordinates are treated as
+    /// already normalized; callers holding pixel coordinates should pass them as `vec2` UVs
+    /// obtained from their target dimensions.
+    fn coord_to_uv(&mut self, coord: InstId) -> InstId {
         let f32_ty = IrType::Scalar(ScalarIrTy::F32);
         let vec2_ty = IrType::Vector {
             scalar: ScalarIrTy::F32,
@@ -3902,18 +4077,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             .ir_fn
             .emit_typed(f32_ty.clone(), InstData::FAdd32(fx, half));
         let py = self.ir_fn.emit_typed(f32_ty, InstData::FAdd32(fy, half));
-        let p_vec = self
-            .ir_fn
-            .emit_typed(vec2_ty.clone(), InstData::MakeVec2(px, py));
-        let inv_screen = self.emit_builtin_struct_field_load(
-            world_desc,
-            &WORLD_UBO_LAYOUT,
-            "inv_screen_size",
-            IrStorageClass::Uniform,
-            span,
-        );
-        self.ir_fn
-            .emit_typed(vec2_ty, InstData::FMul32(p_vec, inv_screen))
+        self.ir_fn.emit_typed(vec2_ty, InstData::MakeVec2(px, py))
     }
 
     fn emit_ndc_to_world(
@@ -3973,7 +4137,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         let inv_vp = self.emit_builtin_struct_field_load(
             world_desc,
             &WORLD_UBO_LAYOUT,
-            "inv_view_proj",
+            "inv_proj",
             IrStorageClass::Uniform,
             span,
         );
@@ -4052,20 +4216,14 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             let uv = if self.inst_ty(arg).is_float() {
                 arg
             } else {
-                self.coord_to_uv(arg, world_desc, span)
+                self.coord_to_uv(arg)
             };
             let far_depth = self
                 .ir_fn
                 .emit_typed(IrType::Scalar(ScalarIrTy::F32), InstData::const_f32(1.0));
             self.emit_ndc_to_world(uv, far_depth, world_desc, span)
         };
-        let cam_pos = self.emit_builtin_struct_field_load(
-            world_desc,
-            &WORLD_UBO_LAYOUT,
-            "camera_pos",
-            IrStorageClass::Uniform,
-            span,
-        );
+        let cam_pos = self.load_world_field("camera_pos_frac", span);
         let diff = self
             .ir_fn
             .emit_typed(vec3_ty.clone(), InstData::FSub32(world_pos, cam_pos));
@@ -4078,22 +4236,16 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         )
     }
 
-    /// `mc::sample_sky(dir)`: computes physical gradient sky using `WorldUBO::sky_horizon`,
-    /// `WorldUBO::sky_zenith`, `WorldUBO::sun_dir`, `WorldUBO::sun_color`, and
-    /// `WorldUBO::rain_strength`.
+    /// `mc::sample_sky(dir)`: gradient sky driven by the engine's `sun_dir` and `rain`, with
+    /// horizon tint from the biome fog telemetry in `packParams[11].rgb`. The 544-byte engine
+    /// UBO has no `sky_*`/`sun_color` members, so the zenith is derived from the horizon and the
+    /// sun tint is a neutral warm constant.
     fn lower_mc_sample_sky(
         &mut self,
         args: &[HirCallArg],
         span: Span,
         out: &mut Vec<StructuredStmt>,
     ) -> InstId {
-        let Some(world_desc) = self.find_world_descriptor() else {
-            return self.emit_diag(
-                "E0525",
-                "`mc::sample_sky` requires `WorldUBO` (Set 0 binding 0)",
-                span,
-            );
-        };
         let Ok(dir) = self.require_arg(args, 0, "mc::sample_sky", span, out) else {
             return self.ir_fn.emit_typed(IrType::Void, InstData::Nop);
         };
@@ -4103,41 +4255,44 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             len: 3,
         };
 
-        let sky_horizon = self.emit_builtin_struct_field_load(
-            world_desc,
-            &WORLD_UBO_LAYOUT,
-            "sky_horizon",
-            IrStorageClass::Uniform,
-            span,
+        let fog = self.world_pack_param_slot(11, span);
+        let fog_lanes = [0u32, 1, 2].map(|lane| {
+            self.ir_fn.emit_typed(
+                f32_ty.clone(),
+                InstData::CompositeExtract {
+                    composite: fog,
+                    indices: vec![lane],
+                },
+            )
+        });
+        let sky_horizon = self.ir_fn.emit_typed(
+            vec3_ty.clone(),
+            InstData::MakeVec3(fog_lanes[0], fog_lanes[1], fog_lanes[2]),
         );
-        let sky_zenith = self.emit_builtin_struct_field_load(
-            world_desc,
-            &WORLD_UBO_LAYOUT,
-            "sky_zenith",
-            IrStorageClass::Uniform,
-            span,
+        let zenith_scale = self
+            .ir_fn
+            .emit_typed(f32_ty.clone(), InstData::const_f32(0.6));
+        let sky_zenith = self.ir_fn.emit_typed(
+            vec3_ty.clone(),
+            InstData::VectorTimesScalar {
+                vec: sky_horizon,
+                scalar: zenith_scale,
+            },
         );
-        let sun_dir = self.emit_builtin_struct_field_load(
-            world_desc,
-            &WORLD_UBO_LAYOUT,
-            "sun_dir",
-            IrStorageClass::Uniform,
-            span,
-        );
-        let sun_color = self.emit_builtin_struct_field_load(
-            world_desc,
-            &WORLD_UBO_LAYOUT,
-            "sun_color",
-            IrStorageClass::Uniform,
-            span,
-        );
-        let rain_strength = self.emit_builtin_struct_field_load(
-            world_desc,
-            &WORLD_UBO_LAYOUT,
-            "rain_strength",
-            IrStorageClass::Uniform,
-            span,
-        );
+        let sun_dir = self.world_sun_dir(span);
+        let r = self
+            .ir_fn
+            .emit_typed(f32_ty.clone(), InstData::const_f32(1.0));
+        let g = self
+            .ir_fn
+            .emit_typed(f32_ty.clone(), InstData::const_f32(0.96));
+        let b = self
+            .ir_fn
+            .emit_typed(f32_ty.clone(), InstData::const_f32(0.86));
+        let sun_color = self
+            .ir_fn
+            .emit_typed(vec3_ty.clone(), InstData::MakeVec3(r, g, b));
+        let rain_strength = self.world_rain(span);
 
         let zero = self
             .ir_fn
@@ -4919,10 +5074,39 @@ fn canonicalize_builtin_field_name<'a>(desc: &BuiltinStructDesc, field_name: &'a
     if desc.name == "InstanceMeta" && field_name == "albedo_slot" {
         return "texture_id";
     }
-    if desc.name == "WorldUBO" && field_name == "time" {
-        return "time_sec";
+    if desc.name == "WorldUBO" {
+        // Legacy VSL field names kept source-compatible with the 544-byte engine ABI.
+        return match field_name {
+            "time" | "time_sec" => "game_time_sec",
+            "rain_strength" => "rain",
+            "camera_pos" => "camera_pos_frac",
+            "inv_view_proj" => "inv_proj",
+            "view_proj" => "cur_view_proj",
+            "far_plane" => "depth_far",
+            other => other,
+        };
     }
     field_name
+}
+
+/// `packParams` slot aliases. The engine exposes a `vec4[12]` array; built-in layout descriptors
+/// model each slot as a separate `vec4` member, with slot 0 keeping the unsuffixed engine name.
+const fn world_pack_param_field_name(slot: u32) -> &'static str {
+    match slot {
+        0 => "pack_params",
+        1 => "pack_params_1",
+        2 => "pack_params_2",
+        3 => "pack_params_3",
+        4 => "pack_params_4",
+        5 => "pack_params_5",
+        6 => "pack_params_6",
+        7 => "pack_params_7",
+        8 => "pack_params_8",
+        9 => "pack_params_9",
+        10 => "pack_params_10",
+        11 => "pack_params_11",
+        _ => "",
+    }
 }
 
 const fn is_assign_op(op: BinaryOp) -> bool {
@@ -5248,4 +5432,57 @@ fn extract_const_range_bounds_hir(
         InstData::ConstI32(start as i32),
     );
     (trip, Some(init))
+}
+
+#[cfg(test)]
+mod tests {
+    use vsl_mc::RenderTier;
+
+    use crate::{CompileOptions, VslCompiler};
+
+    #[test]
+    fn lowers_engine_world_ubo_fields_and_biome_intrinsics() {
+        let src = r"
+            module pack::world_abi;
+
+            import mc::{world};
+
+            @stage(compute(8, 8, 1))
+            pub fn probe(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let t: f32 = mc::world.game_time_sec;
+                let legacy_time: f32 = mc::world.time;
+                let rain_now: f32 = mc::world.rain;
+                let legacy_rain: f32 = mc::world.rain_strength;
+                let storm: f32 = mc::world.thunder;
+                let fluid: i32 = mc::world.eye_in_fluid;
+                let sun: vec3 = mc::world.sun_dir;
+                let cam: vec3 = mc::world.camera_pos;
+                let legacy_vp: mat4 = mc::world.view_proj;
+                let legacy_inv_vp: mat4 = mc::world.inv_view_proj;
+                let prev_vp: mat4 = mc::world.prev_view_proj;
+                let slot0: vec4 = mc::world.pack_params;
+                let telemetry: vec4 = mc::world.pack_params_10;
+                let dim: i32 = mc::dimension_id();
+                let clouds: f32 = mc::biome_cloud_scale();
+                let valid: bool = mc::has_biome_telemetry();
+                let validity: f32 = if valid { 1.0 } else { 0.0 };
+                let value = t + legacy_time + rain_now + legacy_rain + storm + f32(fluid)
+                    + sun.x + cam.x + legacy_vp[0u].x + legacy_inv_vp[0u].x + prev_vp[0u].x
+                    + slot0.x + telemetry.z + f32(dim) + clouds + validity;
+                out_img.store(ivec2(gid.xy), vec4(value, 0.0, 0.0, 1.0));
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
+        let output = compiler.compile_shader_source("world_abi.vsl", src, &opts);
+        assert!(
+            !output.has_errors(),
+            "diagnostics: {:?}",
+            output.diagnostics.as_slice()
+        );
+        assert_eq!(output.units.len(), 1, "expected one compiled entry point");
+    }
 }

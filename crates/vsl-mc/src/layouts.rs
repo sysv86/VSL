@@ -60,115 +60,158 @@ impl BuiltinStructDesc {
     }
 }
 
-/// Set 0, binding 0: per-pass `WorldUBO` (`std140`, 304 bytes).
+/// Number of `vec4` slots in the engine's `packParams[12]` array.
+const WORLD_PACK_PARAM_SLOT_COUNT: u32 = 12;
+/// Byte stride between consecutive `packParams` slots (`vec4` under `std140`).
+const WORLD_PACK_PARAM_SLOT_STRIDE: u32 = 16;
+/// Byte offset of `packParams[0]` in the 544-byte `WorldUBO`.
+const WORLD_PACK_PARAMS_OFFSET: u32 = 320;
+/// Canonical field names for the 12 `packParams` slots. Slot 0 keeps the unsuffixed engine name
+/// so `mc::world.pack_params` reads the first `vec4`; later slots use a numeric suffix because
+/// built-in layout descriptors carry scalar/vector/matrix types but no fixed-size array type.
+const WORLD_PACK_PARAM_FIELD_NAMES: [&str; WORLD_PACK_PARAM_SLOT_COUNT as usize] = [
+    "pack_params",
+    "pack_params_1",
+    "pack_params_2",
+    "pack_params_3",
+    "pack_params_4",
+    "pack_params_5",
+    "pack_params_6",
+    "pack_params_7",
+    "pack_params_8",
+    "pack_params_9",
+    "pack_params_10",
+    "pack_params_11",
+];
+
+const fn world_pack_param_field(slot: usize) -> BuiltinFieldDesc {
+    BuiltinFieldDesc {
+        name: WORLD_PACK_PARAM_FIELD_NAMES[slot],
+        byte_offset: WORLD_PACK_PARAMS_OFFSET + slot as u32 * WORLD_PACK_PARAM_SLOT_STRIDE,
+        byte_size: WORLD_PACK_PARAM_SLOT_STRIDE,
+        ty: BuiltinFieldType::Vec4,
+    }
+}
+
+/// Set 0, binding 0: per-pass `WorldUBO` (`std140`, 544 bytes).
+///
+/// Field names and offsets mirror `WorldUboData` in `vulkanshaders-core` and the GLSL
+/// `WorldUBO` block in the engine's `common.vsl`. The first 528 bytes are the v1 `WorldUBO` ABI;
+/// the remaining 16 bytes carry the VSL pack-parameter BDA plus `std140` padding.
 pub const WORLD_UBO_FIELDS: &[BuiltinFieldDesc] = &[
     BuiltinFieldDesc {
-        name: "pack_params_bda",
+        name: "cur_view_proj",
         byte_offset: 0,
-        byte_size: 8,
-        ty: BuiltinFieldType::U64,
-    },
-    BuiltinFieldDesc {
-        name: "frame_index",
-        byte_offset: 8,
-        byte_size: 4,
-        ty: BuiltinFieldType::U32,
-    },
-    BuiltinFieldDesc {
-        name: "time_sec",
-        byte_offset: 12,
-        byte_size: 4,
-        ty: BuiltinFieldType::F32,
-    },
-    BuiltinFieldDesc {
-        name: "inv_view_proj",
-        byte_offset: 16,
-        byte_size: 64,
-        ty: BuiltinFieldType::Mat4,
-    },
-    BuiltinFieldDesc {
-        name: "view_proj",
-        byte_offset: 80,
         byte_size: 64,
         ty: BuiltinFieldType::Mat4,
     },
     BuiltinFieldDesc {
         name: "prev_view_proj",
-        byte_offset: 144,
+        byte_offset: 64,
         byte_size: 64,
         ty: BuiltinFieldType::Mat4,
     },
     BuiltinFieldDesc {
-        name: "camera_pos",
-        byte_offset: 208,
-        byte_size: 12,
-        ty: BuiltinFieldType::Vec3,
+        name: "inv_proj",
+        byte_offset: 128,
+        byte_size: 64,
+        ty: BuiltinFieldType::Mat4,
     },
     BuiltinFieldDesc {
-        name: "near_plane",
-        byte_offset: 220,
-        byte_size: 4,
-        ty: BuiltinFieldType::F32,
+        name: "inv_view",
+        byte_offset: 192,
+        byte_size: 64,
+        ty: BuiltinFieldType::Mat4,
     },
     BuiltinFieldDesc {
-        name: "sun_dir",
-        byte_offset: 224,
-        byte_size: 12,
-        ty: BuiltinFieldType::Vec3,
-    },
-    BuiltinFieldDesc {
-        name: "far_plane",
-        byte_offset: 236,
-        byte_size: 4,
-        ty: BuiltinFieldType::F32,
-    },
-    BuiltinFieldDesc {
-        name: "sun_color",
-        byte_offset: 240,
-        byte_size: 12,
-        ty: BuiltinFieldType::Vec3,
-    },
-    BuiltinFieldDesc {
-        name: "rain_strength",
-        byte_offset: 252,
-        byte_size: 4,
-        ty: BuiltinFieldType::F32,
-    },
-    BuiltinFieldDesc {
-        name: "sky_zenith",
+        name: "camera_pos_frac",
         byte_offset: 256,
         byte_size: 12,
         ty: BuiltinFieldType::Vec3,
     },
     BuiltinFieldDesc {
-        name: "fog_density",
+        name: "frame_index",
         byte_offset: 268,
         byte_size: 4,
-        ty: BuiltinFieldType::F32,
+        ty: BuiltinFieldType::U32,
     },
     BuiltinFieldDesc {
-        name: "sky_horizon",
+        name: "camera_delta",
         byte_offset: 272,
         byte_size: 12,
         ty: BuiltinFieldType::Vec3,
     },
     BuiltinFieldDesc {
-        name: "exposure",
+        name: "game_time_sec",
         byte_offset: 284,
         byte_size: 4,
         ty: BuiltinFieldType::F32,
     },
     BuiltinFieldDesc {
-        name: "screen_size",
+        name: "sun_dir",
         byte_offset: 288,
-        byte_size: 8,
-        ty: BuiltinFieldType::UVec2,
+        byte_size: 12,
+        ty: BuiltinFieldType::Vec3,
     },
     BuiltinFieldDesc {
-        name: "inv_screen_size",
-        byte_offset: 296,
+        name: "rain",
+        byte_offset: 300,
+        byte_size: 4,
+        ty: BuiltinFieldType::F32,
+    },
+    BuiltinFieldDesc {
+        name: "thunder",
+        byte_offset: 304,
+        byte_size: 4,
+        ty: BuiltinFieldType::F32,
+    },
+    BuiltinFieldDesc {
+        name: "eye_in_fluid",
+        byte_offset: 308,
+        byte_size: 4,
+        ty: BuiltinFieldType::I32,
+    },
+    BuiltinFieldDesc {
+        name: "depth_far",
+        byte_offset: 312,
+        byte_size: 4,
+        ty: BuiltinFieldType::F32,
+    },
+    BuiltinFieldDesc {
+        name: "held_light",
+        byte_offset: 316,
+        byte_size: 4,
+        ty: BuiltinFieldType::F32,
+    },
+    world_pack_param_field(0),
+    world_pack_param_field(1),
+    world_pack_param_field(2),
+    world_pack_param_field(3),
+    world_pack_param_field(4),
+    world_pack_param_field(5),
+    world_pack_param_field(6),
+    world_pack_param_field(7),
+    world_pack_param_field(8),
+    world_pack_param_field(9),
+    world_pack_param_field(10),
+    world_pack_param_field(11),
+    BuiltinFieldDesc {
+        name: "held_light_position",
+        byte_offset: 512,
+        byte_size: 16,
+        ty: BuiltinFieldType::Vec4,
+    },
+    BuiltinFieldDesc {
+        name: "pack_params_bda",
+        byte_offset: 528,
         byte_size: 8,
-        ty: BuiltinFieldType::Vec2,
+        ty: BuiltinFieldType::U64,
+    },
+    BuiltinFieldDesc {
+        name: "pack_params_bda_pad",
+        byte_offset: 536,
+        byte_size: 8,
+        ty: BuiltinFieldType::UVec2,
     },
 ];
 
@@ -176,7 +219,7 @@ pub const WORLD_UBO_LAYOUT: BuiltinStructDesc = BuiltinStructDesc {
     name: "WorldUBO",
     set: Some(DESCRIPTOR_SET_PER_PASS),
     binding: Some(0),
-    total_size: 304,
+    total_size: 544,
     align: 16,
     fields: WORLD_UBO_FIELDS,
 };
@@ -611,22 +654,41 @@ mod tests {
             cursor = field.byte_offset + field.byte_size;
         }
         assert_eq!(cursor, WORLD_UBO_LAYOUT.total_size);
-        assert_eq!(
-            WORLD_UBO_LAYOUT
-                .field("pack_params_bda")
-                .unwrap()
-                .byte_offset,
-            0
-        );
-        assert_eq!(
-            WORLD_UBO_LAYOUT.field("inv_view_proj").unwrap().byte_offset,
-            16
-        );
-        assert_eq!(
-            WORLD_UBO_LAYOUT.field("camera_pos").unwrap().byte_offset,
-            208
-        );
-        assert_eq!(WORLD_UBO_LAYOUT.field("sun_dir").unwrap().byte_offset, 224);
+        assert_eq!(WORLD_UBO_LAYOUT.total_size, 544);
+        assert_eq!(WORLD_UBO_LAYOUT.align, 16);
+        for (name, offset) in [
+            ("cur_view_proj", 0),
+            ("prev_view_proj", 64),
+            ("inv_proj", 128),
+            ("inv_view", 192),
+            ("camera_pos_frac", 256),
+            ("frame_index", 268),
+            ("camera_delta", 272),
+            ("game_time_sec", 284),
+            ("sun_dir", 288),
+            ("rain", 300),
+            ("thunder", 304),
+            ("eye_in_fluid", 308),
+            ("depth_far", 312),
+            ("held_light", 316),
+            ("pack_params", 320),
+            ("held_light_position", 512),
+            ("pack_params_bda", 528),
+            ("pack_params_bda_pad", 536),
+        ] {
+            assert_eq!(
+                WORLD_UBO_LAYOUT.field(name).unwrap().byte_offset,
+                offset,
+                "unexpected offset for `{name}`"
+            );
+        }
+        for (slot, name) in WORLD_PACK_PARAM_FIELD_NAMES.iter().enumerate() {
+            assert_eq!(
+                WORLD_UBO_LAYOUT.field(name).unwrap().byte_offset,
+                WORLD_PACK_PARAMS_OFFSET + slot as u32 * WORLD_PACK_PARAM_SLOT_STRIDE
+            );
+        }
+        assert_eq!(WORLD_PACK_PARAM_FIELD_NAMES.len(), 12);
     }
 
     #[test]
