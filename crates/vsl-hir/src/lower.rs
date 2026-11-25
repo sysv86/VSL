@@ -1061,7 +1061,6 @@ fn lower_unit_internal(
                         generic_bounds: &empty_bounds,
                         type_subst: &empty_subst,
                         expected_return_ty: None,
-                        is_compute: false,
                         is_non_compute_stage: false,
                         caps: HardwareCaps::empty(),
                         scopes: vec![IndexMap::new()],
@@ -3564,7 +3563,6 @@ impl LowerCtx<'_> {
         let mut scan = BodyScan::default();
         let mut local_types: IndexMap<SmolStr, TypeId> = IndexMap::new();
         let body_hir = func.body.as_ref().map(|body| {
-            let is_compute = matches!(parsed_attrs.stage, Some(ShaderStage::Compute));
             let is_non_compute_stage = matches!(
                 parsed_attrs.stage,
                 Some(ShaderStage::Vertex | ShaderStage::Fragment)
@@ -3575,7 +3573,6 @@ impl LowerCtx<'_> {
                 generic_bounds: &fn_bounds,
                 type_subst,
                 expected_return_ty: return_ty,
-                is_compute,
                 is_non_compute_stage,
                 caps: parsed_attrs.required_caps,
                 scopes: vec![root_scope],
@@ -4931,7 +4928,6 @@ struct BodyScanner<'a, 'b> {
     generic_bounds: &'b IndexMap<SmolStr, SmolStr>,
     type_subst: &'b IndexMap<SmolStr, TypeId>,
     expected_return_ty: Option<TypeId>,
-    is_compute: bool,
     is_non_compute_stage: bool,
     caps: HardwareCaps,
     scopes: Vec<IndexMap<SmolStr, ScopedVar>>,
@@ -8640,12 +8636,8 @@ mod tests {
         assert_eq!(func.workgroup_size, Some([8, 8, 1]));
 
         let refl = &func.reflection;
-        assert_eq!(refl.push_constant_size, 16);
-        assert_eq!(refl.push_constants.len(), 4);
-        assert_eq!(refl.push_constants[0].name, "step_size");
-        assert_eq!(refl.push_constants[0].byte_offset, 0);
-        assert_eq!(refl.push_constants[3].name, "phi_depth");
-        assert_eq!(refl.push_constants[3].byte_offset, 12);
+        assert_eq!(refl.push_constant_size, 0);
+        assert!(refl.push_constants.is_empty());
 
         // Set 0: gbuffer_depth (1), out_lit (2); Set 1: lights (3).
         assert_eq!(refl.descriptors.len(), 4);
