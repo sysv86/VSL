@@ -22,7 +22,7 @@ pub fn trace_glossy_reflections(
     let color = if rq.committed_type() == mc::HitType::Triangle {
         let inst = mc::instances[rq.committed_instance_custom_index()];
         let uv = rq.committed_barycentrics();
-        bindless[nonuniform(inst.albedo_slot)].sample_lod(uv, 0.0).rgb
+        bindless[nonuniform(inst.texture_id)].sample_lod(uv, 0.0).rgb
     } else {
         mc::sample_sky(dir)
     };

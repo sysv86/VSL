@@ -1,0 +1,21 @@
+module pack::fog;
+
+import mc::{world};
+
+@stage(compute(8, 8, 1))
+pub fn froxel_march(
+    #[builtin(global_invocation_id)] gid: uvec3,
+    prev_fog: Texture2DArray<f32>,
+    out_fog: RWImage2DArray<rgba16f>,
+    noise: Texture2D<f32>,
+) {
+    let coord = ivec3(i32(gid.x), i32(gid.y), i32(gid.z));
+    let jitter = noise.fetch(ivec2(gid.xy) & ivec2(63, 63), 0).r;
+    let prev = prev_fog.fetch(coord, 0);
+    let sun_boost = mc::param(sun_intensity) * 0.05;
+    let density = clamp(0.02 + mc::world.rain * 0.08 + jitter * 0.01, 0.0, 1.0);
+    let scatter = mc::param(sun_tint) * (sun_boost * density);
+    let cur = vec4(scatter, density);
+    let blended = mix(cur, prev, vec4(0.85));
+    out_fog.store(coord, blended);
+}

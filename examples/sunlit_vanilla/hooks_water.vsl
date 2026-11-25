@@ -1,0 +1,10 @@
+module hooks::water;
+
+import mc::{world};
+
+@hook(water_waves)
+pub fn sunlit_waves(pos: vec3) -> vec3 {
+    let phase = mc::world.wind_phase + pos.x * 0.35 + pos.z * 0.25;
+    let height = sin(phase) * (0.04 + mc::world.rain * 0.03);
+    vec3(pos.x, pos.y + height, pos.z)
+}

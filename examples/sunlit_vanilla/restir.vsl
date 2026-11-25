@@ -52,13 +52,12 @@ pub fn append_active_pixels(
     if count == 0u { return; }
 
     let lane_offset = subgroup_ballot_exclusive_bit_count(mask);
-    let mut base = 0u;
-    if lane_offset == 0u && is_active {
-        base = atomic_add::<Scope::Device, Order::Relaxed>(counter, count);
-    }
-    base = subgroup_broadcast_first(base);
-
     if is_active {
+        let mut base = 0u;
+        if lane_offset == 0u {
+            base = atomic_add::<Scope::Device, Order::Relaxed>(counter, count);
+        }
+        base = subgroup_broadcast_first(base);
         out_list.offset(i64(base + lane_offset)).store(pixel_packed);
     }
 }

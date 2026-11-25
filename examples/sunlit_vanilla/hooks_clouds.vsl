@@ -1,0 +1,12 @@
+module hooks::clouds;
+
+import mc::{world};
+
+@hook(clouds)
+pub fn vanilla_volumetric_clouds(dir: vec3) -> vec4 {
+    let scale = mc::biome_cloud_scale();
+    let elev = clamp(dir.y, 0.0, 1.0);
+    let coverage = clamp((0.35 + mc::world.rain * 0.35) * scale * elev, 0.0, 1.0);
+    let lit = mc::param(sun_tint) * (0.65 + 0.35 * max(dot(dir, mc::world.sun_dir), 0.0));
+    vec4(lit, coverage)
+}

@@ -1,17 +1,10 @@
 module pack::tiled_lighting;
 
+import mc::{world};
 import std::sync::{workgroup_barrier, atomic_add, Scope, Order};
 
 workgroup var s_tile_lights: [u32; 64];
 workgroup var s_tile_count: u32;
-
-#[push_constant, layout(scalar)]
-pub struct AtrousPush {
-    pub step_size: i32,
-    pub phi_color: f32,
-    pub phi_normal: f32,
-    pub phi_depth: f32,
-}
 
 @stage(compute(8, 8, 1))
 pub fn cull_tile_lights(
@@ -23,16 +16,28 @@ pub fn cull_tile_lights(
     if lid == 0u { s_tile_count = 0u; }
     workgroup_barrier();
 
+    let coord = ivec2(gid.xy);
+    let depth = gbuffer_depth.fetch(coord, 0).r;
+    let screen_size = vec2(gbuffer_depth.query_size(0));
+    let pixel_pos = vec2(gid.xy) + vec2(0.5);
+
     for i in (lid..mc::lights.count).step_by(64u) {
         let light = mc::lights.items[i];
-        if distance(vec2(light.position.xy), vec2(gid.xy)) < light.radius {
-            let idx = atomic_add::<Scope::Workgroup, Order::Relaxed>(&s_tile_count, 1u);
-            if idx < 64u { s_tile_lights[idx] = i; }
+        let clip = mc::world.cur_view_proj * vec4(light.position, 1.0);
+        if clip.w > 0.0 {
+            let inv_w = 1.0 / clip.w;
+            let ndc = clip.xy * inv_w;
+            let screen_px = (ndc * 0.5 + vec2(0.5)) * screen_size;
+            let pixel_radius = light.radius * inv_w * screen_size.y * 0.5;
+            if distance(screen_px, pixel_pos) < pixel_radius {
+                let idx = atomic_add::<Scope::Workgroup, Order::Relaxed>(&s_tile_count, 1u);
+                if idx < 64u { s_tile_lights[idx] = i; }
+            }
         }
     }
     workgroup_barrier();
 
     let total = min(s_tile_count, 64u);
-    let color = vec3(f32(total) / 64.0, 0.0, 0.0);
-    out_lit.store(ivec2(gid.xy), vec4(color, 1.0));
+    let heat = if depth < 1.0 { f32(total) / 64.0 } else { 0.0 };
+    out_lit.store(coord, vec4(heat, 0.0, 0.0, 1.0));
 }

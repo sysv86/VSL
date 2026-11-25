@@ -45,10 +45,10 @@ settings {
 }
 
 presets {
-    preset low    (order = 0, tiers: 0..=3, label: "Low")    { pt_max_bounces = 1; custom_rayquery_refl = false; }
-    preset medium (order = 1, tiers: 0..=3, label: "Medium") { pt_max_bounces = 1; custom_rayquery_refl = false; }
-    preset high   (order = 2, tiers: 0..=3, label: "High")   { pt_max_bounces = 2; custom_rayquery_refl = false; }
-    preset ultra  (order = 3, tiers: 2..=3, label: "Ultra")  { pt_max_bounces = 3; custom_rayquery_refl = true;  }
+    preset low    (order = 0, tiers: 0..=3, label: "Low")    { sun_intensity = 2.0;  tone_mapping = pbr_neutral; }
+    preset medium (order = 1, tiers: 0..=3, label: "Medium") { sun_intensity = 2.5;  tone_mapping = aces;        }
+    preset high   (order = 2, tiers: 0..=3, label: "High")   { sun_intensity = 2.75; tone_mapping = agx;         }
+    preset ultra  (order = 3, tiers: 2..=3, label: "Ultra")  { sun_intensity = 3.2;  custom_rayquery_refl = true; }
 }
 
 pipeline extend(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
