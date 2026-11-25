@@ -1172,7 +1172,915 @@ fn lower_unit_internal(
         }
     }
 
+    // Helpers whose parameters are image/texture descriptors have no first-class SSA value in
+    // IR (`IrType::from_hir_type` maps them to `Void`). Expand them monomorphically here so the
+    // caller's descriptor expression becomes the receiver of the inlined image method call.
+    inline_image_param_helpers(&mut module);
+
     (module, diags)
+}
+
+/// Hard cap on recursive expansion of image-parameter helpers. Combined with the active call
+/// stack in [`expand_image_helper`], this keeps cyclic helper call graphs finite.
+const MAX_IMAGE_HELPER_INLINE_DEPTH: usize = 8;
+
+/// Returns `true` for descriptor-backed image/texture types that cannot be passed as ordinary
+/// SSA values and therefore require HIR-level substitution before IR lowering.
+fn is_image_param_type(types: &TypeArena, ty: TypeId) -> bool {
+    matches!(
+        types.get(ty),
+        Type::Texture2D { .. }
+            | Type::Texture2DArray { .. }
+            | Type::Texture3D { .. }
+            | Type::TextureCube { .. }
+            | Type::RwImage2D(_)
+            | Type::RwImage2DArray(_)
+            | Type::RwImage3D(_)
+    )
+}
+
+/// A helper is inlineable when it is private, monomorphic, not an entry point or hook, has a
+/// lowered body, and declares at least one image/texture parameter.
+fn is_inlineable_image_helper(module: &HirModule, func: &HirFunction) -> bool {
+    !func.is_pub
+        && func.generic_params.is_empty()
+        && func.stage.is_none()
+        && func.hook.is_none()
+        && func.body_hir.is_some()
+        && func.params.iter().any(|p| {
+            p.ty.is_some_and(|ty| is_image_param_type(&module.types, ty))
+        })
+}
+
+/// Collects the `SymbolId`s of every formal parameter referenced by `body` and maps each to the
+/// caller's corresponding argument expression. Symbol identity (not spelling) is used so that
+/// locals shadowing a parameter name are never substituted.
+fn collect_param_substitution(
+    module: &HirModule,
+    func: &HirFunction,
+    body: &HirBlock,
+    args: &[HirCallArg],
+    subst: &mut IndexMap<SymbolId, HirExpr>,
+) {
+    let mut by_name: IndexMap<SmolStr, HirExpr> = IndexMap::new();
+    for (idx, param) in func.params.iter().enumerate() {
+        if let Some(arg) = args.get(idx) {
+            by_name.insert(param.name.clone(), arg.value.clone());
+        }
+    }
+    for arg in args {
+        if let Some(name) = &arg.name {
+            by_name.insert(name.clone(), arg.value.clone());
+        }
+    }
+    collect_param_substitution_block(module, body, &by_name, subst);
+}
+
+fn collect_param_substitution_block(
+    module: &HirModule,
+    block: &HirBlock,
+    by_name: &IndexMap<SmolStr, HirExpr>,
+    subst: &mut IndexMap<SymbolId, HirExpr>,
+) {
+    for stmt in &block.stmts {
+        collect_param_substitution_stmt(module, stmt, by_name, subst);
+    }
+    if let Some(tail) = &block.tail_expr {
+        collect_param_substitution_expr(module, tail, by_name, subst);
+    }
+}
+
+fn collect_param_substitution_stmt(
+    module: &HirModule,
+    stmt: &HirStmt,
+    by_name: &IndexMap<SmolStr, HirExpr>,
+    subst: &mut IndexMap<SymbolId, HirExpr>,
+) {
+    match stmt {
+        HirStmt::Let { init, .. } => {
+            if let Some(init) = init {
+                collect_param_substitution_expr(module, init, by_name, subst);
+            }
+        }
+        HirStmt::Return { value, .. } => {
+            if let Some(value) = value {
+                collect_param_substitution_expr(module, value, by_name, subst);
+            }
+        }
+        HirStmt::For { iter, body, .. } => {
+            collect_param_substitution_expr(module, iter, by_name, subst);
+            collect_param_substitution_block(module, body, by_name, subst);
+        }
+        HirStmt::While { cond, body, .. } => {
+            collect_param_substitution_expr(module, cond, by_name, subst);
+            collect_param_substitution_block(module, body, by_name, subst);
+        }
+        HirStmt::Loop { body, .. } => {
+            collect_param_substitution_block(module, body, by_name, subst);
+        }
+        HirStmt::Switch {
+            selector,
+            cases,
+            default,
+            ..
+        } => {
+            collect_param_substitution_expr(module, selector, by_name, subst);
+            for case in cases {
+                collect_param_substitution_block(module, &case.body, by_name, subst);
+            }
+            if let Some(default) = default {
+                collect_param_substitution_block(module, default, by_name, subst);
+            }
+        }
+        HirStmt::Break(_) | HirStmt::Continue(_) => {}
+        HirStmt::Expr { expr, .. } => {
+            collect_param_substitution_expr(module, expr, by_name, subst);
+        }
+    }
+}
+
+fn collect_param_substitution_expr(
+    module: &HirModule,
+    expr: &HirExpr,
+    by_name: &IndexMap<SmolStr, HirExpr>,
+    subst: &mut IndexMap<SymbolId, HirExpr>,
+) {
+    if let Some(sym) = expr.symbol {
+        let info = module.symbol(sym);
+        if info.kind == SymbolKind::Param
+            && let Some(repl) = by_name.get(&info.name)
+        {
+            subst.insert(sym, repl.clone());
+        }
+    }
+    match &expr.kind {
+        HirExprKind::IntLit(_)
+        | HirExprKind::FloatLit(_)
+        | HirExprKind::BoolLit(_)
+        | HirExprKind::StringLit(_)
+        | HirExprKind::NoneLit
+        | HirExprKind::Path { .. } => {}
+        HirExprKind::ArrayLit { elements } => {
+            for element in elements {
+                collect_param_substitution_expr(module, element, by_name, subst);
+            }
+        }
+        HirExprKind::StructLit { fields, .. } => {
+            for (_, field) in fields {
+                collect_param_substitution_expr(module, field, by_name, subst);
+            }
+        }
+        HirExprKind::Unary { operand, .. } => {
+            collect_param_substitution_expr(module, operand, by_name, subst);
+        }
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            collect_param_substitution_expr(module, lhs, by_name, subst);
+            collect_param_substitution_expr(module, rhs, by_name, subst);
+        }
+        HirExprKind::Call { callee, args, .. } => {
+            collect_param_substitution_expr(module, callee, by_name, subst);
+            for arg in args {
+                collect_param_substitution_expr(module, &arg.value, by_name, subst);
+            }
+        }
+        HirExprKind::MethodCall { receiver, args, .. } => {
+            collect_param_substitution_expr(module, receiver, by_name, subst);
+            for arg in args {
+                collect_param_substitution_expr(module, &arg.value, by_name, subst);
+            }
+        }
+        HirExprKind::Field { receiver, .. } => {
+            collect_param_substitution_expr(module, receiver, by_name, subst);
+        }
+        HirExprKind::Index { receiver, index } => {
+            collect_param_substitution_expr(module, receiver, by_name, subst);
+            collect_param_substitution_expr(module, index, by_name, subst);
+        }
+        HirExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_param_substitution_expr(module, cond, by_name, subst);
+            collect_param_substitution_block(module, then_branch, by_name, subst);
+            if let Some(else_branch) = else_branch {
+                collect_param_substitution_expr(module, else_branch, by_name, subst);
+            }
+        }
+        HirExprKind::Block(block) => {
+            collect_param_substitution_block(module, block, by_name, subst);
+        }
+        HirExprKind::Swizzle { base, .. } => {
+            collect_param_substitution_expr(module, base, by_name, subst);
+        }
+    }
+}
+
+fn substitute_block(
+    module: &HirModule,
+    block: &HirBlock,
+    subst: &IndexMap<SymbolId, HirExpr>,
+) -> HirBlock {
+    HirBlock {
+        stmts: block
+            .stmts
+            .iter()
+            .map(|stmt| substitute_stmt(module, stmt, subst))
+            .collect(),
+        tail_expr: block
+            .tail_expr
+            .as_deref()
+            .map(|expr| Box::new(substitute_expr(module, expr, subst))),
+        ty: block.ty,
+        span: block.span,
+    }
+}
+
+fn substitute_stmt(
+    module: &HirModule,
+    stmt: &HirStmt,
+    subst: &IndexMap<SymbolId, HirExpr>,
+) -> HirStmt {
+    match stmt {
+        HirStmt::Let {
+            symbol,
+            is_mut,
+            name,
+            ty,
+            init,
+            span,
+        } => HirStmt::Let {
+            symbol: *symbol,
+            is_mut: *is_mut,
+            name: name.clone(),
+            ty: *ty,
+            init: init
+                .as_ref()
+                .map(|expr| substitute_expr(module, expr, subst)),
+            span: *span,
+        },
+        HirStmt::Return { value, span } => HirStmt::Return {
+            value: value
+                .as_ref()
+                .map(|expr| substitute_expr(module, expr, subst)),
+            span: *span,
+        },
+        HirStmt::For {
+            binding_symbol,
+            binding,
+            binding_ty,
+            iter,
+            body,
+            span,
+        } => HirStmt::For {
+            binding_symbol: *binding_symbol,
+            binding: binding.clone(),
+            binding_ty: *binding_ty,
+            iter: substitute_expr(module, iter, subst),
+            body: substitute_block(module, body, subst),
+            span: *span,
+        },
+        HirStmt::While { cond, body, span } => HirStmt::While {
+            cond: substitute_expr(module, cond, subst),
+            body: substitute_block(module, body, subst),
+            span: *span,
+        },
+        HirStmt::Loop { body, span } => HirStmt::Loop {
+            body: substitute_block(module, body, subst),
+            span: *span,
+        },
+        HirStmt::Switch {
+            selector,
+            cases,
+            default,
+            span,
+        } => HirStmt::Switch {
+            selector: substitute_expr(module, selector, subst),
+            cases: cases
+                .iter()
+                .map(|case| HirSwitchCase {
+                    value: substitute_expr(module, &case.value, subst),
+                    body: substitute_block(module, &case.body, subst),
+                    span: case.span,
+                })
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|block| substitute_block(module, block, subst)),
+            span: *span,
+        },
+        HirStmt::Break(span) => HirStmt::Break(*span),
+        HirStmt::Continue(span) => HirStmt::Continue(*span),
+        HirStmt::Expr {
+            expr,
+            has_semi,
+            span,
+        } => HirStmt::Expr {
+            expr: substitute_expr(module, expr, subst),
+            has_semi: *has_semi,
+            span: *span,
+        },
+    }
+}
+
+fn substitute_expr(
+    module: &HirModule,
+    expr: &HirExpr,
+    subst: &IndexMap<SymbolId, HirExpr>,
+) -> HirExpr {
+    if let Some(sym) = expr.symbol
+        && let Some(repl) = subst.get(&sym)
+    {
+        return repl.clone();
+    }
+    let kind = match &expr.kind {
+        HirExprKind::IntLit(s) => HirExprKind::IntLit(s.clone()),
+        HirExprKind::FloatLit(s) => HirExprKind::FloatLit(s.clone()),
+        HirExprKind::BoolLit(v) => HirExprKind::BoolLit(*v),
+        HirExprKind::StringLit(s) => HirExprKind::StringLit(s.clone()),
+        HirExprKind::NoneLit => HirExprKind::NoneLit,
+        HirExprKind::Path { path, turbofish } => HirExprKind::Path {
+            path: path.clone(),
+            turbofish: turbofish.clone(),
+        },
+        HirExprKind::ArrayLit { elements } => HirExprKind::ArrayLit {
+            elements: elements
+                .iter()
+                .map(|element| substitute_expr(module, element, subst))
+                .collect(),
+        },
+        HirExprKind::StructLit {
+            struct_name,
+            fields,
+        } => HirExprKind::StructLit {
+            struct_name: struct_name.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, expr)| (name.clone(), substitute_expr(module, expr, subst)))
+                .collect(),
+        },
+        HirExprKind::Unary { op, operand } => HirExprKind::Unary {
+            op: *op,
+            operand: Box::new(substitute_expr(module, operand, subst)),
+        },
+        HirExprKind::Binary { op, lhs, rhs } => HirExprKind::Binary {
+            op: *op,
+            lhs: Box::new(substitute_expr(module, lhs, subst)),
+            rhs: Box::new(substitute_expr(module, rhs, subst)),
+        },
+        HirExprKind::Call {
+            callee,
+            resolved_fn,
+            args,
+        } => HirExprKind::Call {
+            callee: Box::new(substitute_expr(module, callee, subst)),
+            resolved_fn: *resolved_fn,
+            args: args
+                .iter()
+                .map(|arg| HirCallArg {
+                    name: arg.name.clone(),
+                    value: substitute_expr(module, &arg.value, subst),
+                    span: arg.span,
+                })
+                .collect(),
+        },
+        HirExprKind::MethodCall {
+            receiver,
+            method,
+            resolved_fn,
+            turbofish,
+            args,
+        } => HirExprKind::MethodCall {
+            receiver: Box::new(substitute_expr(module, receiver, subst)),
+            method: method.clone(),
+            resolved_fn: *resolved_fn,
+            turbofish: turbofish.clone(),
+            args: args
+                .iter()
+                .map(|arg| HirCallArg {
+                    name: arg.name.clone(),
+                    value: substitute_expr(module, &arg.value, subst),
+                    span: arg.span,
+                })
+                .collect(),
+        },
+        HirExprKind::Field {
+            receiver,
+            field,
+            field_index,
+        } => HirExprKind::Field {
+            receiver: Box::new(substitute_expr(module, receiver, subst)),
+            field: field.clone(),
+            field_index: *field_index,
+        },
+        HirExprKind::Index { receiver, index } => HirExprKind::Index {
+            receiver: Box::new(substitute_expr(module, receiver, subst)),
+            index: Box::new(substitute_expr(module, index, subst)),
+        },
+        HirExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => HirExprKind::If {
+            cond: Box::new(substitute_expr(module, cond, subst)),
+            then_branch: substitute_block(module, then_branch, subst),
+            else_branch: else_branch
+                .as_deref()
+                .map(|expr| Box::new(substitute_expr(module, expr, subst))),
+        },
+        HirExprKind::Block(block) => HirExprKind::Block(substitute_block(module, block, subst)),
+        HirExprKind::Swizzle {
+            base,
+            components,
+            is_write,
+        } => HirExprKind::Swizzle {
+            base: Box::new(substitute_expr(module, base, subst)),
+            components: components.clone(),
+            is_write: *is_write,
+        },
+    };
+    HirExpr {
+        kind,
+        ty: expr.ty,
+        symbol: expr.symbol,
+        span: expr.span,
+    }
+}
+
+/// Rewrites every eligible call inside `block` into a `HirExprKind::Block` holding the expanded
+/// callee body. Nested calls are expanded recursively up to [`MAX_IMAGE_HELPER_INLINE_DEPTH`].
+fn inline_block(
+    module: &HirModule,
+    eligible: &IndexSet<HirFnId>,
+    block: &HirBlock,
+    stack: &mut Vec<HirFnId>,
+    depth: usize,
+) -> HirBlock {
+    HirBlock {
+        stmts: block
+            .stmts
+            .iter()
+            .map(|stmt| inline_stmt(module, eligible, stmt, stack, depth))
+            .collect(),
+        tail_expr: block
+            .tail_expr
+            .as_deref()
+            .map(|expr| Box::new(inline_expr(module, eligible, expr, stack, depth))),
+        ty: block.ty,
+        span: block.span,
+    }
+}
+
+fn inline_stmt(
+    module: &HirModule,
+    eligible: &IndexSet<HirFnId>,
+    stmt: &HirStmt,
+    stack: &mut Vec<HirFnId>,
+    depth: usize,
+) -> HirStmt {
+    match stmt {
+        HirStmt::Let {
+            symbol,
+            is_mut,
+            name,
+            ty,
+            init,
+            span,
+        } => HirStmt::Let {
+            symbol: *symbol,
+            is_mut: *is_mut,
+            name: name.clone(),
+            ty: *ty,
+            init: init
+                .as_ref()
+                .map(|expr| inline_expr(module, eligible, expr, stack, depth)),
+            span: *span,
+        },
+        HirStmt::Return { value, span } => HirStmt::Return {
+            value: value
+                .as_ref()
+                .map(|expr| inline_expr(module, eligible, expr, stack, depth)),
+            span: *span,
+        },
+        HirStmt::For {
+            binding_symbol,
+            binding,
+            binding_ty,
+            iter,
+            body,
+            span,
+        } => HirStmt::For {
+            binding_symbol: *binding_symbol,
+            binding: binding.clone(),
+            binding_ty: *binding_ty,
+            iter: inline_expr(module, eligible, iter, stack, depth),
+            body: inline_block(module, eligible, body, stack, depth),
+            span: *span,
+        },
+        HirStmt::While { cond, body, span } => HirStmt::While {
+            cond: inline_expr(module, eligible, cond, stack, depth),
+            body: inline_block(module, eligible, body, stack, depth),
+            span: *span,
+        },
+        HirStmt::Loop { body, span } => HirStmt::Loop {
+            body: inline_block(module, eligible, body, stack, depth),
+            span: *span,
+        },
+        HirStmt::Switch {
+            selector,
+            cases,
+            default,
+            span,
+        } => HirStmt::Switch {
+            selector: inline_expr(module, eligible, selector, stack, depth),
+            cases: cases
+                .iter()
+                .map(|case| HirSwitchCase {
+                    value: inline_expr(module, eligible, &case.value, stack, depth),
+                    body: inline_block(module, eligible, &case.body, stack, depth),
+                    span: case.span,
+                })
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|block| inline_block(module, eligible, block, stack, depth)),
+            span: *span,
+        },
+        HirStmt::Break(span) => HirStmt::Break(*span),
+        HirStmt::Continue(span) => HirStmt::Continue(*span),
+        HirStmt::Expr {
+            expr,
+            has_semi,
+            span,
+        } => HirStmt::Expr {
+            expr: inline_expr(module, eligible, expr, stack, depth),
+            has_semi: *has_semi,
+            span: *span,
+        },
+    }
+}
+
+fn inline_expr(
+    module: &HirModule,
+    eligible: &IndexSet<HirFnId>,
+    expr: &HirExpr,
+    stack: &mut Vec<HirFnId>,
+    depth: usize,
+) -> HirExpr {
+    if let HirExprKind::Call {
+        resolved_fn: Some(fn_id),
+        args,
+        ..
+    } = &expr.kind
+        && eligible.contains(fn_id)
+        && depth < MAX_IMAGE_HELPER_INLINE_DEPTH
+        && !stack.contains(fn_id)
+        && let Some(expanded) = expand_image_helper(module, eligible, *fn_id, args, stack, depth)
+    {
+        return HirExpr {
+            kind: HirExprKind::Block(expanded),
+            ty: expr.ty,
+            symbol: expr.symbol,
+            span: expr.span,
+        };
+    }
+
+    let kind = match &expr.kind {
+        HirExprKind::IntLit(s) => HirExprKind::IntLit(s.clone()),
+        HirExprKind::FloatLit(s) => HirExprKind::FloatLit(s.clone()),
+        HirExprKind::BoolLit(v) => HirExprKind::BoolLit(*v),
+        HirExprKind::StringLit(s) => HirExprKind::StringLit(s.clone()),
+        HirExprKind::NoneLit => HirExprKind::NoneLit,
+        HirExprKind::Path { path, turbofish } => HirExprKind::Path {
+            path: path.clone(),
+            turbofish: turbofish.clone(),
+        },
+        HirExprKind::ArrayLit { elements } => HirExprKind::ArrayLit {
+            elements: elements
+                .iter()
+                .map(|e| inline_expr(module, eligible, e, stack, depth))
+                .collect(),
+        },
+        HirExprKind::StructLit {
+            struct_name,
+            fields,
+        } => HirExprKind::StructLit {
+            struct_name: struct_name.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, e)| (name.clone(), inline_expr(module, eligible, e, stack, depth)))
+                .collect(),
+        },
+        HirExprKind::Unary { op, operand } => HirExprKind::Unary {
+            op: *op,
+            operand: Box::new(inline_expr(module, eligible, operand, stack, depth)),
+        },
+        HirExprKind::Binary { op, lhs, rhs } => HirExprKind::Binary {
+            op: *op,
+            lhs: Box::new(inline_expr(module, eligible, lhs, stack, depth)),
+            rhs: Box::new(inline_expr(module, eligible, rhs, stack, depth)),
+        },
+        HirExprKind::Call {
+            callee,
+            resolved_fn,
+            args,
+        } => HirExprKind::Call {
+            callee: Box::new(inline_expr(module, eligible, callee, stack, depth)),
+            resolved_fn: *resolved_fn,
+            args: args
+                .iter()
+                .map(|arg| HirCallArg {
+                    name: arg.name.clone(),
+                    value: inline_expr(module, eligible, &arg.value, stack, depth),
+                    span: arg.span,
+                })
+                .collect(),
+        },
+        HirExprKind::MethodCall {
+            receiver,
+            method,
+            resolved_fn,
+            turbofish,
+            args,
+        } => HirExprKind::MethodCall {
+            receiver: Box::new(inline_expr(module, eligible, receiver, stack, depth)),
+            method: method.clone(),
+            resolved_fn: *resolved_fn,
+            turbofish: turbofish.clone(),
+            args: args
+                .iter()
+                .map(|arg| HirCallArg {
+                    name: arg.name.clone(),
+                    value: inline_expr(module, eligible, &arg.value, stack, depth),
+                    span: arg.span,
+                })
+                .collect(),
+        },
+        HirExprKind::Field {
+            receiver,
+            field,
+            field_index,
+        } => HirExprKind::Field {
+            receiver: Box::new(inline_expr(module, eligible, receiver, stack, depth)),
+            field: field.clone(),
+            field_index: *field_index,
+        },
+        HirExprKind::Index { receiver, index } => HirExprKind::Index {
+            receiver: Box::new(inline_expr(module, eligible, receiver, stack, depth)),
+            index: Box::new(inline_expr(module, eligible, index, stack, depth)),
+        },
+        HirExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => HirExprKind::If {
+            cond: Box::new(inline_expr(module, eligible, cond, stack, depth)),
+            then_branch: inline_block(module, eligible, then_branch, stack, depth),
+            else_branch: else_branch
+                .as_deref()
+                .map(|e| Box::new(inline_expr(module, eligible, e, stack, depth))),
+        },
+        HirExprKind::Block(block) => {
+            HirExprKind::Block(inline_block(module, eligible, block, stack, depth))
+        }
+        HirExprKind::Swizzle {
+            base,
+            components,
+            is_write,
+        } => HirExprKind::Swizzle {
+            base: Box::new(inline_expr(module, eligible, base, stack, depth)),
+            components: components.clone(),
+            is_write: *is_write,
+        },
+    };
+    HirExpr {
+        kind,
+        ty: expr.ty,
+        symbol: expr.symbol,
+        span: expr.span,
+    }
+}
+
+fn expand_image_helper(
+    module: &HirModule,
+    eligible: &IndexSet<HirFnId>,
+    fn_id: HirFnId,
+    args: &[HirCallArg],
+    stack: &mut Vec<HirFnId>,
+    depth: usize,
+) -> Option<HirBlock> {
+    let func = &module.functions[fn_id];
+    let original = func.body_hir.as_ref()?;
+
+    // Capture formal-parameter symbols before recursion: the recursively expanded body may
+    // contain other inlined helpers whose parameters share the same spelling but different ids.
+    let mut subst = IndexMap::new();
+    collect_param_substitution(module, func, original, args, &mut subst);
+
+    stack.push(fn_id);
+    let expanded = inline_block(module, eligible, original, stack, depth + 1);
+    stack.pop();
+
+    let mut substituted = substitute_block(module, &expanded, &subst);
+    // A trailing `return expr` is the block's value once the call frame disappears. Conditional
+    // early returns remain `HirStmt::Return` and exit the caller, matching inline semantics.
+    if func.return_ty.is_some()
+        && let Some(HirStmt::Return {
+            value: Some(value), ..
+        }) = substituted.stmts.last()
+    {
+        let value = value.clone();
+        substituted.stmts.pop();
+        substituted.tail_expr = Some(Box::new(value));
+    }
+    Some(substituted)
+}
+
+/// Records candidate helpers still referenced by a body. Any such helper must keep its HIR body
+/// because a cyclic or depth-capped expansion leaves the original `FunctionCall` in place.
+fn collect_remaining_calls_block(
+    block: &HirBlock,
+    candidates: &IndexSet<HirFnId>,
+    found: &mut IndexSet<HirFnId>,
+) {
+    for stmt in &block.stmts {
+        collect_remaining_calls_stmt(stmt, candidates, found);
+    }
+    if let Some(tail) = &block.tail_expr {
+        collect_remaining_calls_expr(tail, candidates, found);
+    }
+}
+
+fn collect_remaining_calls_stmt(
+    stmt: &HirStmt,
+    candidates: &IndexSet<HirFnId>,
+    found: &mut IndexSet<HirFnId>,
+) {
+    match stmt {
+        HirStmt::Let { init, .. } => {
+            if let Some(init) = init {
+                collect_remaining_calls_expr(init, candidates, found);
+            }
+        }
+        HirStmt::Return { value, .. } => {
+            if let Some(value) = value {
+                collect_remaining_calls_expr(value, candidates, found);
+            }
+        }
+        HirStmt::For { iter, body, .. } => {
+            collect_remaining_calls_expr(iter, candidates, found);
+            collect_remaining_calls_block(body, candidates, found);
+        }
+        HirStmt::While { cond, body, .. } => {
+            collect_remaining_calls_expr(cond, candidates, found);
+            collect_remaining_calls_block(body, candidates, found);
+        }
+        HirStmt::Loop { body, .. } => collect_remaining_calls_block(body, candidates, found),
+        HirStmt::Switch {
+            selector,
+            cases,
+            default,
+            ..
+        } => {
+            collect_remaining_calls_expr(selector, candidates, found);
+            for case in cases {
+                collect_remaining_calls_block(&case.body, candidates, found);
+            }
+            if let Some(default) = default {
+                collect_remaining_calls_block(default, candidates, found);
+            }
+        }
+        HirStmt::Break(_) | HirStmt::Continue(_) => {}
+        HirStmt::Expr { expr, .. } => collect_remaining_calls_expr(expr, candidates, found),
+    }
+}
+
+fn collect_remaining_calls_expr(
+    expr: &HirExpr,
+    candidates: &IndexSet<HirFnId>,
+    found: &mut IndexSet<HirFnId>,
+) {
+    if let HirExprKind::Call {
+        resolved_fn: Some(fn_id),
+        ..
+    } = &expr.kind
+        && candidates.contains(fn_id)
+    {
+        found.insert(*fn_id);
+    }
+    match &expr.kind {
+        HirExprKind::ArrayLit { elements } => {
+            for element in elements {
+                collect_remaining_calls_expr(element, candidates, found);
+            }
+        }
+        HirExprKind::StructLit { fields, .. } => {
+            for (_, field) in fields {
+                collect_remaining_calls_expr(field, candidates, found);
+            }
+        }
+        HirExprKind::Unary { operand, .. } | HirExprKind::Swizzle { base: operand, .. } => {
+            collect_remaining_calls_expr(operand, candidates, found);
+        }
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            collect_remaining_calls_expr(lhs, candidates, found);
+            collect_remaining_calls_expr(rhs, candidates, found);
+        }
+        HirExprKind::Call { callee, args, .. } => {
+            collect_remaining_calls_expr(callee, candidates, found);
+            for arg in args {
+                collect_remaining_calls_expr(&arg.value, candidates, found);
+            }
+        }
+        HirExprKind::MethodCall { receiver, args, .. } => {
+            collect_remaining_calls_expr(receiver, candidates, found);
+            for arg in args {
+                collect_remaining_calls_expr(&arg.value, candidates, found);
+            }
+        }
+        HirExprKind::Field { receiver, .. } => {
+            collect_remaining_calls_expr(receiver, candidates, found);
+        }
+        HirExprKind::Index { receiver, index } => {
+            collect_remaining_calls_expr(receiver, candidates, found);
+            collect_remaining_calls_expr(index, candidates, found);
+        }
+        HirExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_remaining_calls_expr(cond, candidates, found);
+            collect_remaining_calls_block(then_branch, candidates, found);
+            if let Some(else_branch) = else_branch {
+                collect_remaining_calls_expr(else_branch, candidates, found);
+            }
+        }
+        HirExprKind::Block(block) => collect_remaining_calls_block(block, candidates, found),
+        HirExprKind::IntLit(_)
+        | HirExprKind::FloatLit(_)
+        | HirExprKind::BoolLit(_)
+        | HirExprKind::StringLit(_)
+        | HirExprKind::NoneLit
+        | HirExprKind::Path { .. } => {}
+    }
+}
+
+/// Expands every private monomorphic helper that takes an image/texture parameter into its call
+/// sites, then drops the bodies of helpers that are no longer referenced. Helpers left referenced
+/// by a cycle or by the depth cap keep their original bodies so IR lowering still reports the
+/// same diagnostics as before rather than calling a function without a body.
+fn inline_image_param_helpers(module: &mut HirModule) {
+    let candidates: IndexSet<HirFnId> = module
+        .functions
+        .iter()
+        .filter(|(_, func)| is_inlineable_image_helper(module, func))
+        .map(|(id, _)| id)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+
+    let all_ids: Vec<HirFnId> = module.functions.iter().map(|(id, _)| id).collect();
+    for fn_id in &all_ids {
+        if candidates.contains(fn_id) {
+            continue;
+        }
+        let Some(body) = module.functions[*fn_id].body_hir.clone() else {
+            continue;
+        };
+        let expanded = inline_block(module, &candidates, &body, &mut Vec::new(), 0);
+        module.functions[*fn_id].body_hir = Some(expanded);
+    }
+
+    // A kept body may call another candidate whose body was not expanded (cyclic helpers are
+    // never expanded), so keep that candidate too and repeat until the set stabilizes.
+    let mut droppable = candidates.clone();
+    loop {
+        let mut referenced = IndexSet::new();
+        for (fn_id, func) in module.functions.iter() {
+            if droppable.contains(&fn_id) {
+                continue;
+            }
+            if let Some(body) = &func.body_hir {
+                collect_remaining_calls_block(body, &droppable, &mut referenced);
+            }
+        }
+        if referenced.is_empty() {
+            break;
+        }
+        let before = droppable.len();
+        for fn_id in referenced {
+            droppable.shift_remove(&fn_id);
+        }
+        if droppable.len() == before {
+            break;
+        }
+    }
+
+    for fn_id in droppable {
+        module.functions[fn_id].body_hir = None;
+    }
 }
 
 #[derive(Default)]

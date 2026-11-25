@@ -5249,3 +5249,121 @@ fn extract_const_range_bounds_hir(
     );
     (trip, Some(init))
 }
+
+#[cfg(test)]
+mod image_param_inline_tests {
+    use crate::{CompileOptions, VslCompiler};
+    use std::process::Command;
+    use vsl_mc::RenderTier;
+
+    /// Runs `spirv-val --target-env vulkan1.3` when available, mirroring the workspace tests.
+    fn validate_spirv(label: &str, words: &[u32]) {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let path =
+            std::env::temp_dir().join(format!("vsl_img_param_{label}_{}.spv", std::process::id()));
+        std::fs::write(&path, &bytes).expect("write temporary SPIR-V");
+        let output = Command::new("spirv-val")
+            .arg("--target-env")
+            .arg("vulkan1.3")
+            .arg(&path)
+            .output();
+        let _ = std::fs::remove_file(&path);
+        match output {
+            Ok(out) => assert!(
+                out.status.success(),
+                "spirv-val failed for `{label}`:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("failed to invoke spirv-val: {err}"),
+        }
+    }
+
+    const IMAGE_PARAM_SRC: &str = r"
+        module pack::image_param_inline;
+
+        import mc::world;
+
+        fn sample_depth(depth_tex: Texture2D<f32>, coord: ivec2) -> f32 {
+            depth_tex.fetch(coord, 0).r
+        }
+
+        fn shade_depth(depth_tex: Texture2D<f32>, coord: ivec2) -> vec4<f32> {
+            let d = sample_depth(depth_tex, coord);
+            return vec4(d, d, d, 1.0);
+        }
+
+        fn write_color(dst_img: RWImage2D<rgba16f>, coord: ivec2, color: vec4<f32>) {
+            dst_img.store(coord, color);
+        }
+
+        @stage(compute(8, 8, 1))
+        pub fn main_cs(
+            #[builtin(global_invocation_id)] gid: uvec3,
+            gbuffer_depth: Texture2D<f32>,
+            out_img: RWImage2D<rgba16f>,
+        ) {
+            let coord = ivec2(gid.xy);
+            let color = shade_depth(gbuffer_depth, coord);
+            write_color(out_img, coord, color);
+        }
+    ";
+
+    #[test]
+    fn helpers_taking_texture2d_and_rwimage2d_compile_to_valid_spirv() {
+        let mut compiler = VslCompiler::new();
+        let out = compiler.compile_shader_source(
+            "image_param_inline.vsl",
+            IMAGE_PARAM_SRC,
+            &CompileOptions::for_tier(RenderTier::Tier2RayQuery),
+        );
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        let unit = &out.units[0];
+        assert_eq!(unit.entry_point, "main_cs");
+        assert_eq!(unit.spirv[0], 0x0723_0203);
+
+        // Descriptor substitution must not add extra bindings: world + depth + output only.
+        assert_eq!(unit.descriptors.len(), 3);
+        let names: Vec<_> = unit.descriptors.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"world"));
+        assert!(names.contains(&"gbuffer_depth"));
+        assert!(names.contains(&"out_img"));
+
+        validate_spirv("image_param_inline", &unit.spirv);
+    }
+
+    #[test]
+    fn cyclic_image_param_helper_keeps_original_lowering_behavior() {
+        let src = r"
+            module pack::img_param_cycle;
+
+            import mc::world;
+
+            fn recurse(tex: Texture2D<f32>, coord: ivec2, n: i32) -> f32 {
+                if n > 0 {
+                    return recurse(tex, coord, n - 1);
+                }
+                tex.fetch(coord, 0).r
+            }
+
+            @stage(compute(8, 8, 1))
+            pub fn main_cs(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                depth: Texture2D<f32>,
+            ) {
+                let v = recurse(depth, ivec2(gid.xy), 2);
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let out = compiler.compile_shader_source(
+            "img_param_cycle.vsl",
+            src,
+            &CompileOptions::for_tier(RenderTier::Tier2RayQuery),
+        );
+        // The cycle cannot be inlined; lowering must report diagnostics rather than emit a
+        // call to a helper whose body was dropped.
+        assert!(out.has_errors());
+        assert!(out.units.is_empty());
+    }
+}
