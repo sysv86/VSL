@@ -3,8 +3,11 @@ use smol_str::SmolStr;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use vsl_mc::{
-    BINDLESS_IMAGE_COUNT, DESCRIPTOR_SET_BINDLESS, DESCRIPTOR_SET_PER_PASS,
-    DESCRIPTOR_SET_SCENE_GLOBALS, ImageFormat,
+    BINDLESS_IMAGE_COUNT, BuiltinFieldType, BuiltinStructDesc, DESCRIPTOR_SET_BINDLESS,
+    DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS, DESCRIPTOR_SET_SCENE_GLOBALS,
+    EMISSIVE_LIGHT_LAYOUT, EMISSIVE_LIGHT_SSBO_LAYOUT, INSTANCE_META_LAYOUT, ImageFormat,
+    RESTIR_RESERVOIR_LAYOUT, RESTIR_RESERVOIR_SSBO_LAYOUT, SHARC_CONFIG_UBO_LAYOUT,
+    WORLD_UBO_LAYOUT,
 };
 use vsl_syntax::ast::{
     Attribute, BinaryOp, Block, CallArg, ConstDecl, Expr, FnDecl, FnParam, GenericParam, Ident,
@@ -12,12 +15,56 @@ use vsl_syntax::ast::{
     TypeExpr, UnaryOp, WorkgroupVarDecl,
 };
 
+/// Maximum Set 0 binding reserved for per-pass targets before optional fallback sampler slots.
+const MAX_PASS_TARGET_BINDING: u32 = 14;
+
+/// Set 2 bindless descriptor ABI variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BindlessAbi {
+    /// Hyaloclast engine ABI: `sampler2D bindless[4096]` combined image-sampler array.
+    #[default]
+    Hyaloclast4096,
+    /// Upstream VSL ABI: unsized `texture2D bindless[]` separated texture array.
+    UpstreamUnsized,
+}
+
 /// Lowering options controlling GLSL 460 oracle vs. raster G-Buffer hook bridge behavior.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct EmitOptions {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EmitOptions {
     /// When `true`, rewrites pack `param` reads to `VsMotion.packParams.<key>` for
     /// `HookAbiRoute::RasterGbufferGlslBridge` slots.
     pub route_params_to_vs_motion: bool,
+    /// Controls whether Set 2 binding 0 emits Hyaloclast's `sampler2D bindless[4096]`
+    /// or upstream VSL's unsized `texture2D bindless[]`.
+    pub bindless_abi: BindlessAbi,
+}
+
+/// Memory layout mode declared on a struct or buffer block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LayoutMode {
+    #[default]
+    Scalar,
+    Std430,
+    Std140,
+}
+
+impl LayoutMode {
+    pub(crate) const fn as_glsl(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Std430 => "std430",
+            Self::Std140 => "std140",
+        }
+    }
+
+    pub(crate) fn from_attr_str(s: &str) -> Option<Self> {
+        match s {
+            "scalar" => Some(Self::Scalar),
+            "std430" => Some(Self::Std430),
+            "std140" => Some(Self::Std140),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,7 +112,9 @@ pub(crate) struct FeatureScan {
     pub generic_instantiations: IndexSet<MonomorphKey>,
     pub uses_tlas: bool,
     pub uses_instances: bool,
+    pub uses_sharc_config: bool,
     pub uses_lights: bool,
+    pub uses_restir_reservoir: bool,
     pub uses_bindless: bool,
     pub uses_sampled_textures: bool,
     pub imported_mc_world: bool,
@@ -77,11 +126,15 @@ pub(crate) struct FeatureScan {
 }
 
 /// Scoped emission context tracking local/parameter GLSL types, BDA metadata, and struct layouts.
+#[derive(Clone)]
 pub(crate) struct EmitCtx {
     pub opts: EmitOptions,
     pub local_types: IndexMap<SmolStr, String>,
     pub bda_types: IndexMap<String, BdaRefKey>,
     pub struct_fields: IndexMap<SmolStr, IndexMap<SmolStr, String>>,
+    pub struct_field_dims: IndexMap<SmolStr, IndexMap<SmolStr, Vec<u64>>>,
+    pub struct_layouts: IndexMap<SmolStr, LayoutMode>,
+    pub push_constant_instances: IndexMap<SmolStr, String>,
     pub generic_structs: IndexMap<SmolStr, GenericStructMeta>,
     pub fn_returns: IndexMap<SmolStr, String>,
     pub generic_subst: IndexMap<SmolStr, String>,
@@ -98,6 +151,9 @@ impl EmitCtx {
             local_types: IndexMap::new(),
             bda_types: IndexMap::new(),
             struct_fields: IndexMap::new(),
+            struct_field_dims: IndexMap::new(),
+            struct_layouts: IndexMap::new(),
+            push_constant_instances: IndexMap::new(),
             generic_structs: IndexMap::new(),
             fn_returns: IndexMap::new(),
             generic_subst: IndexMap::new(),
@@ -141,34 +197,29 @@ pub(crate) fn escape_glsl_ident(name: &str) -> String {
 /// - `trait` / `impl` blocks to mangled GLSL helper functions
 /// - VSL 2.0 statements, structured loops, `switch`, struct literals, and expressions into clean GLSL 460
 pub fn emit_glsl_460(unit: &SourceUnit) -> String {
+    emit_glsl_460_with_options(unit, EmitOptions::default())
+}
+
+/// Emits a Stage A GLSL 460 oracle shader source string with explicit [`EmitOptions`].
+pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> String {
     let mut scan = FeatureScan {
         generic_instantiations: collect_generic_instantiations(unit),
         ..FeatureScan::default()
     };
-    scan_unit(unit, &mut scan);
-    // WorldUBO is emitted for every entry point and uses scalar block layout.
-    scan.extensions.insert("GL_EXT_scalar_block_layout");
+    scan_unit_with_options(unit, opts, &mut scan);
+    // Canonical `WorldUBO` carries `uint64_t pack_params_bda` for every entry point.
+    scan.extensions
+        .insert("GL_EXT_shader_explicit_arithmetic_types_int64");
 
-    let mut out = String::with_capacity(2048);
-    out.push_str("#version 460 core\n");
-
-    for ext in &scan.extensions {
-        let _ = writeln!(out, "#extension {ext} : require");
-    }
-
-    if let Some(ref module_decl) = unit.module_decl {
-        let _ = writeln!(out, "// module {}", module_decl.path.joined());
-    }
-    out.push('\n');
-
-    let mut ctx = EmitCtx::new(EmitOptions::default());
+    let mut ctx = EmitCtx::new(opts);
     ctx.imported_mc_world = scan.imported_mc_world;
     for bda in &scan.bda_refs {
         ctx.bda_types.insert(bda.type_name(), bda.clone());
     }
     seed_mc_builtin_types(&mut ctx);
 
-    // Pre-collect struct field types, generic struct metadata, constants, workgroup vars, and function return types.
+    // Pre-collect struct field types, dimensions, layouts, generic struct metadata,
+    // push-constant instance names, constants, workgroup vars, and function return types.
     for item in &unit.items {
         match item {
             Item::Const(c) => {
@@ -180,12 +231,22 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
                     .insert(w.name.name.clone(), type_to_glsl(&w.ty).0);
             }
             Item::Struct(s) => {
+                let layout_mode = extract_layout_attr(&s.attrs)
+                    .and_then(LayoutMode::from_attr_str)
+                    .unwrap_or(LayoutMode::Scalar);
                 if s.generics.is_empty() {
                     let mut fields = IndexMap::new();
+                    let mut dims = IndexMap::new();
                     for f in &s.fields {
                         fields.insert(f.name.name.clone(), type_to_glsl(&f.ty).0);
+                        let field_dims = extract_array_dims(&f.ty);
+                        if !field_dims.is_empty() {
+                            dims.insert(f.name.name.clone(), field_dims);
+                        }
                     }
                     ctx.struct_fields.insert(s.name.name.clone(), fields);
+                    ctx.struct_field_dims.insert(s.name.name.clone(), dims);
+                    ctx.struct_layouts.insert(s.name.name.clone(), layout_mode);
                 } else {
                     let generic_params: Vec<SmolStr> =
                         s.generics.iter().map(|g| g.name.name.clone()).collect();
@@ -218,20 +279,38 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
                             subst.insert(g.name.name.clone(), concrete.clone());
                         }
                         let mut fields = IndexMap::new();
+                        let mut dims = IndexMap::new();
                         for f in &s.fields {
                             fields.insert(
                                 f.name.name.clone(),
                                 type_to_glsl_with_subst(&f.ty, &subst).0,
                             );
+                            let field_dims = extract_array_dims(&f.ty);
+                            if !field_dims.is_empty() {
+                                dims.insert(f.name.name.clone(), field_dims);
+                            }
                         }
-                        ctx.struct_fields
-                            .insert(SmolStr::new(key.mangled_name()), fields);
+                        let mangled = SmolStr::new(key.mangled_name());
+                        ctx.struct_fields.insert(mangled.clone(), fields);
+                        ctx.struct_field_dims.insert(mangled.clone(), dims);
+                        ctx.struct_layouts.insert(mangled, layout_mode);
                     }
                 }
             }
             Item::Function(f) => {
                 ctx.fn_returns
                     .insert(f.name.name.clone(), fn_return_glsl_type(f));
+                if extract_entry_stage(&f.attrs).is_some() {
+                    for p in &f.params {
+                        if has_attr(&p.attrs, "push_constant")
+                            && let Some(ref ty) = p.ty
+                        {
+                            let ty_name = type_to_glsl(ty).0;
+                            ctx.push_constant_instances
+                                .insert(SmolStr::new(ty_name), escape_glsl_ident(&p.name.name));
+                        }
+                    }
+                }
             }
             Item::Impl(imp) => {
                 if imp.generics.is_empty() {
@@ -272,8 +351,32 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
         }
     }
 
+    // Require `GL_EXT_scalar_block_layout` when any BDA reference uses `scalar` layout.
+    for bda in &scan.bda_refs {
+        let layout = ctx
+            .struct_layouts
+            .get(bda.elem_glsl.as_str())
+            .copied()
+            .unwrap_or(LayoutMode::Scalar);
+        if layout == LayoutMode::Scalar {
+            scan.extensions.insert("GL_EXT_scalar_block_layout");
+        }
+    }
+
+    let mut out = String::with_capacity(2048);
+    out.push_str("#version 460 core\n");
+
+    for ext in &scan.extensions {
+        let _ = writeln!(out, "#extension {ext} : require");
+    }
+
+    if let Some(ref module_decl) = unit.module_decl {
+        let _ = writeln!(out, "// module {}", module_decl.path.joined());
+    }
+    out.push('\n');
+
     // 0. Global `mc::*` scene & bindless resource declarations.
-    emit_mc_global_decls(&scan, &mut out);
+    emit_mc_global_decls(&scan, opts, &mut out);
 
     // 1. Constants.
     for item in &unit.items {
@@ -305,9 +408,15 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
         } else {
             "readonly buffer"
         };
+        let layout_qual = ctx
+            .struct_layouts
+            .get(bda.elem_glsl.as_str())
+            .copied()
+            .unwrap_or(LayoutMode::Scalar)
+            .as_glsl();
         let _ = writeln!(
             out,
-            "layout(buffer_reference, scalar, buffer_reference_align = {}) {qualifier} {} {{",
+            "layout(buffer_reference, {layout_qual}, buffer_reference_align = {}) {qualifier} {} {{",
             bda.align,
             bda.type_name()
         );
@@ -354,36 +463,51 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
     out
 }
 
-fn seed_mc_builtin_types(ctx: &mut EmitCtx) {
-    let mut inst_fields = IndexMap::new();
-    inst_fields.insert(SmolStr::new_static("albedo_slot"), "uint".to_owned());
-    inst_fields.insert(SmolStr::new_static("normal_slot"), "uint".to_owned());
-    inst_fields.insert(SmolStr::new_static("material_slot"), "uint".to_owned());
-    inst_fields.insert(SmolStr::new_static("flags"), "uint".to_owned());
-    ctx.struct_fields
-        .insert(SmolStr::new_static("InstanceMeta"), inst_fields);
+fn builtin_field_glsl_type(ty: BuiltinFieldType) -> (String, &'static str) {
+    match ty {
+        BuiltinFieldType::Bool => ("bool".to_owned(), ""),
+        BuiltinFieldType::I32 => ("int".to_owned(), ""),
+        BuiltinFieldType::U32 => ("uint".to_owned(), ""),
+        BuiltinFieldType::I64 => ("int64_t".to_owned(), ""),
+        BuiltinFieldType::U64 => ("uint64_t".to_owned(), ""),
+        BuiltinFieldType::F32 => ("float".to_owned(), ""),
+        BuiltinFieldType::Vec2 => ("vec2".to_owned(), ""),
+        BuiltinFieldType::Vec3 => ("vec3".to_owned(), ""),
+        BuiltinFieldType::Vec4 => ("vec4".to_owned(), ""),
+        BuiltinFieldType::UVec2 => ("uvec2".to_owned(), ""),
+        BuiltinFieldType::UVec3 => ("uvec3".to_owned(), ""),
+        BuiltinFieldType::UVec4 => ("uvec4".to_owned(), ""),
+        BuiltinFieldType::Mat4 => ("mat4".to_owned(), ""),
+        BuiltinFieldType::RuntimeArrayStruct(elem) => (elem.to_owned(), "[]"),
+    }
+}
 
-    let mut light_fields = IndexMap::new();
-    light_fields.insert(SmolStr::new_static("position_radius"), "vec4".to_owned());
-    light_fields.insert(SmolStr::new_static("color_intensity"), "vec4".to_owned());
-    ctx.struct_fields
-        .insert(SmolStr::new_static("EmissiveLight"), light_fields);
+fn seed_builtin_struct(desc: &BuiltinStructDesc, layout: LayoutMode, ctx: &mut EmitCtx) {
+    let mut fields = IndexMap::new();
+    for field in desc.fields {
+        let (glsl_ty, _) = builtin_field_glsl_type(field.ty);
+        fields.insert(SmolStr::new(field.name), glsl_ty);
+    }
+    let name = SmolStr::new(desc.name);
+    ctx.struct_fields.insert(name.clone(), fields);
+    ctx.struct_layouts.insert(name, layout);
+}
 
-    let mut lights_ssbo = IndexMap::new();
-    lights_ssbo.insert(SmolStr::new_static("count"), "uint".to_owned());
-    lights_ssbo.insert(SmolStr::new_static("items"), "EmissiveLight".to_owned());
-    ctx.struct_fields
-        .insert(SmolStr::new_static("EmissiveLightSSBO"), lights_ssbo);
+fn emit_builtin_fields(desc: &BuiltinStructDesc, out: &mut String) {
+    for field in desc.fields {
+        let (glsl_ty, suffix) = builtin_field_glsl_type(field.ty);
+        let _ = writeln!(out, "    {glsl_ty} {}{suffix};", field.name);
+    }
+}
 
-    let mut world_fields = IndexMap::new();
-    world_fields.insert(SmolStr::new_static("view_proj"), "mat4".to_owned());
-    world_fields.insert(SmolStr::new_static("inv_view_proj"), "mat4".to_owned());
-    world_fields.insert(SmolStr::new_static("camera_pos"), "vec4".to_owned());
-    world_fields.insert(SmolStr::new_static("sun_dir"), "vec4".to_owned());
-    world_fields.insert(SmolStr::new_static("time"), "float".to_owned());
-    world_fields.insert(SmolStr::new_static("frame_index"), "uint".to_owned());
-    ctx.struct_fields
-        .insert(SmolStr::new_static("WorldUBO"), world_fields);
+pub(crate) fn seed_mc_builtin_types(ctx: &mut EmitCtx) {
+    seed_builtin_struct(&WORLD_UBO_LAYOUT, LayoutMode::Std140, ctx);
+    seed_builtin_struct(&INSTANCE_META_LAYOUT, LayoutMode::Std430, ctx);
+    seed_builtin_struct(&SHARC_CONFIG_UBO_LAYOUT, LayoutMode::Std140, ctx);
+    seed_builtin_struct(&EMISSIVE_LIGHT_LAYOUT, LayoutMode::Std430, ctx);
+    seed_builtin_struct(&EMISSIVE_LIGHT_SSBO_LAYOUT, LayoutMode::Std430, ctx);
+    seed_builtin_struct(&RESTIR_RESERVOIR_LAYOUT, LayoutMode::Std430, ctx);
+    seed_builtin_struct(&RESTIR_RESERVOIR_SSBO_LAYOUT, LayoutMode::Std430, ctx);
 
     ctx.local_types
         .insert(SmolStr::new_static("mc_world"), "WorldUBO".to_owned());
@@ -402,28 +526,38 @@ fn seed_mc_builtin_types(ctx: &mut EmitCtx) {
         "InstanceMeta".to_owned(),
     );
     ctx.local_types.insert(
+        SmolStr::new_static("mc_sharc_config"),
+        "SharcConfigUBO".to_owned(),
+    );
+    ctx.local_types.insert(
         SmolStr::new_static("mc_lights"),
         "EmissiveLightSSBO".to_owned(),
     );
+    ctx.local_types.insert(
+        SmolStr::new_static("mc_restir_reservoir"),
+        "RestirReservoirSSBO".to_owned(),
+    );
+    let bindless_ty = match ctx.opts.bindless_abi {
+        BindlessAbi::Hyaloclast4096 => "sampler2D",
+        BindlessAbi::UpstreamUnsized => "texture2D",
+    };
     ctx.local_types
-        .insert(SmolStr::new_static("bindless"), "sampler2D".to_owned());
+        .insert(SmolStr::new_static("bindless"), bindless_ty.to_owned());
     ctx.local_types
-        .insert(SmolStr::new_static("mc_bindless"), "sampler2D".to_owned());
+        .insert(SmolStr::new_static("mc_bindless"), bindless_ty.to_owned());
 }
 
-fn emit_mc_global_decls(scan: &FeatureScan, out: &mut String) {
-    // Set 0, binding 0: WorldUBO is part of the engine ABI for every entry point.
+fn emit_mc_global_decls(scan: &FeatureScan, opts: EmitOptions, out: &mut String) {
+    // Set 0, binding 0: Canonical `WorldUBO` (`std140`, 544 bytes) from `vsl_mc::layouts`.
     let mut emitted_any = true;
+    let world_set = WORLD_UBO_LAYOUT.set.unwrap_or(DESCRIPTOR_SET_PER_PASS);
+    let world_binding = WORLD_UBO_LAYOUT.binding.unwrap_or(0);
     let _ = writeln!(
         out,
-        "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = 0, scalar) uniform WorldUBO {{"
+        "layout(set = {world_set}, binding = {world_binding}, std140) uniform {} {{",
+        WORLD_UBO_LAYOUT.name
     );
-    out.push_str("    mat4 view_proj;\n");
-    out.push_str("    mat4 inv_view_proj;\n");
-    out.push_str("    vec4 camera_pos;\n");
-    out.push_str("    vec4 sun_dir;\n");
-    out.push_str("    float time;\n");
-    out.push_str("    uint frame_index;\n");
+    emit_builtin_fields(&WORLD_UBO_LAYOUT, out);
     out.push_str("} mc_world;\n\n");
     // Set 0, ascending bindings after pass resource parameters: debug output images from `mc::debug_write(...)`.
     let mut next_free_binding = scan.next_per_pass_binding.max(1);
@@ -438,10 +572,11 @@ fn emit_mc_global_decls(scan: &FeatureScan, out: &mut String) {
     if !scan.debug_channels.is_empty() {
         out.push('\n');
     }
-    // Set 0 default sampler: placed at `max(next_free_binding, 14)` so it never collides with
+    // Set 0 default sampler: emitted only when separated textures are actually sampled,
+    // placed at `max(next_free_binding, MAX_PASS_TARGET_BINDING)` so it never collides with
     // per-pass resource parameters or debug channels.
     if scan.uses_sampled_textures {
-        let sampler_binding = next_free_binding.max(14);
+        let sampler_binding = next_free_binding.max(MAX_PASS_TARGET_BINDING);
         let _ = writeln!(
             out,
             "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {sampler_binding}) uniform sampler vsl_default_sampler;\n"
@@ -456,43 +591,86 @@ fn emit_mc_global_decls(scan: &FeatureScan, out: &mut String) {
         );
         emitted_any = true;
     }
-    // Set 1, binding 1: InstanceMetaSSBO.
+    // Set 1, binding 1: Canonical `InstanceMetaSSBO` (`std430`).
     if scan.uses_instances {
-        out.push_str("struct InstanceMeta {\n");
-        out.push_str("    uint albedo_slot;\n");
-        out.push_str("    uint normal_slot;\n");
-        out.push_str("    uint material_slot;\n");
-        out.push_str("    uint flags;\n");
+        let _ = writeln!(out, "struct {} {{", INSTANCE_META_LAYOUT.name);
+        emit_builtin_fields(&INSTANCE_META_LAYOUT, out);
         out.push_str("};\n");
         let _ = writeln!(
             out,
-            "layout(set = {DESCRIPTOR_SET_SCENE_GLOBALS}, binding = 1, scalar) readonly buffer InstanceMetaSSBO {{"
+            "layout(set = {DESCRIPTOR_SET_SCENE_GLOBALS}, binding = 1, std430) readonly buffer InstanceMetaSSBO {{"
         );
         out.push_str("    InstanceMeta mc_instances[];\n");
         out.push_str("};\n\n");
         emitted_any = true;
     }
-    // Set 1, binding 3: EmissiveLightSSBO.
-    if scan.uses_lights {
-        out.push_str("struct EmissiveLight {\n");
-        out.push_str("    vec4 position_radius;\n");
-        out.push_str("    vec4 color_intensity;\n");
-        out.push_str("};\n");
+    // Set 1, binding 2: Canonical `SharcConfigUBO` (`std140`, 48 bytes).
+    if scan.uses_sharc_config {
+        let sharc_set = SHARC_CONFIG_UBO_LAYOUT
+            .set
+            .unwrap_or(DESCRIPTOR_SET_SCENE_GLOBALS);
+        let sharc_binding = SHARC_CONFIG_UBO_LAYOUT.binding.unwrap_or(2);
         let _ = writeln!(
             out,
-            "layout(set = {DESCRIPTOR_SET_SCENE_GLOBALS}, binding = 3, scalar) readonly buffer EmissiveLightSSBO {{"
+            "layout(set = {sharc_set}, binding = {sharc_binding}, std140) uniform {} {{",
+            SHARC_CONFIG_UBO_LAYOUT.name
         );
-        out.push_str("    uint count;\n");
-        out.push_str("    EmissiveLight items[];\n");
+        emit_builtin_fields(&SHARC_CONFIG_UBO_LAYOUT, out);
+        out.push_str("} mc_sharc_config;\n\n");
+        emitted_any = true;
+    }
+    // Set 1, binding 3: Canonical `EmissiveLightSSBO` (`std430`).
+    if scan.uses_lights {
+        let _ = writeln!(out, "struct {} {{", EMISSIVE_LIGHT_LAYOUT.name);
+        emit_builtin_fields(&EMISSIVE_LIGHT_LAYOUT, out);
+        out.push_str("};\n");
+        let lights_set = EMISSIVE_LIGHT_SSBO_LAYOUT
+            .set
+            .unwrap_or(DESCRIPTOR_SET_SCENE_GLOBALS);
+        let lights_binding = EMISSIVE_LIGHT_SSBO_LAYOUT.binding.unwrap_or(3);
+        let _ = writeln!(
+            out,
+            "layout(set = {lights_set}, binding = {lights_binding}, std430) readonly buffer {} {{",
+            EMISSIVE_LIGHT_SSBO_LAYOUT.name
+        );
+        emit_builtin_fields(&EMISSIVE_LIGHT_SSBO_LAYOUT, out);
         out.push_str("} mc_lights;\n\n");
         emitted_any = true;
     }
-    // Set 2, binding 0: Global bindless combined image-sampler array (Hyaloclast 4-set ABI).
-    if scan.uses_bindless {
+    // Set 1, binding 4: Canonical `RestirReservoirSSBO` (`std430`).
+    if scan.uses_restir_reservoir {
+        let _ = writeln!(out, "struct {} {{", RESTIR_RESERVOIR_LAYOUT.name);
+        emit_builtin_fields(&RESTIR_RESERVOIR_LAYOUT, out);
+        out.push_str("};\n");
+        let restir_set = RESTIR_RESERVOIR_SSBO_LAYOUT
+            .set
+            .unwrap_or(DESCRIPTOR_SET_SCENE_GLOBALS);
+        let restir_binding = RESTIR_RESERVOIR_SSBO_LAYOUT.binding.unwrap_or(4);
         let _ = writeln!(
             out,
-            "layout(set = {DESCRIPTOR_SET_BINDLESS}, binding = 0) uniform sampler2D bindless[{BINDLESS_IMAGE_COUNT}];\n"
+            "layout(set = {restir_set}, binding = {restir_binding}, std430) buffer {} {{",
+            RESTIR_RESERVOIR_SSBO_LAYOUT.name
         );
+        emit_builtin_fields(&RESTIR_RESERVOIR_SSBO_LAYOUT, out);
+        out.push_str("} mc_restir_reservoir;\n\n");
+        emitted_any = true;
+    }
+    // Set 2, binding 0: Global bindless descriptor array (Hyaloclast 4096 or upstream unsized).
+    if scan.uses_bindless {
+        match opts.bindless_abi {
+            BindlessAbi::Hyaloclast4096 => {
+                let _ = writeln!(
+                    out,
+                    "layout(set = {DESCRIPTOR_SET_BINDLESS}, binding = 0) uniform sampler2D bindless[{BINDLESS_IMAGE_COUNT}];\n"
+                );
+            }
+            BindlessAbi::UpstreamUnsized => {
+                let _ = writeln!(
+                    out,
+                    "layout(set = {DESCRIPTOR_SET_BINDLESS}, binding = 0) uniform texture2D bindless[];\n"
+                );
+            }
+        }
         emitted_any = true;
     }
     // Forward declarations for referenced `mc::*` utility helpers.
@@ -529,21 +707,7 @@ pub(crate) fn scan_fn_decl_without_param_inference(func: &FnDecl) -> FeatureScan
     scan
 }
 
-/// Emits a single VSL function declaration as a GLSL 460 helper function with resolved pack
-/// parameter GLSL types.
-pub(crate) fn emit_fn_decl_with_param_types(
-    func: &FnDecl,
-    opts: EmitOptions,
-    param_types: &IndexMap<SmolStr, String>,
-    out: &mut String,
-) {
-    let mut ctx = EmitCtx::new(opts);
-    ctx.pack_param_types.clone_from(param_types);
-    seed_mc_builtin_types(&mut ctx);
-    emit_fn_decl_with_ctx(func, None, &mut ctx, out);
-}
-
-fn emit_fn_decl_with_ctx(
+pub(crate) fn emit_fn_decl_with_ctx(
     func: &FnDecl,
     self_ty: Option<&str>,
     ctx: &mut EmitCtx,
@@ -568,7 +732,7 @@ fn emit_fn_decl_with_ctx(
     }
 
     let fn_name = self_ty.map_or_else(
-        || func.name.name.to_string(),
+        || escape_glsl_ident(&func.name.name),
         |t| format!("{t}_{}", func.name.name),
     );
     let ret_ty = fn_return_glsl_type_with_subst(func, &ctx.generic_subst);
@@ -803,7 +967,7 @@ fn emit_impl_block(
     }
 }
 
-fn emit_const_decl(decl: &ConstDecl, ctx: &EmitCtx, out: &mut String) {
+pub(crate) fn emit_const_decl(decl: &ConstDecl, ctx: &EmitCtx, out: &mut String) {
     let (ty_str, arr_suffix) = type_to_glsl(&decl.ty);
     let val_str = emit_expr_const(&decl.value, ctx);
     let name = escape_glsl_ident(&decl.name.name);
@@ -855,7 +1019,12 @@ fn emit_struct_decl(
     emit_concrete_struct_decl(decl, &decl.name.name, ctx, out);
 }
 
-fn emit_concrete_struct_decl(decl: &StructDecl, glsl_name: &str, ctx: &EmitCtx, out: &mut String) {
+pub(crate) fn emit_concrete_struct_decl(
+    decl: &StructDecl,
+    glsl_name: &str,
+    ctx: &EmitCtx,
+    out: &mut String,
+) {
     let is_push_constant = has_attr(&decl.attrs, "push_constant");
     let layout_mode = extract_layout_attr(&decl.attrs);
 
@@ -870,7 +1039,11 @@ fn emit_concrete_struct_decl(decl: &StructDecl, glsl_name: &str, ctx: &EmitCtx, 
             let fname = escape_glsl_ident(&field.name.name);
             let _ = writeln!(out, "    {ty_str} {fname}{arr_suffix};");
         }
-        out.push_str("};\n\n");
+        if let Some(inst_name) = ctx.push_constant_instances.get(glsl_name) {
+            let _ = writeln!(out, "}} {inst_name};\n");
+        } else {
+            out.push_str("};\n\n");
+        }
         return;
     }
 
@@ -886,15 +1059,24 @@ fn emit_concrete_struct_decl(decl: &StructDecl, glsl_name: &str, ctx: &EmitCtx, 
     out.push_str("};\n\n");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryStage {
+    Compute(u32, u32, u32),
+    Vertex,
+    Fragment,
+}
+
 fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
-    if let Some((lx, ly, lz)) = extract_compute_stage(&func.attrs) {
+    if let Some(stage) = extract_entry_stage(&func.attrs) {
         let saved_locals = ctx.local_types.clone();
         let saved_shadowed_world = ctx.shadowed_world;
 
-        // Emit Set 0 resource bindings for non-builtin, non-push-constant parameters.
-        // Binding 0 is reserved for `WorldUBO`; `vsl_default_sampler` is placed at `max(next_free_binding, 14)`.
+        // Binding 0 is reserved for `WorldUBO`; pass targets start at binding 1.
+        // `#[pack_resource]` parameters are placed in Set 3 (`DESCRIPTOR_SET_PACK_RESOURCES`).
         let mut binding_slot = 1u32;
-        let mut builtin_aliases: Vec<(String, String, &'static str)> = Vec::new();
+        let mut pack_resource_slot = 0u32;
+        let mut builtin_inits: Vec<(String, String, Option<&'static str>)> = Vec::new();
+        let mut builtin_writebacks: Vec<(&'static str, String)> = Vec::new();
 
         for param in &func.params {
             if let Some(builtin) = extract_builtin_attr(&param.attrs) {
@@ -905,36 +1087,103 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
                 ctx.local_types
                     .insert(param.name.name.clone(), ty_str.clone());
                 if let Some(gl_builtin) = map_builtin_var(builtin) {
-                    builtin_aliases.push((ty_str, escape_glsl_ident(&param.name.name), gl_builtin));
+                    let local_name = escape_glsl_ident(&param.name.name);
+                    match param.mode {
+                        ParamMode::Out => {
+                            builtin_inits.push((ty_str, local_name.clone(), None));
+                            builtin_writebacks.push((gl_builtin, local_name));
+                        }
+                        ParamMode::InOut | ParamMode::Mut => {
+                            builtin_inits.push((ty_str, local_name.clone(), Some(gl_builtin)));
+                            builtin_writebacks.push((gl_builtin, local_name));
+                        }
+                        ParamMode::In => {
+                            builtin_inits.push((ty_str, local_name, Some(gl_builtin)));
+                        }
+                    }
+                }
+            } else if let Some(location) = extract_location_attr(&param.attrs) {
+                if let Some(ref ty) = param.ty {
+                    let (ty_str, arr_suffix) = type_to_glsl(ty);
+                    ctx.local_types
+                        .insert(param.name.name.clone(), ty_str.clone());
+                    let escaped_name = escape_glsl_ident(&param.name.name);
+                    let dir = match param.mode {
+                        ParamMode::Out | ParamMode::InOut | ParamMode::Mut => "out",
+                        ParamMode::In => "in",
+                    };
+                    let _ = writeln!(
+                        out,
+                        "layout(location = {location}) {dir} {ty_str} {escaped_name}{arr_suffix};"
+                    );
                 }
             } else if has_attr(&param.attrs, "push_constant") {
                 if let Some(ref ty) = param.ty {
                     ctx.local_types
                         .insert(param.name.name.clone(), type_to_glsl(ty).0);
                 }
+            } else if has_attr(&param.attrs, "pack_resource") {
+                if let Some(ref ty) = param.ty {
+                    ctx.local_types
+                        .insert(param.name.name.clone(), type_to_glsl(ty).0);
+                    let escaped_name = escape_glsl_ident(&param.name.name);
+                    emit_entry_resource_binding(
+                        DESCRIPTOR_SET_PACK_RESOURCES,
+                        pack_resource_slot,
+                        &escaped_name,
+                        ty,
+                        ctx,
+                        out,
+                    );
+                    pack_resource_slot += 1;
+                }
             } else if let Some(ref ty) = param.ty {
                 ctx.local_types
                     .insert(param.name.name.clone(), type_to_glsl(ty).0);
                 let escaped_name = escape_glsl_ident(&param.name.name);
-                emit_entry_resource_binding(binding_slot, &escaped_name, ty, out);
+                emit_entry_resource_binding(
+                    DESCRIPTOR_SET_PER_PASS,
+                    binding_slot,
+                    &escaped_name,
+                    ty,
+                    ctx,
+                    out,
+                );
                 binding_slot += 1;
             }
         }
 
-        let _ = writeln!(
-            out,
-            "layout(local_size_x = {lx}, local_size_y = {ly}, local_size_z = {lz}) in;"
-        );
+        match stage {
+            EntryStage::Compute(lx, ly, lz) => {
+                let _ = writeln!(
+                    out,
+                    "layout(local_size_x = {lx}, local_size_y = {ly}, local_size_z = {lz}) in;"
+                );
+            }
+            EntryStage::Vertex => {
+                out.push_str("// stage: vertex\n");
+            }
+            EntryStage::Fragment => {
+                out.push_str("// stage: fragment\n");
+            }
+        }
         if has_attr(&func.attrs, "maximally_reconverges") {
             out.push_str("// maximally_reconverges\n");
         }
         let _ = writeln!(out, "// entry: {}", func.name.name);
         out.push_str("void main() {\n");
-        for (ty_str, local_name, gl_var) in builtin_aliases {
-            let _ = writeln!(out, "    {ty_str} {local_name} = {gl_var};");
+        for (ty_str, local_name, gl_var) in builtin_inits {
+            if let Some(var) = gl_var {
+                let _ = writeln!(out, "    {ty_str} {local_name} = {var};");
+            } else {
+                let _ = writeln!(out, "    {ty_str} {local_name};");
+            }
         }
         if let Some(ref body) = func.body {
             emit_block_contents(body, 1, false, ctx, out);
+        }
+        for (gl_var, local_name) in builtin_writebacks {
+            let _ = writeln!(out, "    {gl_var} = {local_name};");
         }
         out.push_str("}\n\n");
 
@@ -946,42 +1195,49 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
     }
 }
 
-fn emit_entry_resource_binding(binding: u32, name: &str, ty: &TypeExpr, out: &mut String) {
+fn emit_entry_resource_binding(
+    set: u32,
+    binding: u32,
+    name: &str,
+    ty: &TypeExpr,
+    ctx: &EmitCtx,
+    out: &mut String,
+) {
     if let TypeExpr::Named { path, args, .. } = ty {
         let base = path.joined();
         match base.as_str() {
             "Texture2D" => {
                 let _ = writeln!(
                     out,
-                    "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {binding}) uniform texture2D {name};"
+                    "layout(set = {set}, binding = {binding}) uniform texture2D {name};"
                 );
                 return;
             }
             "Texture3D" => {
                 let _ = writeln!(
                     out,
-                    "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {binding}) uniform texture3D {name};"
+                    "layout(set = {set}, binding = {binding}) uniform texture3D {name};"
                 );
                 return;
             }
             "Texture2DArray" => {
                 let _ = writeln!(
                     out,
-                    "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {binding}) uniform texture2DArray {name};"
+                    "layout(set = {set}, binding = {binding}) uniform texture2DArray {name};"
                 );
                 return;
             }
             "TextureCube" => {
                 let _ = writeln!(
                     out,
-                    "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {binding}) uniform textureCube {name};"
+                    "layout(set = {set}, binding = {binding}) uniform textureCube {name};"
                 );
                 return;
             }
             "Sampler" => {
                 let _ = writeln!(
                     out,
-                    "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {binding}) uniform sampler {name};"
+                    "layout(set = {set}, binding = {binding}) uniform sampler {name};"
                 );
                 return;
             }
@@ -1002,7 +1258,7 @@ fn emit_entry_resource_binding(binding: u32, name: &str, ty: &TypeExpr, out: &mu
                 };
                 let _ = writeln!(
                     out,
-                    "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {binding}, {fmt}) uniform {img_ty} {name};"
+                    "layout(set = {set}, binding = {binding}, {fmt}) uniform {img_ty} {name};"
                 );
                 return;
             }
@@ -1019,9 +1275,15 @@ fn emit_entry_resource_binding(binding: u32, name: &str, ty: &TypeExpr, out: &mu
                 } else {
                     "buffer"
                 };
+                let layout_qual = ctx
+                    .struct_layouts
+                    .get(elem_ty.as_str())
+                    .copied()
+                    .unwrap_or(LayoutMode::Scalar)
+                    .as_glsl();
                 let _ = writeln!(
                     out,
-                    "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {binding}, scalar) {qual} VslBuf_{name} {{ {elem_ty} {name}[]; }};"
+                    "layout(set = {set}, binding = {binding}, {layout_qual}) {qual} VslBuf_{name} {{ {elem_ty} {name}[]; }};"
                 );
                 return;
             }
@@ -1031,7 +1293,7 @@ fn emit_entry_resource_binding(binding: u32, name: &str, ty: &TypeExpr, out: &mu
     let (ty_str, arr_suffix) = type_to_glsl(ty);
     let _ = writeln!(
         out,
-        "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {binding}) uniform {ty_str} {name}{arr_suffix};"
+        "layout(set = {set}, binding = {binding}) uniform {ty_str} {name}{arr_suffix};"
     );
 }
 
@@ -1501,19 +1763,7 @@ fn emit_if_stmt(
 }
 
 fn emit_expr_const(expr: &Expr, ctx: &EmitCtx) -> String {
-    let mut dummy_ctx = EmitCtx {
-        opts: ctx.opts,
-        local_types: ctx.local_types.clone(),
-        bda_types: ctx.bda_types.clone(),
-        struct_fields: ctx.struct_fields.clone(),
-        generic_structs: ctx.generic_structs.clone(),
-        fn_returns: ctx.fn_returns.clone(),
-        generic_subst: ctx.generic_subst.clone(),
-        pack_param_types: ctx.pack_param_types.clone(),
-        imported_mc_world: ctx.imported_mc_world,
-        shadowed_world: ctx.shadowed_world,
-        tmp_counter: ctx.tmp_counter,
-    };
+    let mut dummy_ctx = ctx.clone();
     let mut discard = String::new();
     emit_expr_with_hoist(expr, 0, &mut dummy_ctx, &mut discard)
 }
@@ -1796,33 +2046,165 @@ fn combined_sampler_ctor(tex_ty: &str) -> &'static str {
     }
 }
 
-fn bda_element_stride(bda: &BdaRefKey, ctx: &EmitCtx) -> u64 {
-    let size = glsl_type_byte_size(&bda.elem_glsl, ctx);
-    let align = u64::from(bda.align.max(1));
-    size.div_ceil(align) * align
+const fn align_up(offset: u64, align: u64) -> u64 {
+    let a = if align == 0 { 1 } else { align };
+    offset.div_ceil(a) * a
 }
 
-fn glsl_type_byte_size(ty: &str, ctx: &EmitCtx) -> u64 {
-    match ty {
-        "float16_t" => 2,
-        "float" | "int" | "uint" | "bool" => 4,
-        "double" | "int64_t" | "uint64_t" | "vec2" | "ivec2" | "uvec2" => 8,
-        "vec3" | "ivec3" | "uvec3" => 12,
-        "vec4" | "ivec4" | "uvec4" | "mat2" => 16,
-        "mat3" => 36,
-        "mat4" => 64,
+fn extract_array_dims(ty: &TypeExpr) -> Vec<u64> {
+    let mut dims = Vec::new();
+    let mut cur = ty;
+    while let TypeExpr::Array { element, len, .. } = cur {
+        let count = parse_u32_lit(len).map_or(1, u64::from).max(1);
+        dims.push(count);
+        cur = element;
+    }
+    dims
+}
+
+fn bda_element_stride(bda: &BdaRefKey, ctx: &EmitCtx) -> u64 {
+    let layout = ctx
+        .struct_layouts
+        .get(bda.elem_glsl.as_str())
+        .copied()
+        .unwrap_or(LayoutMode::Scalar);
+    let (size, natural_align) = glsl_type_size_align(&bda.elem_glsl, &[], layout, ctx, 0);
+    let align = natural_align.max(u64::from(bda.align.max(1)));
+    align_up(size, align)
+}
+
+fn glsl_type_size_align(
+    ty: &str,
+    array_dims: &[u64],
+    layout: LayoutMode,
+    ctx: &EmitCtx,
+    depth: usize,
+) -> (u64, u64) {
+    let (elem_size, elem_align) = match ty {
+        "float16_t" => (2, 2),
+        "f16vec2" => (
+            4,
+            match layout {
+                LayoutMode::Scalar => 2,
+                LayoutMode::Std430 | LayoutMode::Std140 => 4,
+            },
+        ),
+        "f16vec3" => (
+            6,
+            match layout {
+                LayoutMode::Scalar => 2,
+                LayoutMode::Std430 | LayoutMode::Std140 => 8,
+            },
+        ),
+        "f16vec4" => (
+            8,
+            match layout {
+                LayoutMode::Scalar => 2,
+                LayoutMode::Std430 | LayoutMode::Std140 => 8,
+            },
+        ),
+        "float" | "int" | "uint" | "bool" => (4, 4),
+        "double" | "int64_t" | "uint64_t" => (8, 8),
+        other if other.starts_with("VslPtr") => (8, 8),
+        "vec2" | "ivec2" | "uvec2" | "bvec2" => (
+            8,
+            match layout {
+                LayoutMode::Scalar => 4,
+                LayoutMode::Std430 | LayoutMode::Std140 => 8,
+            },
+        ),
+        "vec3" | "ivec3" | "uvec3" | "bvec3" => (
+            12,
+            match layout {
+                LayoutMode::Scalar => 4,
+                LayoutMode::Std430 | LayoutMode::Std140 => 16,
+            },
+        ),
+        "vec4" | "ivec4" | "uvec4" | "bvec4" => (
+            16,
+            match layout {
+                LayoutMode::Scalar => 4,
+                LayoutMode::Std430 | LayoutMode::Std140 => 16,
+            },
+        ),
+        "dvec2" => (
+            16,
+            match layout {
+                LayoutMode::Scalar => 8,
+                LayoutMode::Std430 | LayoutMode::Std140 => 16,
+            },
+        ),
+        "dvec3" => (
+            24,
+            match layout {
+                LayoutMode::Scalar => 8,
+                LayoutMode::Std430 | LayoutMode::Std140 => 32,
+            },
+        ),
+        "dvec4" => (
+            32,
+            match layout {
+                LayoutMode::Scalar => 8,
+                LayoutMode::Std430 | LayoutMode::Std140 => 32,
+            },
+        ),
+        "mat2" => match layout {
+            LayoutMode::Scalar => (16, 4),
+            LayoutMode::Std430 => (16, 8),
+            LayoutMode::Std140 => (32, 16),
+        },
+        "mat3" => match layout {
+            LayoutMode::Scalar => (36, 4),
+            LayoutMode::Std430 | LayoutMode::Std140 => (48, 16),
+        },
+        "mat4" => (
+            64,
+            match layout {
+                LayoutMode::Scalar => 4,
+                LayoutMode::Std430 | LayoutMode::Std140 => 16,
+            },
+        ),
         other => {
-            if let Some(fields) = ctx.struct_fields.get(other) {
-                let total: u64 = fields
-                    .values()
-                    .map(|f_ty| glsl_type_byte_size(f_ty, ctx))
-                    .sum();
-                total.max(4)
+            if depth < 16
+                && let Some(fields) = ctx.struct_fields.get(other)
+            {
+                let field_dims_map = ctx.struct_field_dims.get(other);
+                let mut offset = 0u64;
+                let mut max_align = 1u64;
+                for (fname, f_ty) in fields {
+                    let f_dims = field_dims_map
+                        .and_then(|m| m.get(fname))
+                        .map_or(&[][..], Vec::as_slice);
+                    let (f_size, f_align) =
+                        glsl_type_size_align(f_ty, f_dims, layout, ctx, depth + 1);
+                    offset = align_up(offset, f_align);
+                    offset += f_size;
+                    max_align = max_align.max(f_align);
+                }
+                if layout == LayoutMode::Std140 {
+                    max_align = align_up(max_align, 16);
+                }
+                (align_up(offset, max_align).max(4), max_align)
             } else {
-                4
+                (4, 4)
             }
         }
+    };
+
+    if array_dims.is_empty() {
+        return (elem_size, elem_align);
     }
+
+    let arr_align = match layout {
+        LayoutMode::Std140 => align_up(elem_align, 16),
+        LayoutMode::Scalar | LayoutMode::Std430 => elem_align,
+    };
+    let elem_stride = align_up(elem_size, arr_align);
+    let total_elems: u64 = array_dims
+        .iter()
+        .copied()
+        .fold(1u64, |acc, d| acc.saturating_mul(d.max(1)));
+    (elem_stride.saturating_mul(total_elems), arr_align)
 }
 
 fn emit_method_call_expr_with_hoist(
@@ -1860,17 +2242,7 @@ fn emit_method_call_expr_with_hoist(
                 format!("imageLoad({recv}, {})", rendered_args.join(", "))
             }
         }
-        "fetch" => {
-            if is_combined_sampler_type(&recv_ty) {
-                format!("texelFetch({recv}, {})", rendered_args.join(", "))
-            } else {
-                let ctor = combined_sampler_ctor(&recv_ty);
-                format!(
-                    "texelFetch({ctor}({recv}, vsl_default_sampler), {})",
-                    rendered_args.join(", ")
-                )
-            }
-        }
+        "fetch" => format!("texelFetch({recv}, {})", rendered_args.join(", ")),
         "sample_lod" => {
             if is_combined_sampler_type(&recv_ty) {
                 if args.len() == 3 && infer_glsl_type(&args[0].value, ctx) == "sampler" {
@@ -1958,7 +2330,7 @@ fn emit_method_call_expr_with_hoist(
     }
 }
 
-fn type_to_glsl(ty: &TypeExpr) -> (String, String) {
+pub(crate) fn type_to_glsl(ty: &TypeExpr) -> (String, String) {
     let empty = IndexMap::new();
     type_to_glsl_with_subst(ty, &empty)
 }
@@ -2404,6 +2776,8 @@ fn format_path_expr(path: &Path, ctx: &EmitCtx) -> String {
         "mc::HitType::Triangle" => "gl_RayQueryCommittedIntersectionTriangleEXT".to_owned(),
         "mc::tlas" => "tlas".to_owned(),
         "mc::bindless" => "bindless".to_owned(),
+        "mc::sharc_config" | "mc::sharc" => "mc_sharc_config".to_owned(),
+        "mc::restir_reservoir" | "mc::reservoirs" => "mc_restir_reservoir".to_owned(),
         "world" if ctx.imported_mc_world && !ctx.shadowed_world => "mc_world".to_owned(),
         _ => escape_glsl_ident(&joined.replace("::", "_")),
     }
@@ -2484,11 +2858,17 @@ fn map_builtin_var(name: &str) -> Option<&'static str> {
         "local_invocation_index" => Some("gl_LocalInvocationIndex"),
         "workgroup_id" => Some("gl_WorkGroupID"),
         "num_workgroups" => Some("gl_NumWorkGroups"),
+        "vertex_index" => Some("gl_VertexIndex"),
+        "instance_index" => Some("gl_InstanceIndex"),
+        "position" => Some("gl_Position"),
+        "frag_coord" => Some("gl_FragCoord"),
+        "front_facing" => Some("gl_FrontFacing"),
+        "point_coord" => Some("gl_PointCoord"),
         _ => None,
     }
 }
 
-fn has_attr(attrs: &[Attribute], name: &str) -> bool {
+pub(crate) fn has_attr(attrs: &[Attribute], name: &str) -> bool {
     attrs
         .iter()
         .any(|a| a.entries.iter().any(|e| e.name.name == name))
@@ -2526,27 +2906,55 @@ fn extract_builtin_attr(attrs: &[Attribute]) -> Option<&str> {
     None
 }
 
-fn extract_compute_stage(attrs: &[Attribute]) -> Option<(u32, u32, u32)> {
+fn extract_location_attr(attrs: &[Attribute]) -> Option<u32> {
     for attr in attrs {
         for entry in &attr.entries {
-            if entry.name.name == "stage"
-                && let Some(Expr::Call { callee, args, .. }) = entry.args.first()
-                && let Expr::Path { path, .. } = callee.as_ref()
-                && path.joined() == "compute"
+            if entry.name.name == "location"
+                && let Some(first) = entry.args.first()
             {
-                let x = args
-                    .first()
-                    .and_then(|a| parse_u32_lit(&a.value))
-                    .unwrap_or(1);
-                let y = args
-                    .get(1)
-                    .and_then(|a| parse_u32_lit(&a.value))
-                    .unwrap_or(1);
-                let z = args
-                    .get(2)
-                    .and_then(|a| parse_u32_lit(&a.value))
-                    .unwrap_or(1);
-                return Some((x, y, z));
+                return parse_u32_lit(first);
+            }
+        }
+    }
+    None
+}
+
+fn extract_entry_stage(attrs: &[Attribute]) -> Option<EntryStage> {
+    for attr in attrs {
+        for entry in &attr.entries {
+            if entry.name.name == "stage" {
+                match entry.args.first() {
+                    Some(Expr::Call { callee, args, .. }) => {
+                        if let Expr::Path { path, .. } = callee.as_ref() {
+                            match path.joined().as_str() {
+                                "compute" => {
+                                    let x = args
+                                        .first()
+                                        .and_then(|a| parse_u32_lit(&a.value))
+                                        .unwrap_or(1);
+                                    let y = args
+                                        .get(1)
+                                        .and_then(|a| parse_u32_lit(&a.value))
+                                        .unwrap_or(1);
+                                    let z = args
+                                        .get(2)
+                                        .and_then(|a| parse_u32_lit(&a.value))
+                                        .unwrap_or(1);
+                                    return Some(EntryStage::Compute(x, y, z));
+                                }
+                                "vertex" => return Some(EntryStage::Vertex),
+                                "fragment" => return Some(EntryStage::Fragment),
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(Expr::Path { path, .. }) => match path.joined().as_str() {
+                        "vertex" => return Some(EntryStage::Vertex),
+                        "fragment" => return Some(EntryStage::Fragment),
+                        _ => {}
+                    },
+                    _ => {}
+                }
             }
         }
     }
@@ -2598,7 +3006,7 @@ fn write_indent(indent: usize, out: &mut String) {
 // AST Pre-Scan for Extensions, `mc::*` Globals, and BDA Buffer References
 // ============================================================================
 
-fn scan_unit(unit: &SourceUnit, scan: &mut FeatureScan) {
+fn scan_unit_with_options(unit: &SourceUnit, opts: EmitOptions, scan: &mut FeatureScan) {
     for imp in &unit.imports {
         let prefix = imp.prefix.joined();
         if prefix.contains("subgroup") {
@@ -2620,7 +3028,9 @@ fn scan_unit(unit: &SourceUnit, scan: &mut FeatureScan) {
                     mark_mc_global("world", scan);
                     mark_mc_global("tlas", scan);
                     mark_mc_global("instances", scan);
+                    mark_mc_global("sharc_config", scan);
                     mark_mc_global("lights", scan);
+                    mark_mc_global("restir_reservoir", scan);
                     mark_mc_global("bindless", scan);
                 }
                 ImportTree::Single => {}
@@ -2636,14 +3046,15 @@ fn scan_unit(unit: &SourceUnit, scan: &mut FeatureScan) {
         match item {
             Item::Const(c) => {
                 scan_type(&c.ty, scan);
-                scan_expr(&c.value, scan);
+                scan_expr_with_options(&c.value, opts, scan);
             }
             Item::WorkgroupVar(w) => {
                 scan_type(&w.ty, scan);
             }
             Item::Struct(s) => {
                 scan_attrs(&s.attrs, scan);
-                if has_attr(&s.attrs, "push_constant")
+                if (has_attr(&s.attrs, "push_constant")
+                    && extract_layout_attr(&s.attrs).unwrap_or("scalar") == "scalar")
                     || extract_layout_attr(&s.attrs) == Some("scalar")
                 {
                     scan.extensions.insert("GL_EXT_scalar_block_layout");
@@ -2672,13 +3083,13 @@ fn scan_unit(unit: &SourceUnit, scan: &mut FeatureScan) {
             }
             Item::Trait(t) => {
                 for m in &t.methods {
-                    scan_fn_into(m, scan);
+                    scan_fn_into_with_options(m, opts, scan);
                 }
             }
             Item::Impl(imp) => {
                 if imp.generics.is_empty() {
                     for m in &imp.methods {
-                        scan_fn_into(m, scan);
+                        scan_fn_into_with_options(m, opts, scan);
                     }
                 } else if let Some(base_name) = impl_target_base_name(&imp.target) {
                     let matching: Vec<MonomorphKey> = scan
@@ -2691,16 +3102,17 @@ fn scan_unit(unit: &SourceUnit, scan: &mut FeatureScan) {
                         let mut subst = IndexMap::new();
                         apply_impl_subst(imp, &key.type_args, &mut subst);
                         for m in &imp.methods {
-                            scan_fn_into_with_subst(m, &subst, scan);
+                            scan_fn_into_with_subst(m, &subst, opts, scan);
                         }
                     }
                 }
             }
             Item::Function(f) => {
-                if extract_compute_stage(&f.attrs).is_some() {
+                if extract_entry_stage(&f.attrs).is_some() {
                     let mut next_binding = 1u32;
                     for p in &f.params {
                         if extract_builtin_attr(&p.attrs).is_none()
+                            && extract_location_attr(&p.attrs).is_none()
                             && !has_attr(&p.attrs, "push_constant")
                             && !has_attr(&p.attrs, "pack_resource")
                             && p.ty.is_some()
@@ -2710,7 +3122,7 @@ fn scan_unit(unit: &SourceUnit, scan: &mut FeatureScan) {
                     }
                     scan.next_per_pass_binding = scan.next_per_pass_binding.max(next_binding);
                 }
-                scan_fn_into(f, scan);
+                scan_fn_into_with_options(f, opts, scan);
             }
             _ => {}
         }
@@ -2720,7 +3132,8 @@ fn scan_unit(unit: &SourceUnit, scan: &mut FeatureScan) {
 fn mark_mc_global(name: &str, scan: &mut FeatureScan) {
     match name {
         "world" => {
-            scan.extensions.insert("GL_EXT_scalar_block_layout");
+            scan.extensions
+                .insert("GL_EXT_shader_explicit_arithmetic_types_int64");
         }
         "tlas" => {
             scan.uses_tlas = true;
@@ -2728,11 +3141,17 @@ fn mark_mc_global(name: &str, scan: &mut FeatureScan) {
         }
         "instances" => {
             scan.uses_instances = true;
-            scan.extensions.insert("GL_EXT_scalar_block_layout");
+        }
+        "sharc_config" | "sharc" => {
+            scan.uses_sharc_config = true;
+            scan.extensions
+                .insert("GL_EXT_shader_explicit_arithmetic_types_int64");
         }
         "lights" => {
             scan.uses_lights = true;
-            scan.extensions.insert("GL_EXT_scalar_block_layout");
+        }
+        "restir_reservoir" | "reservoirs" => {
+            scan.uses_restir_reservoir = true;
         }
         "bindless" => {
             scan.uses_bindless = true;
@@ -2751,12 +3170,21 @@ fn mark_mc_global(name: &str, scan: &mut FeatureScan) {
     }
 }
 
-fn scan_fn_into(f: &FnDecl, scan: &mut FeatureScan) {
-    let empty = IndexMap::new();
-    scan_fn_into_with_subst(f, &empty, scan);
+pub(crate) fn scan_fn_into(f: &FnDecl, scan: &mut FeatureScan) {
+    scan_fn_into_with_options(f, EmitOptions::default(), scan);
 }
 
-fn scan_fn_into_with_subst(f: &FnDecl, subst: &IndexMap<SmolStr, String>, scan: &mut FeatureScan) {
+fn scan_fn_into_with_options(f: &FnDecl, opts: EmitOptions, scan: &mut FeatureScan) {
+    let empty = IndexMap::new();
+    scan_fn_into_with_subst(f, &empty, opts, scan);
+}
+
+fn scan_fn_into_with_subst(
+    f: &FnDecl,
+    subst: &IndexMap<SmolStr, String>,
+    opts: EmitOptions,
+    scan: &mut FeatureScan,
+) {
     scan_attrs(&f.attrs, scan);
     for p in &f.params {
         if let Some(ref ty) = p.ty {
@@ -2767,7 +3195,7 @@ fn scan_fn_into_with_subst(f: &FnDecl, subst: &IndexMap<SmolStr, String>, scan: 
         scan_type_with_subst(ret, subst, scan);
     }
     if let Some(ref body) = f.body {
-        scan_block_with_subst(body, subst, scan);
+        scan_block_with_subst(body, subst, opts, scan);
     }
 }
 
@@ -2814,7 +3242,7 @@ fn scan_attrs(attrs: &[Attribute], scan: &mut FeatureScan) {
     }
 }
 
-fn scan_type(ty: &TypeExpr, scan: &mut FeatureScan) {
+pub(crate) fn scan_type(ty: &TypeExpr, scan: &mut FeatureScan) {
     let empty = IndexMap::new();
     scan_type_with_subst(ty, &empty, scan);
 }
@@ -2825,7 +3253,6 @@ fn scan_type_with_subst(ty: &TypeExpr, subst: &IndexMap<SmolStr, String>, scan: 
         TypeExpr::Named { path, args, .. } => {
             let joined = path.joined();
             if let Some(bda) = parse_bda_type_with_subst(&joined, args, subst) {
-                scan.extensions.insert("GL_EXT_scalar_block_layout");
                 scan.extensions.insert("GL_EXT_buffer_reference");
                 scan.extensions.insert("GL_EXT_buffer_reference2");
                 scan.extensions
@@ -2837,7 +3264,7 @@ fn scan_type_with_subst(ty: &TypeExpr, subst: &IndexMap<SmolStr, String>, scan: 
                     scan.extensions
                         .insert("GL_EXT_shader_explicit_arithmetic_types_int64");
                 }
-                "f16" => {
+                "f16" | "f16vec2" | "f16vec3" | "f16vec4" => {
                     scan.extensions
                         .insert("GL_EXT_shader_explicit_arithmetic_types_float16");
                 }
@@ -2858,7 +3285,12 @@ fn scan_type_with_subst(ty: &TypeExpr, subst: &IndexMap<SmolStr, String>, scan: 
     }
 }
 
-fn scan_block_with_subst(block: &Block, subst: &IndexMap<SmolStr, String>, scan: &mut FeatureScan) {
+fn scan_block_with_subst(
+    block: &Block,
+    subst: &IndexMap<SmolStr, String>,
+    opts: EmitOptions,
+    scan: &mut FeatureScan,
+) {
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let { ty, init, .. } => {
@@ -2866,31 +3298,31 @@ fn scan_block_with_subst(block: &Block, subst: &IndexMap<SmolStr, String>, scan:
                     scan_type_with_subst(t, subst, scan);
                 }
                 if let Some(e) = init {
-                    scan_expr_with_subst(e, subst, scan);
+                    scan_expr_with_subst(e, subst, opts, scan);
                 }
             }
             Stmt::Return { value, .. } => {
                 if let Some(e) = value {
-                    scan_expr_with_subst(e, subst, scan);
+                    scan_expr_with_subst(e, subst, opts, scan);
                 }
             }
             Stmt::For {
                 attrs, iter, body, ..
             } => {
                 scan_attrs(attrs, scan);
-                scan_expr_with_subst(iter, subst, scan);
-                scan_block_with_subst(body, subst, scan);
+                scan_expr_with_subst(iter, subst, opts, scan);
+                scan_block_with_subst(body, subst, opts, scan);
             }
             Stmt::While {
                 attrs, cond, body, ..
             } => {
                 scan_attrs(attrs, scan);
-                scan_expr_with_subst(cond, subst, scan);
-                scan_block_with_subst(body, subst, scan);
+                scan_expr_with_subst(cond, subst, opts, scan);
+                scan_block_with_subst(body, subst, opts, scan);
             }
             Stmt::Loop { attrs, body, .. } => {
                 scan_attrs(attrs, scan);
-                scan_block_with_subst(body, subst, scan);
+                scan_block_with_subst(body, subst, opts, scan);
             }
             Stmt::Switch {
                 selector,
@@ -2898,21 +3330,21 @@ fn scan_block_with_subst(block: &Block, subst: &IndexMap<SmolStr, String>, scan:
                 default,
                 ..
             } => {
-                scan_expr_with_subst(selector, subst, scan);
+                scan_expr_with_subst(selector, subst, opts, scan);
                 for case in cases {
-                    scan_expr_with_subst(&case.value, subst, scan);
-                    scan_block_with_subst(&case.body, subst, scan);
+                    scan_expr_with_subst(&case.value, subst, opts, scan);
+                    scan_block_with_subst(&case.body, subst, opts, scan);
                 }
                 if let Some(def) = default {
-                    scan_block_with_subst(def, subst, scan);
+                    scan_block_with_subst(def, subst, opts, scan);
                 }
             }
-            Stmt::Expr { expr, .. } => scan_expr_with_subst(expr, subst, scan),
+            Stmt::Expr { expr, .. } => scan_expr_with_subst(expr, subst, opts, scan),
             Stmt::Break(_) | Stmt::Continue(_) => {}
         }
     }
     if let Some(ref tail) = block.tail_expr {
-        scan_expr_with_subst(tail, subst, scan);
+        scan_expr_with_subst(tail, subst, opts, scan);
     }
 }
 
@@ -2924,12 +3356,21 @@ fn is_bindless_receiver(expr: &Expr) -> bool {
     }
 }
 
-fn scan_expr(expr: &Expr, scan: &mut FeatureScan) {
-    let empty = IndexMap::new();
-    scan_expr_with_subst(expr, &empty, scan);
+pub(crate) fn scan_expr(expr: &Expr, scan: &mut FeatureScan) {
+    scan_expr_with_options(expr, EmitOptions::default(), scan);
 }
 
-fn scan_expr_with_subst(expr: &Expr, subst: &IndexMap<SmolStr, String>, scan: &mut FeatureScan) {
+fn scan_expr_with_options(expr: &Expr, opts: EmitOptions, scan: &mut FeatureScan) {
+    let empty = IndexMap::new();
+    scan_expr_with_subst(expr, &empty, opts, scan);
+}
+
+fn scan_expr_with_subst(
+    expr: &Expr,
+    subst: &IndexMap<SmolStr, String>,
+    opts: EmitOptions,
+    scan: &mut FeatureScan,
+) {
     match expr {
         Expr::IntLit(raw, _) => {
             if raw.ends_with("u64") || raw.ends_with("i64") {
@@ -2956,18 +3397,18 @@ fn scan_expr_with_subst(expr: &Expr, subst: &IndexMap<SmolStr, String>, scan: &m
         }
         Expr::ArrayLit { elements, .. } => {
             for e in elements {
-                scan_expr_with_subst(e, subst, scan);
+                scan_expr_with_subst(e, subst, opts, scan);
             }
         }
         Expr::StructLit { fields, .. } => {
             for (_, v) in fields {
-                scan_expr_with_subst(v, subst, scan);
+                scan_expr_with_subst(v, subst, opts, scan);
             }
         }
-        Expr::Unary { operand, .. } => scan_expr_with_subst(operand, subst, scan),
+        Expr::Unary { operand, .. } => scan_expr_with_subst(operand, subst, opts, scan),
         Expr::Binary { lhs, rhs, .. } => {
-            scan_expr_with_subst(lhs, subst, scan);
-            scan_expr_with_subst(rhs, subst, scan);
+            scan_expr_with_subst(lhs, subst, opts, scan);
+            scan_expr_with_subst(rhs, subst, opts, scan);
         }
         Expr::Call { callee, args, .. } => {
             if let Expr::Path { path, .. } = callee.as_ref() {
@@ -2995,9 +3436,9 @@ fn scan_expr_with_subst(expr: &Expr, subst: &IndexMap<SmolStr, String>, scan: &m
                     }
                 }
             }
-            scan_expr_with_subst(callee, subst, scan);
+            scan_expr_with_subst(callee, subst, opts, scan);
             for a in args {
-                scan_expr_with_subst(&a.value, subst, scan);
+                scan_expr_with_subst(&a.value, subst, opts, scan);
             }
         }
         Expr::MethodCall {
@@ -3006,14 +3447,17 @@ fn scan_expr_with_subst(expr: &Expr, subst: &IndexMap<SmolStr, String>, scan: &m
             args,
             ..
         } => {
-            if matches!(method.name.as_str(), "sample" | "sample_lod" | "fetch")
-                && !is_bindless_receiver(receiver)
+            // Only `.sample()` / `.sample_lod()` require a sampler; `.fetch()` lowers to
+            // `texelFetch(...)` directly without `vsl_default_sampler`.
+            if matches!(method.name.as_str(), "sample" | "sample_lod")
+                && (opts.bindless_abi == BindlessAbi::UpstreamUnsized
+                    || !is_bindless_receiver(receiver))
             {
                 scan.uses_sampled_textures = true;
             }
-            scan_expr_with_subst(receiver, subst, scan);
+            scan_expr_with_subst(receiver, subst, opts, scan);
             for a in args {
-                scan_expr_with_subst(&a.value, subst, scan);
+                scan_expr_with_subst(&a.value, subst, opts, scan);
             }
         }
         Expr::Field {
@@ -3027,13 +3471,13 @@ fn scan_expr_with_subst(expr: &Expr, subst: &IndexMap<SmolStr, String>, scan: &m
             {
                 scan.pack_param_keys.insert(field.name.to_string());
             }
-            scan_expr_with_subst(receiver, subst, scan);
+            scan_expr_with_subst(receiver, subst, opts, scan);
         }
         Expr::Index {
             receiver, index, ..
         } => {
-            scan_expr_with_subst(receiver, subst, scan);
-            scan_expr_with_subst(index, subst, scan);
+            scan_expr_with_subst(receiver, subst, opts, scan);
+            scan_expr_with_subst(index, subst, opts, scan);
         }
         Expr::If {
             cond,
@@ -3041,13 +3485,13 @@ fn scan_expr_with_subst(expr: &Expr, subst: &IndexMap<SmolStr, String>, scan: &m
             else_branch,
             ..
         } => {
-            scan_expr_with_subst(cond, subst, scan);
-            scan_block_with_subst(then_branch, subst, scan);
+            scan_expr_with_subst(cond, subst, opts, scan);
+            scan_block_with_subst(then_branch, subst, opts, scan);
             if let Some(eb) = else_branch {
-                scan_expr_with_subst(eb, subst, scan);
+                scan_expr_with_subst(eb, subst, opts, scan);
             }
         }
-        Expr::Block(b) => scan_block_with_subst(b, subst, scan),
+        Expr::Block(b) => scan_block_with_subst(b, subst, opts, scan),
         Expr::BoolLit(_, _) | Expr::StringLit(_, _) | Expr::NoneLit(_) => {}
     }
 }
@@ -3806,21 +4250,36 @@ fn infer_param_types_block(
     aliases: &mut IndexMap<SmolStr, SmolStr>,
     out_types: &mut IndexMap<SmolStr, String>,
 ) {
+    let saved_locals = local_types.clone();
+    let saved_aliases = aliases.clone();
+
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let { name, ty, init, .. } => {
                 if let Some(e) = init {
+                    let rhs_param_key = expr_to_param_key(e, aliases);
+                    let rhs_simple_ty = literal_or_local_type(e, local_types);
+                    infer_param_types_expr(e, local_types, aliases, out_types);
                     if let Some(t) = ty {
                         let glsl_ty = type_to_glsl(t).0;
-                        local_types.insert(name.name.clone(), glsl_ty.clone());
-                        if let Some(key) = expr_to_param_key(e, aliases) {
+                        if let Some(key) = rhs_param_key {
                             record_param_type(out_types, key, &glsl_ty);
                         }
-                    } else if let Some(key) = expr_to_param_key(e, aliases) {
+                        aliases.swap_remove(&name.name);
+                        local_types.insert(name.name.clone(), glsl_ty);
+                    } else if let Some(key) = rhs_param_key {
+                        local_types.swap_remove(&name.name);
                         aliases.insert(name.name.clone(), key);
+                    } else {
+                        aliases.swap_remove(&name.name);
+                        if let Some(inferred) = rhs_simple_ty {
+                            local_types.insert(name.name.clone(), inferred.to_owned());
+                        } else {
+                            local_types.swap_remove(&name.name);
+                        }
                     }
-                    infer_param_types_expr(e, local_types, aliases, out_types);
                 } else if let Some(t) = ty {
+                    aliases.swap_remove(&name.name);
                     local_types.insert(name.name.clone(), type_to_glsl(t).0);
                 }
             }
@@ -3870,6 +4329,9 @@ fn infer_param_types_block(
     if let Some(ref tail) = block.tail_expr {
         infer_param_types_expr(tail, local_types, aliases, out_types);
     }
+
+    *local_types = saved_locals;
+    *aliases = saved_aliases;
 }
 
 fn literal_or_local_type(

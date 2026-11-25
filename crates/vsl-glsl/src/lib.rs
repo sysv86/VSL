@@ -3,10 +3,10 @@
 pub mod emit;
 pub mod hook_bridge;
 
-pub use emit::emit_glsl_460;
+pub use emit::{BindlessAbi, EmitOptions, emit_glsl_460, emit_glsl_460_with_options};
 pub use hook_bridge::{
-    emit_raster_gbuffer_hook_slot, emit_raster_gbuffer_hook_slot_with_schema,
-    emit_raster_gbuffer_hook_slot_with_types,
+    emit_raster_gbuffer_hook_slot, emit_raster_gbuffer_hook_slot_from_unit,
+    emit_raster_gbuffer_hook_slot_with_schema, emit_raster_gbuffer_hook_slot_with_types,
 };
 
 #[cfg(test)]
@@ -36,8 +36,9 @@ mod tests {
 
         let glsl = emit_glsl_460(&parsed.unit);
         assert!(glsl.contains("#version 460 core"));
-        assert!(glsl.contains("#extension GL_EXT_scalar_block_layout : require"));
-        assert!(glsl.contains("layout(push_constant, scalar) uniform AtrousPush"));
+        assert!(glsl.contains("#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require"));
+        assert!(glsl.contains("layout(set = 0, binding = 0, std140) uniform WorldUBO"));
+        assert!(glsl.contains("mc_world.cur_view_proj"));
         assert!(glsl.contains("shared uint s_tile_lights[64];"));
         assert!(glsl.contains("shared uint s_tile_count;"));
         assert!(glsl.contains("layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;"));
@@ -53,7 +54,7 @@ mod tests {
         assert!(!glsl.contains("vsl_default_sampler"));
         assert!(!glsl.contains("binding = 15"));
         assert!(
-            glsl.contains("layout(set = 1, binding = 3, scalar) readonly buffer EmissiveLightSSBO")
+            glsl.contains("layout(set = 1, binding = 3, std430) readonly buffer EmissiveLightSSBO")
         );
     }
 
@@ -100,22 +101,20 @@ mod tests {
 
         let glsl = emit_glsl_460(&parsed.unit);
         // Exact Hyaloclast 4-set Vulkan ABI.
-        assert!(glsl.contains("layout(set = 0, binding = 0, scalar) uniform WorldUBO"));
+        assert!(glsl.contains("layout(set = 0, binding = 0, std140) uniform WorldUBO"));
         assert!(glsl.contains("layout(set = 0, binding = 1) uniform texture2D gbuffer_normal;"));
         assert!(glsl.contains("layout(set = 0, binding = 2) uniform texture2D gbuffer_depth;"));
         assert!(glsl.contains("layout(set = 0, binding = 3, rgba16f) uniform image2D out_refl;"));
         assert!(glsl.contains(
             "layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D vsl_debug_custom_reflections;"
         ));
-        assert!(
-            glsl.contains("layout(set = 0, binding = 14) uniform sampler vsl_default_sampler;")
-        );
+        assert!(!glsl.contains("vsl_default_sampler"));
         assert!(!glsl.contains("binding = 15"));
         assert!(
             glsl.contains("layout(set = 1, binding = 0) uniform accelerationStructureEXT tlas;")
         );
         assert!(
-            glsl.contains("layout(set = 1, binding = 1, scalar) readonly buffer InstanceMetaSSBO")
+            glsl.contains("layout(set = 1, binding = 1, std430) readonly buffer InstanceMetaSSBO")
         );
         assert!(glsl.contains("layout(set = 2, binding = 0) uniform sampler2D bindless[4096];"));
 
@@ -131,7 +130,7 @@ mod tests {
         assert!(!glsl.contains("\"custom_reflections\""));
 
         assert!(
-            glsl.contains("textureLod(bindless[nonuniformEXT(inst.albedo_slot)], uv, 0.0).rgb")
+            glsl.contains("textureLod(bindless[nonuniformEXT(inst.texture_id)], uv, 0.0).rgb")
         );
         assert!(glsl.contains("vec3 color;"));
         assert!(glsl.contains("InstanceMeta inst = mc_instances["));
@@ -183,7 +182,8 @@ mod tests {
 
         let glsl = emit_glsl_460(&parsed.unit);
         assert!(glsl.contains("layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;"));
-        assert!(glsl.contains("layout(set = 0, binding = 0, scalar) uniform WorldUBO"));
+        assert!(glsl.contains("layout(set = 0, binding = 0, std140) uniform WorldUBO"));
+        assert!(glsl.contains("} pc;"));
         assert!(glsl.contains("layout(set = 0, binding = 1) uniform texture2D in_tex;"));
         assert!(glsl.contains("layout(set = 0, binding = 2, rgba16f) uniform image2D out_img;"));
         assert!(
@@ -222,7 +222,7 @@ mod tests {
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
 
         let glsl = emit_glsl_460(&parsed.unit);
-        assert!(glsl.contains("layout(set = 0, binding = 0, scalar) uniform WorldUBO"));
+        assert!(glsl.contains("layout(set = 0, binding = 0, std140) uniform WorldUBO"));
         assert!(glsl.contains("float t = mc_world.time;"));
         assert!(glsl.contains("vec3 _vsl_tmp_0;"));
         assert!(glsl.contains("float boost = (t * 2.0);"));
@@ -261,9 +261,9 @@ mod tests {
 
         let vd = emit_raster_gbuffer_hook_slot(HookStage::VertexDisplace, func)
             .expect("vertex_displace slot");
-        assert!(vd.contains("#extension GL_EXT_scalar_block_layout : require"));
         assert!(vd.contains("struct VsPackParams"));
-        assert!(vd.contains("layout(set = 0, binding = 0, scalar) uniform VsMotionBlock"));
+        assert!(vd.contains("layout(set = 0, binding = 15, std430) readonly buffer VsMotionBlock"));
+        assert!(!vd.contains("binding = 0"));
         assert!(vd.contains("} VsMotion;"));
         assert!(vd.contains("bool enable_wind;"));
         assert!(vd.contains("int wave_octaves;"));
@@ -411,9 +411,8 @@ mod tests {
         assert!(glsl.contains(
             "layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D vsl_debug_normal_dbg;"
         ));
-        assert!(
-            glsl.contains("layout(set = 0, binding = 14) uniform sampler vsl_default_sampler;")
-        );
+        assert!(glsl.contains("texelFetch(tex_a, coord, 0)"));
+        assert!(!glsl.contains("vsl_default_sampler"));
         assert!(!glsl.contains("binding = 15"));
     }
 
@@ -815,6 +814,352 @@ mod tests {
         );
         assert!(
             glsl.contains("uint budget = VsMotion.packParams.frame_budget;"),
+            "got:\n{glsl}"
+        );
+    }
+
+    #[test]
+    fn emits_canonical_vsl_mc_abi_layouts_including_sharc_and_restir() {
+        let src = r"
+            import mc::{world, sharc_config, lights, restir_reservoir};
+
+            @stage(compute(8, 8, 1))
+            pub fn abi_check_cs(out_img: RWImage2D<rgba16f>) {
+                let p = world.pack_params_bda;
+                let cap = mc::sharc_config.capacity;
+                let n = mc::lights.count;
+                let r = mc::restir_reservoir.count;
+                out_img.store(ivec2(0, 0), vec4(f32(p), f32(cap), f32(n), f32(r)));
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let glsl = emit_glsl_460(&parsed.unit);
+        assert!(
+            glsl.contains("#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("layout(set = 0, binding = 0, std140) uniform WorldUBO"),
+            "got:\n{glsl}"
+        );
+        assert!(glsl.contains("uint64_t pack_params_bda;"), "got:\n{glsl}");
+        assert!(glsl.contains("float wind_phase;"), "got:\n{glsl}");
+        assert!(glsl.contains("uint pack_params_bda_pad;"), "got:\n{glsl}");
+        assert!(
+            glsl.contains("layout(set = 1, binding = 2, std140) uniform SharcConfigUBO"),
+            "got:\n{glsl}"
+        );
+        assert!(glsl.contains("uint64_t hash_table_bda;"), "got:\n{glsl}");
+        assert!(
+            glsl.contains("layout(set = 1, binding = 3, std430) readonly buffer EmissiveLightSSBO"),
+            "got:\n{glsl}"
+        );
+        assert!(glsl.contains("vec3 position;"), "got:\n{glsl}");
+        assert!(glsl.contains("float radius;"), "got:\n{glsl}");
+        assert!(glsl.contains("uint _pad0;"), "got:\n{glsl}");
+        assert!(
+            glsl.contains("layout(set = 1, binding = 4, std430) buffer RestirReservoirSSBO"),
+            "got:\n{glsl}"
+        );
+        assert!(glsl.contains("vec3 sample_pos;"), "got:\n{glsl}");
+        assert!(glsl.contains("float weight_sum;"), "got:\n{glsl}");
+    }
+
+    #[test]
+    fn computes_layout_aware_std430_and_std140_bda_strides() {
+        let src = r"
+            #[layout(std430)]
+            pub struct PaddedStd430 {
+                pub a: f32,
+                pub b: vec3,
+            }
+
+            #[layout(std140)]
+            pub struct ArrayStd140 {
+                pub vals: [f32; 2],
+            }
+
+            #[layout(std430)]
+            pub struct PtrHolder {
+                pub p: ptr<u32, align = 4>,
+                pub tag: f32,
+            }
+
+            @stage(compute(1, 1, 1))
+            pub fn stride_cs(
+                s_ptr: ptr<PaddedStd430, align = 16>,
+                a_ptr: ptr<ArrayStd140, align = 16>,
+                h_ptr: ptr<PtrHolder, align = 8>,
+                out_buf: RWBuffer<PaddedStd430>,
+            ) {
+                let s1 = s_ptr.offset(1);
+                let a1 = a_ptr.offset(1);
+                let h1 = h_ptr.offset(1);
+                out_buf[0] = s1.load();
+                let _ = a1.load();
+                let _ = h1.load();
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let glsl = emit_glsl_460(&parsed.unit);
+        assert!(
+            glsl.contains(
+                "layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer VslPtrRo_PaddedStd430_a16"
+            ),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains(
+                "layout(buffer_reference, std140, buffer_reference_align = 16) readonly buffer VslPtrRo_ArrayStd140_a16"
+            ),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("layout(set = 0, binding = 4, std430) buffer VslBuf_out_buf"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("VslPtrRo_PaddedStd430_a16(uint64_t(s_ptr) + uint64_t(1) * 32ul)"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("VslPtrRo_ArrayStd140_a16(uint64_t(a_ptr) + uint64_t(1) * 32ul)"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("VslPtrRo_PtrHolder_a8(uint64_t(h_ptr) + uint64_t(1) * 16ul)"),
+            "got:\n{glsl}"
+        );
+    }
+
+    #[test]
+    fn supports_upstream_unsized_bindless_abi_toggle() {
+        let src = r"
+            import mc::{bindless};
+
+            @stage(compute(8, 8, 1))
+            pub fn unsized_bindless_cs(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let slot = gid.x;
+                let uv = vec2(0.5, 0.5);
+                let c = bindless[nonuniform(slot)].sample_lod(uv, 0.0);
+                out_img.store(ivec2(gid.xy), c);
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let opts = EmitOptions {
+            bindless_abi: BindlessAbi::UpstreamUnsized,
+            ..EmitOptions::default()
+        };
+        let glsl = emit_glsl_460_with_options(&parsed.unit, opts);
+        assert!(
+            glsl.contains("layout(set = 2, binding = 0) uniform texture2D bindless[];"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("layout(set = 0, binding = 14) uniform sampler vsl_default_sampler;"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains(
+                "textureLod(sampler2D(bindless[nonuniformEXT(slot)], vsl_default_sampler), uv, 0.0)"
+            ),
+            "got:\n{glsl}"
+        );
+    }
+
+    #[test]
+    fn emits_pack_resource_in_set3_and_named_push_constant_instance() {
+        let src = r"
+            #[push_constant, layout(std430)]
+            pub struct TonePush {
+                pub exposure: f32,
+            }
+
+            @stage(compute(8, 8, 1))
+            pub fn tonemap_cs(
+                #[push_constant] push: TonePush,
+                #[pack_resource] lut: Texture2D<f32>,
+                in_tex: Texture2D<f32>,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let c = in_tex.fetch(ivec2(0, 0), 0);
+                let l = lut.fetch(ivec2(0, 0), 0);
+                out_img.store(ivec2(0, 0), c * l * push.exposure);
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let glsl = emit_glsl_460(&parsed.unit);
+        assert!(
+            glsl.contains("layout(push_constant, std430) uniform TonePush"),
+            "got:\n{glsl}"
+        );
+        assert!(glsl.contains("} push;"), "got:\n{glsl}");
+        assert!(
+            glsl.contains("layout(set = 3, binding = 0) uniform texture2D lut;"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("layout(set = 0, binding = 1) uniform texture2D in_tex;"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("layout(set = 0, binding = 2, rgba16f) uniform image2D out_img;"),
+            "got:\n{glsl}"
+        );
+        assert!(!glsl.contains("vsl_default_sampler"), "got:\n{glsl}");
+    }
+
+    #[test]
+    fn emits_vertex_and_fragment_stages_with_locations_and_graphics_builtins() {
+        let vs_src = r"
+            @stage(vertex)
+            pub fn main_vs(
+                #[builtin(vertex_index)] vid: i32,
+                #[builtin(instance_index)] iid: i32,
+                #[location(0)] in_pos: vec3,
+                #[location(0)] out v_uv: vec2,
+                #[builtin(position)] out clip_pos: vec4,
+            ) {
+                v_uv = vec2(f32(vid), f32(iid));
+                clip_pos = vec4(in_pos, 1.0);
+            }
+        ";
+        let vs_parsed = parse_source(FileId(0), vs_src);
+        assert!(!vs_parsed.has_errors(), "{:?}", vs_parsed.diagnostics);
+        let vs_glsl = emit_glsl_460(&vs_parsed.unit);
+        assert!(
+            vs_glsl.contains("layout(location = 0) in vec3 in_pos;"),
+            "got:\n{vs_glsl}"
+        );
+        assert!(
+            vs_glsl.contains("layout(location = 0) out vec2 v_uv;"),
+            "got:\n{vs_glsl}"
+        );
+        assert!(vs_glsl.contains("void main()"), "got:\n{vs_glsl}");
+        assert!(
+            vs_glsl.contains("int vid = gl_VertexIndex;"),
+            "got:\n{vs_glsl}"
+        );
+        assert!(
+            vs_glsl.contains("int iid = gl_InstanceIndex;"),
+            "got:\n{vs_glsl}"
+        );
+        assert!(
+            vs_glsl.contains("gl_Position = clip_pos;"),
+            "got:\n{vs_glsl}"
+        );
+
+        let fs_src = r"
+            @stage(fragment)
+            pub fn main_fs(
+                #[builtin(frag_coord)] fc: vec4,
+                #[builtin(front_facing)] ff: bool,
+                #[builtin(point_coord)] pc: vec2,
+                #[location(0)] v_uv: vec2,
+                #[location(0)] out frag_color: vec4,
+            ) {
+                let s = if ff { 1.0 } else { 0.5 };
+                frag_color = vec4(v_uv + pc, fc.z * s, 1.0);
+            }
+        ";
+        let fs_parsed = parse_source(FileId(1), fs_src);
+        assert!(!fs_parsed.has_errors(), "{:?}", fs_parsed.diagnostics);
+        let fs_glsl = emit_glsl_460(&fs_parsed.unit);
+        assert!(
+            fs_glsl.contains("layout(location = 0) in vec2 v_uv;"),
+            "got:\n{fs_glsl}"
+        );
+        assert!(
+            fs_glsl.contains("layout(location = 0) out vec4 frag_color;"),
+            "got:\n{fs_glsl}"
+        );
+        assert!(fs_glsl.contains("void main()"), "got:\n{fs_glsl}");
+        assert!(
+            fs_glsl.contains("vec4 fc = gl_FragCoord;"),
+            "got:\n{fs_glsl}"
+        );
+        assert!(
+            fs_glsl.contains("bool ff = gl_FrontFacing;"),
+            "got:\n{fs_glsl}"
+        );
+        assert!(
+            fs_glsl.contains("vec2 pc = gl_PointCoord;"),
+            "got:\n{fs_glsl}"
+        );
+    }
+
+    #[test]
+    fn emits_ordered_schema_and_transitive_helpers_in_hook_bridge() {
+        let src = r"
+            const SCALE: f32 = 2.0;
+
+            struct TintData {
+                pub weight: f32,
+            }
+
+            fn compute_tint(w: f32) -> TintData {
+                TintData { weight: w * SCALE }
+            }
+
+            @hook(surface)
+            pub fn sample(inout albedo: vec3) {
+                let td = compute_tint(mc::param(second_param));
+                albedo = albedo * td.weight;
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let func = parsed
+            .unit
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Function(f) if f.name.name == "sample" => Some(f),
+                _ => None,
+            })
+            .expect("hook function");
+
+        let mut schema = IndexMap::new();
+        schema.insert(SmolStr::new_static("first_param"), PackParamType::Vec3);
+        schema.insert(SmolStr::new_static("second_param"), PackParamType::F32);
+
+        let glsl = emit_raster_gbuffer_hook_slot_from_unit(
+            HookStage::Surface,
+            &parsed.unit,
+            func,
+            &schema,
+        )
+        .expect("hook slot from unit");
+
+        let first_idx = glsl
+            .find("vec3 first_param;")
+            .expect("first_param in schema");
+        let second_idx = glsl
+            .find("float second_param;")
+            .expect("second_param in schema");
+        assert!(
+            first_idx < second_idx,
+            "schema field order must be preserved:\n{glsl}"
+        );
+        assert!(glsl.contains("const float SCALE = 2.0;"), "got:\n{glsl}");
+        assert!(glsl.contains("struct TintData"), "got:\n{glsl}");
+        assert!(glsl.contains("TintData compute_tint("), "got:\n{glsl}");
+        assert!(glsl.contains("void _vsl_sample("), "got:\n{glsl}");
+        assert!(glsl.contains("_vsl_sample(albedo);"), "got:\n{glsl}");
+        assert!(
+            glsl.contains("layout(set = 0, binding = 15, std430) readonly buffer VsMotionBlock"),
             "got:\n{glsl}"
         );
     }
