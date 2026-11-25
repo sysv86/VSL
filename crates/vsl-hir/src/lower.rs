@@ -243,6 +243,9 @@ fn lower_unit_internal(
 
     // Pass 1 (Structs): Pre-register all struct names and attributes for forward references.
     let mut struct_types: IndexMap<SmolStr, TypeId> = IndexMap::new();
+    let mut explicit_block_layout_structs: IndexSet<SmolStr> = IndexSet::new();
+    let mut bool_checked_structs: IndexSet<SmolStr> = IndexSet::new();
+    let mut legality_checked_mono_structs: IndexSet<SmolStr> = IndexSet::new();
     let mut pending_structs: Vec<PendingStruct<'_>> = Vec::new();
 
     for item in &unit.items {
@@ -306,6 +309,9 @@ fn lower_unit_internal(
                 fields: Vec::new(),
             });
             struct_types.insert(decl.name.name.clone(), type_id);
+            if has_explicit_block_layout {
+                explicit_block_layout_structs.insert(decl.name.name.clone());
+            }
             let generic_params: Vec<SmolStr> =
                 decl.generics.iter().map(|g| g.name.name.clone()).collect();
             pending_structs.push(PendingStruct {
@@ -381,10 +387,16 @@ fn lower_unit_internal(
                 pending.direct_f16_fields.insert(field.name.name.clone());
             }
 
+            let pass2_diags = if type_expr_has_type_args(&field.ty) {
+                None
+            } else {
+                Some(&mut diags)
+            };
             let mut type_ctx = TypeLowerCtx::types_only(
                 &mut module.types,
                 &mut struct_types,
                 &builtin_struct_types,
+                pass2_diags,
             );
             if let Some(ty_id) =
                 lower_type_expr(&field.ty, &mut type_ctx, &generic_names, &empty_subst)
@@ -446,13 +458,17 @@ fn lower_unit_internal(
             {
                 continue;
             }
-            let mut type_ctx = TypeLowerCtx::full(
+            let mut type_ctx = TypeLowerCtx::full_with_diags(
                 &mut module.types,
                 &mut module.structs,
                 &mut struct_types,
                 &mut struct_ids,
                 &builtin_struct_types,
                 &mut struct_generic_args,
+                &mut diags,
+                &mut bool_checked_structs,
+                &explicit_block_layout_structs,
+                &mut legality_checked_mono_structs,
             );
             if let Some(ty_id) =
                 lower_type_expr(&field.ty, &mut type_ctx, &generic_names, &empty_subst)
@@ -484,7 +500,6 @@ fn lower_unit_internal(
 
     // Pass 3 (Structs): Compute layouts and run transitive legality checks across all structs.
     let mut module_push_constants: Vec<HirStructId> = Vec::new();
-    let mut bool_checked_structs: IndexSet<SmolStr> = IndexSet::new();
 
     for (pending, sid) in pending_structs.into_iter().zip(pending_sids) {
         let is_interface_block = pending.is_push_constant || pending.has_explicit_block_layout;
@@ -622,13 +637,17 @@ fn lower_unit_internal(
     for item in &unit.items {
         match item {
             Item::Const(decl) => {
-                let mut type_ctx = TypeLowerCtx::full(
+                let mut type_ctx = TypeLowerCtx::full_with_diags(
                     &mut module.types,
                     &mut module.structs,
                     &mut struct_types,
                     &mut struct_ids,
                     &builtin_struct_types,
                     &mut struct_generic_args,
+                    &mut diags,
+                    &mut bool_checked_structs,
+                    &explicit_block_layout_structs,
+                    &mut legality_checked_mono_structs,
                 );
                 if let Some(ty_id) =
                     lower_type_expr(&decl.ty, &mut type_ctx, &empty_generics, &empty_subst)
@@ -666,13 +685,17 @@ fn lower_unit_internal(
                 }
 
                 let ty = {
-                    let mut type_ctx = TypeLowerCtx::full(
+                    let mut type_ctx = TypeLowerCtx::full_with_diags(
                         &mut module.types,
                         &mut module.structs,
                         &mut struct_types,
                         &mut struct_ids,
                         &builtin_struct_types,
                         &mut struct_generic_args,
+                        &mut diags,
+                        &mut bool_checked_structs,
+                        &explicit_block_layout_structs,
+                        &mut legality_checked_mono_structs,
                     );
                     lower_type_expr(&var.ty, &mut type_ctx, &empty_generics, &empty_subst)
                 }
@@ -1004,6 +1027,10 @@ fn lower_unit_internal(
         fallback_param_layouts: IndexMap::new(),
         next_fallback_param_offset,
         bool_checked_structs: &mut bool_checked_structs,
+        explicit_block_layout_structs: &explicit_block_layout_structs,
+        legality_checked_mono_structs: &mut legality_checked_mono_structs,
+        fn_scans: IndexMap::new(),
+        fn_entry_meta: IndexMap::new(),
     };
 
     // 5a: Traits and module constants.
@@ -1022,14 +1049,12 @@ fn lower_unit_internal(
                 });
             }
             Item::Const(decl) => {
-                let declared_ty = ctx
-                    .const_types
-                    .get(&decl.name.name)
-                    .copied()
-                    .unwrap_or_else(|| ctx.module.types.alloc(Type::Void));
+                let declared_ty_opt = ctx.const_types.get(&decl.name.name).copied();
+                let declared_ty =
+                    declared_ty_opt.unwrap_or_else(|| ctx.module.types.alloc(Type::Void));
                 let mut dummy_locals = IndexMap::new();
                 let mut dummy_scan = BodyScan::default();
-                let value_expr = {
+                let (value_expr, init_ty) = {
                     let mut scanner = BodyScanner {
                         ctx: &mut ctx,
                         generic_params: &empty_generics,
@@ -1043,8 +1068,30 @@ fn lower_unit_internal(
                         local_types: &mut dummy_locals,
                         scan: &mut dummy_scan,
                     };
-                    scanner.lower_expr(&decl.value, false).0
+                    scanner.lower_expr(&decl.value, false)
                 };
+                if let (Some(ann_ty), Some(inf_ty)) = (declared_ty_opt, init_ty)
+                    && !matches!(
+                        ctx.module.types.get(ann_ty),
+                        Type::Void | Type::TypeParam(_)
+                    )
+                    && !matches!(
+                        ctx.module.types.get(inf_ty),
+                        Type::Void | Type::TypeParam(_)
+                    )
+                    && ann_ty != inf_ty
+                {
+                    let ann_name = format_type_name(&ctx.module.types, ann_ty);
+                    let inf_name = format_type_name(&ctx.module.types, inf_ty);
+                    ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!(
+                            "mismatched initializer type for `const {}`: expected `{ann_name}`, found `{inf_name}`",
+                            decl.name.name
+                        ),
+                        decl.span,
+                    ));
+                }
                 ctx.module.consts.push(HirConst {
                     name: decl.name.name.clone(),
                     ty: declared_ty,
@@ -1172,10 +1219,14 @@ fn lower_unit_internal(
         }
     }
 
+    // Propagate BodyScan usage and hardware capabilities transitively across helper call graphs
+    // into every entry point's single-source-of-truth EntryReflection before inlining drops bodies.
+    ctx.finalize_entry_reflections();
+
     // Helpers whose parameters are image/texture descriptors have no first-class SSA value in
     // IR (`IrType::from_hir_type` maps them to `Void`). Expand them monomorphically here so the
     // caller's descriptor expression becomes the receiver of the inlined image method call.
-    inline_image_param_helpers(&mut module);
+    inline_image_param_helpers(&mut module, &mut diags);
 
     (module, diags)
 }
@@ -1212,28 +1263,17 @@ fn is_inlineable_image_helper(module: &HirModule, func: &HirFunction) -> bool {
         })
 }
 
-/// Collects the `SymbolId`s of every formal parameter referenced by `body` and maps each to the
-/// caller's corresponding argument expression. Symbol identity (not spelling) is used so that
-/// locals shadowing a parameter name are never substituted.
+/// Collects the `SymbolId`s of every formal parameter referenced by `body` and maps each to its
+/// replacement expression (either the caller's descriptor/inout expression or a fresh local
+/// `HirStmt::Let` reference). Symbol identity (not spelling) is used so that locals shadowing a
+/// parameter name are never substituted.
 fn collect_param_substitution(
     module: &HirModule,
-    func: &HirFunction,
     body: &HirBlock,
-    args: &[HirCallArg],
+    by_name: &IndexMap<SmolStr, HirExpr>,
     subst: &mut IndexMap<SymbolId, HirExpr>,
 ) {
-    let mut by_name: IndexMap<SmolStr, HirExpr> = IndexMap::new();
-    for (idx, param) in func.params.iter().enumerate() {
-        if let Some(arg) = args.get(idx) {
-            by_name.insert(param.name.clone(), arg.value.clone());
-        }
-    }
-    for arg in args {
-        if let Some(name) = &arg.name {
-            by_name.insert(name.clone(), arg.value.clone());
-        }
-    }
-    collect_param_substitution_block(module, body, &by_name, subst);
+    collect_param_substitution_block(module, body, by_name, subst);
 }
 
 fn collect_param_substitution_block(
@@ -1376,31 +1416,363 @@ fn collect_param_substitution_expr(
     }
 }
 
-fn substitute_block(
-    module: &HirModule,
+/// Returns the span of the first non-trailing `HirStmt::Return` inside `block`, if any.
+fn find_non_trailing_return_block(block: &HirBlock, allow_trailing: bool) -> Option<Span> {
+    for (idx, stmt) in block.stmts.iter().enumerate() {
+        let is_trailing = allow_trailing
+            && block.tail_expr.is_none()
+            && idx + 1 == block.stmts.len();
+        if let Some(span) = find_non_trailing_return_stmt(stmt, is_trailing) {
+            return Some(span);
+        }
+    }
+    block
+        .tail_expr
+        .as_deref()
+        .and_then(find_non_trailing_return_expr)
+}
+
+fn find_non_trailing_return_stmt(stmt: &HirStmt, is_trailing: bool) -> Option<Span> {
+    match stmt {
+        HirStmt::Return { value, span } => {
+            if !is_trailing {
+                return Some(*span);
+            }
+            value.as_ref().and_then(find_non_trailing_return_expr)
+        }
+        HirStmt::Let { init, .. } => init.as_ref().and_then(find_non_trailing_return_expr),
+        HirStmt::For { iter, body, .. } => find_non_trailing_return_expr(iter)
+            .or_else(|| find_non_trailing_return_block(body, false)),
+        HirStmt::While { cond, body, .. } => find_non_trailing_return_expr(cond)
+            .or_else(|| find_non_trailing_return_block(body, false)),
+        HirStmt::Loop { body, .. } => find_non_trailing_return_block(body, false),
+        HirStmt::Switch {
+            selector,
+            cases,
+            default,
+            ..
+        } => {
+            if let Some(span) = find_non_trailing_return_expr(selector) {
+                return Some(span);
+            }
+            for case in cases {
+                if let Some(span) = find_non_trailing_return_expr(&case.value)
+                    .or_else(|| find_non_trailing_return_block(&case.body, false))
+                {
+                    return Some(span);
+                }
+            }
+            default
+                .as_ref()
+                .and_then(|b| find_non_trailing_return_block(b, false))
+        }
+        HirStmt::Break(_) | HirStmt::Continue(_) => None,
+        HirStmt::Expr { expr, .. } => find_non_trailing_return_expr(expr),
+    }
+}
+
+fn find_non_trailing_return_expr(expr: &HirExpr) -> Option<Span> {
+    match &expr.kind {
+        HirExprKind::ArrayLit { elements } => elements.iter().find_map(find_non_trailing_return_expr),
+        HirExprKind::StructLit { fields, .. } => {
+            fields.iter().find_map(|(_, e)| find_non_trailing_return_expr(e))
+        }
+        HirExprKind::Unary { operand, .. } | HirExprKind::Swizzle { base: operand, .. } => {
+            find_non_trailing_return_expr(operand)
+        }
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            find_non_trailing_return_expr(lhs).or_else(|| find_non_trailing_return_expr(rhs))
+        }
+        HirExprKind::Call { callee, args, .. } => find_non_trailing_return_expr(callee)
+            .or_else(|| args.iter().find_map(|a| find_non_trailing_return_expr(&a.value))),
+        HirExprKind::MethodCall { receiver, args, .. } => find_non_trailing_return_expr(receiver)
+            .or_else(|| args.iter().find_map(|a| find_non_trailing_return_expr(&a.value))),
+        HirExprKind::Field { receiver, .. } => find_non_trailing_return_expr(receiver),
+        HirExprKind::Index { receiver, index } => {
+            find_non_trailing_return_expr(receiver).or_else(|| find_non_trailing_return_expr(index))
+        }
+        HirExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => find_non_trailing_return_expr(cond)
+            .or_else(|| find_non_trailing_return_block(then_branch, false))
+            .or_else(|| else_branch.as_deref().and_then(find_non_trailing_return_expr)),
+        HirExprKind::Block(block) => find_non_trailing_return_block(block, false),
+        HirExprKind::IntLit(_)
+        | HirExprKind::FloatLit(_)
+        | HirExprKind::BoolLit(_)
+        | HirExprKind::StringLit(_)
+        | HirExprKind::NoneLit
+        | HirExprKind::Path { .. } => None,
+    }
+}
+
+/// Allocates fresh `SymbolId`s for every `HirStmt::Let` and `HirStmt::For` binding inside an
+/// inlined helper body so multiple expansions never collide on local symbol identities.
+fn alpha_rename_block(
+    module: &mut HirModule,
     block: &HirBlock,
-    subst: &IndexMap<SymbolId, HirExpr>,
+    rename: &mut IndexMap<SymbolId, SymbolId>,
 ) -> HirBlock {
     HirBlock {
         stmts: block
             .stmts
             .iter()
-            .map(|stmt| substitute_stmt(module, stmt, subst))
+            .map(|stmt| alpha_rename_stmt(module, stmt, rename))
             .collect(),
         tail_expr: block
             .tail_expr
             .as_deref()
-            .map(|expr| Box::new(substitute_expr(module, expr, subst))),
+            .map(|expr| Box::new(alpha_rename_expr(module, expr, rename))),
         ty: block.ty,
         span: block.span,
     }
 }
 
-fn substitute_stmt(
-    module: &HirModule,
+fn alpha_rename_stmt(
+    module: &mut HirModule,
     stmt: &HirStmt,
-    subst: &IndexMap<SymbolId, HirExpr>,
+    rename: &mut IndexMap<SymbolId, SymbolId>,
 ) -> HirStmt {
+    match stmt {
+        HirStmt::Let {
+            symbol,
+            is_mut,
+            name,
+            ty,
+            init,
+            span,
+        } => {
+            let new_init = init
+                .as_ref()
+                .map(|expr| alpha_rename_expr(module, expr, rename));
+            let fresh = module.alloc_symbol(name.clone(), SymbolKind::Local, *ty, *is_mut, *span);
+            rename.insert(*symbol, fresh);
+            HirStmt::Let {
+                symbol: fresh,
+                is_mut: *is_mut,
+                name: name.clone(),
+                ty: *ty,
+                init: new_init,
+                span: *span,
+            }
+        }
+        HirStmt::Return { value, span } => HirStmt::Return {
+            value: value
+                .as_ref()
+                .map(|expr| alpha_rename_expr(module, expr, rename)),
+            span: *span,
+        },
+        HirStmt::For {
+            binding_symbol,
+            binding,
+            binding_ty,
+            iter,
+            body,
+            span,
+        } => {
+            let new_iter = alpha_rename_expr(module, iter, rename);
+            let fresh = module.alloc_symbol(
+                binding.clone(),
+                SymbolKind::Local,
+                *binding_ty,
+                false,
+                *span,
+            );
+            rename.insert(*binding_symbol, fresh);
+            let new_body = alpha_rename_block(module, body, rename);
+            HirStmt::For {
+                binding_symbol: fresh,
+                binding: binding.clone(),
+                binding_ty: *binding_ty,
+                iter: new_iter,
+                body: new_body,
+                span: *span,
+            }
+        }
+        HirStmt::While { cond, body, span } => HirStmt::While {
+            cond: alpha_rename_expr(module, cond, rename),
+            body: alpha_rename_block(module, body, rename),
+            span: *span,
+        },
+        HirStmt::Loop { body, span } => HirStmt::Loop {
+            body: alpha_rename_block(module, body, rename),
+            span: *span,
+        },
+        HirStmt::Switch {
+            selector,
+            cases,
+            default,
+            span,
+        } => HirStmt::Switch {
+            selector: alpha_rename_expr(module, selector, rename),
+            cases: cases
+                .iter()
+                .map(|case| HirSwitchCase {
+                    value: alpha_rename_expr(module, &case.value, rename),
+                    body: alpha_rename_block(module, &case.body, rename),
+                    span: case.span,
+                })
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|block| alpha_rename_block(module, block, rename)),
+            span: *span,
+        },
+        HirStmt::Break(span) => HirStmt::Break(*span),
+        HirStmt::Continue(span) => HirStmt::Continue(*span),
+        HirStmt::Expr {
+            expr,
+            has_semi,
+            span,
+        } => HirStmt::Expr {
+            expr: alpha_rename_expr(module, expr, rename),
+            has_semi: *has_semi,
+            span: *span,
+        },
+    }
+}
+
+fn alpha_rename_expr(
+    module: &mut HirModule,
+    expr: &HirExpr,
+    rename: &mut IndexMap<SymbolId, SymbolId>,
+) -> HirExpr {
+    let symbol = expr
+        .symbol
+        .map(|sym| rename.get(&sym).copied().unwrap_or(sym));
+    let kind = match &expr.kind {
+        HirExprKind::IntLit(s) => HirExprKind::IntLit(s.clone()),
+        HirExprKind::FloatLit(s) => HirExprKind::FloatLit(s.clone()),
+        HirExprKind::BoolLit(v) => HirExprKind::BoolLit(*v),
+        HirExprKind::StringLit(s) => HirExprKind::StringLit(s.clone()),
+        HirExprKind::NoneLit => HirExprKind::NoneLit,
+        HirExprKind::Path { path, turbofish } => HirExprKind::Path {
+            path: path.clone(),
+            turbofish: turbofish.clone(),
+        },
+        HirExprKind::ArrayLit { elements } => HirExprKind::ArrayLit {
+            elements: elements
+                .iter()
+                .map(|e| alpha_rename_expr(module, e, rename))
+                .collect(),
+        },
+        HirExprKind::StructLit {
+            struct_name,
+            fields,
+        } => HirExprKind::StructLit {
+            struct_name: struct_name.clone(),
+            fields: fields
+                .iter()
+                .map(|(n, e)| (n.clone(), alpha_rename_expr(module, e, rename)))
+                .collect(),
+        },
+        HirExprKind::Unary { op, operand } => HirExprKind::Unary {
+            op: *op,
+            operand: Box::new(alpha_rename_expr(module, operand, rename)),
+        },
+        HirExprKind::Binary { op, lhs, rhs } => HirExprKind::Binary {
+            op: *op,
+            lhs: Box::new(alpha_rename_expr(module, lhs, rename)),
+            rhs: Box::new(alpha_rename_expr(module, rhs, rename)),
+        },
+        HirExprKind::Call {
+            callee,
+            resolved_fn,
+            args,
+        } => HirExprKind::Call {
+            callee: Box::new(alpha_rename_expr(module, callee, rename)),
+            resolved_fn: *resolved_fn,
+            args: args
+                .iter()
+                .map(|arg| HirCallArg {
+                    name: arg.name.clone(),
+                    value: alpha_rename_expr(module, &arg.value, rename),
+                    span: arg.span,
+                })
+                .collect(),
+        },
+        HirExprKind::MethodCall {
+            receiver,
+            method,
+            resolved_fn,
+            turbofish,
+            args,
+        } => HirExprKind::MethodCall {
+            receiver: Box::new(alpha_rename_expr(module, receiver, rename)),
+            method: method.clone(),
+            resolved_fn: *resolved_fn,
+            turbofish: turbofish.clone(),
+            args: args
+                .iter()
+                .map(|arg| HirCallArg {
+                    name: arg.name.clone(),
+                    value: alpha_rename_expr(module, &arg.value, rename),
+                    span: arg.span,
+                })
+                .collect(),
+        },
+        HirExprKind::Field {
+            receiver,
+            field,
+            field_index,
+        } => HirExprKind::Field {
+            receiver: Box::new(alpha_rename_expr(module, receiver, rename)),
+            field: field.clone(),
+            field_index: *field_index,
+        },
+        HirExprKind::Index { receiver, index } => HirExprKind::Index {
+            receiver: Box::new(alpha_rename_expr(module, receiver, rename)),
+            index: Box::new(alpha_rename_expr(module, index, rename)),
+        },
+        HirExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => HirExprKind::If {
+            cond: Box::new(alpha_rename_expr(module, cond, rename)),
+            then_branch: alpha_rename_block(module, then_branch, rename),
+            else_branch: else_branch
+                .as_deref()
+                .map(|e| Box::new(alpha_rename_expr(module, e, rename))),
+        },
+        HirExprKind::Block(block) => HirExprKind::Block(alpha_rename_block(module, block, rename)),
+        HirExprKind::Swizzle {
+            base,
+            components,
+            is_write,
+        } => HirExprKind::Swizzle {
+            base: Box::new(alpha_rename_expr(module, base, rename)),
+            components: components.clone(),
+            is_write: *is_write,
+        },
+    };
+    HirExpr {
+        kind,
+        ty: expr.ty,
+        symbol,
+        span: expr.span,
+    }
+}
+
+fn substitute_block(block: &HirBlock, subst: &IndexMap<SymbolId, HirExpr>) -> HirBlock {
+    HirBlock {
+        stmts: block
+            .stmts
+            .iter()
+            .map(|stmt| substitute_stmt(stmt, subst))
+            .collect(),
+        tail_expr: block
+            .tail_expr
+            .as_deref()
+            .map(|expr| Box::new(substitute_expr(expr, subst))),
+        ty: block.ty,
+        span: block.span,
+    }
+}
+
+fn substitute_stmt(stmt: &HirStmt, subst: &IndexMap<SymbolId, HirExpr>) -> HirStmt {
     match stmt {
         HirStmt::Let {
             symbol,
@@ -1414,15 +1786,11 @@ fn substitute_stmt(
             is_mut: *is_mut,
             name: name.clone(),
             ty: *ty,
-            init: init
-                .as_ref()
-                .map(|expr| substitute_expr(module, expr, subst)),
+            init: init.as_ref().map(|expr| substitute_expr(expr, subst)),
             span: *span,
         },
         HirStmt::Return { value, span } => HirStmt::Return {
-            value: value
-                .as_ref()
-                .map(|expr| substitute_expr(module, expr, subst)),
+            value: value.as_ref().map(|expr| substitute_expr(expr, subst)),
             span: *span,
         },
         HirStmt::For {
@@ -1436,17 +1804,17 @@ fn substitute_stmt(
             binding_symbol: *binding_symbol,
             binding: binding.clone(),
             binding_ty: *binding_ty,
-            iter: substitute_expr(module, iter, subst),
-            body: substitute_block(module, body, subst),
+            iter: substitute_expr(iter, subst),
+            body: substitute_block(body, subst),
             span: *span,
         },
         HirStmt::While { cond, body, span } => HirStmt::While {
-            cond: substitute_expr(module, cond, subst),
-            body: substitute_block(module, body, subst),
+            cond: substitute_expr(cond, subst),
+            body: substitute_block(body, subst),
             span: *span,
         },
         HirStmt::Loop { body, span } => HirStmt::Loop {
-            body: substitute_block(module, body, subst),
+            body: substitute_block(body, subst),
             span: *span,
         },
         HirStmt::Switch {
@@ -1455,18 +1823,16 @@ fn substitute_stmt(
             default,
             span,
         } => HirStmt::Switch {
-            selector: substitute_expr(module, selector, subst),
+            selector: substitute_expr(selector, subst),
             cases: cases
                 .iter()
                 .map(|case| HirSwitchCase {
-                    value: substitute_expr(module, &case.value, subst),
-                    body: substitute_block(module, &case.body, subst),
+                    value: substitute_expr(&case.value, subst),
+                    body: substitute_block(&case.body, subst),
                     span: case.span,
                 })
                 .collect(),
-            default: default
-                .as_ref()
-                .map(|block| substitute_block(module, block, subst)),
+            default: default.as_ref().map(|block| substitute_block(block, subst)),
             span: *span,
         },
         HirStmt::Break(span) => HirStmt::Break(*span),
@@ -1476,18 +1842,14 @@ fn substitute_stmt(
             has_semi,
             span,
         } => HirStmt::Expr {
-            expr: substitute_expr(module, expr, subst),
+            expr: substitute_expr(expr, subst),
             has_semi: *has_semi,
             span: *span,
         },
     }
 }
 
-fn substitute_expr(
-    module: &HirModule,
-    expr: &HirExpr,
-    subst: &IndexMap<SymbolId, HirExpr>,
-) -> HirExpr {
+fn substitute_expr(expr: &HirExpr, subst: &IndexMap<SymbolId, HirExpr>) -> HirExpr {
     if let Some(sym) = expr.symbol
         && let Some(repl) = subst.get(&sym)
     {
@@ -1506,7 +1868,7 @@ fn substitute_expr(
         HirExprKind::ArrayLit { elements } => HirExprKind::ArrayLit {
             elements: elements
                 .iter()
-                .map(|element| substitute_expr(module, element, subst))
+                .map(|element| substitute_expr(element, subst))
                 .collect(),
         },
         HirExprKind::StructLit {
@@ -1516,30 +1878,30 @@ fn substitute_expr(
             struct_name: struct_name.clone(),
             fields: fields
                 .iter()
-                .map(|(name, expr)| (name.clone(), substitute_expr(module, expr, subst)))
+                .map(|(name, expr)| (name.clone(), substitute_expr(expr, subst)))
                 .collect(),
         },
         HirExprKind::Unary { op, operand } => HirExprKind::Unary {
             op: *op,
-            operand: Box::new(substitute_expr(module, operand, subst)),
+            operand: Box::new(substitute_expr(operand, subst)),
         },
         HirExprKind::Binary { op, lhs, rhs } => HirExprKind::Binary {
             op: *op,
-            lhs: Box::new(substitute_expr(module, lhs, subst)),
-            rhs: Box::new(substitute_expr(module, rhs, subst)),
+            lhs: Box::new(substitute_expr(lhs, subst)),
+            rhs: Box::new(substitute_expr(rhs, subst)),
         },
         HirExprKind::Call {
             callee,
             resolved_fn,
             args,
         } => HirExprKind::Call {
-            callee: Box::new(substitute_expr(module, callee, subst)),
+            callee: Box::new(substitute_expr(callee, subst)),
             resolved_fn: *resolved_fn,
             args: args
                 .iter()
                 .map(|arg| HirCallArg {
                     name: arg.name.clone(),
-                    value: substitute_expr(module, &arg.value, subst),
+                    value: substitute_expr(&arg.value, subst),
                     span: arg.span,
                 })
                 .collect(),
@@ -1551,7 +1913,7 @@ fn substitute_expr(
             turbofish,
             args,
         } => HirExprKind::MethodCall {
-            receiver: Box::new(substitute_expr(module, receiver, subst)),
+            receiver: Box::new(substitute_expr(receiver, subst)),
             method: method.clone(),
             resolved_fn: *resolved_fn,
             turbofish: turbofish.clone(),
@@ -1559,7 +1921,7 @@ fn substitute_expr(
                 .iter()
                 .map(|arg| HirCallArg {
                     name: arg.name.clone(),
-                    value: substitute_expr(module, &arg.value, subst),
+                    value: substitute_expr(&arg.value, subst),
                     span: arg.span,
                 })
                 .collect(),
@@ -1569,32 +1931,32 @@ fn substitute_expr(
             field,
             field_index,
         } => HirExprKind::Field {
-            receiver: Box::new(substitute_expr(module, receiver, subst)),
+            receiver: Box::new(substitute_expr(receiver, subst)),
             field: field.clone(),
             field_index: *field_index,
         },
         HirExprKind::Index { receiver, index } => HirExprKind::Index {
-            receiver: Box::new(substitute_expr(module, receiver, subst)),
-            index: Box::new(substitute_expr(module, index, subst)),
+            receiver: Box::new(substitute_expr(receiver, subst)),
+            index: Box::new(substitute_expr(index, subst)),
         },
         HirExprKind::If {
             cond,
             then_branch,
             else_branch,
         } => HirExprKind::If {
-            cond: Box::new(substitute_expr(module, cond, subst)),
-            then_branch: substitute_block(module, then_branch, subst),
+            cond: Box::new(substitute_expr(cond, subst)),
+            then_branch: substitute_block(then_branch, subst),
             else_branch: else_branch
                 .as_deref()
-                .map(|expr| Box::new(substitute_expr(module, expr, subst))),
+                .map(|expr| Box::new(substitute_expr(expr, subst))),
         },
-        HirExprKind::Block(block) => HirExprKind::Block(substitute_block(module, block, subst)),
+        HirExprKind::Block(block) => HirExprKind::Block(substitute_block(block, subst)),
         HirExprKind::Swizzle {
             base,
             components,
             is_write,
         } => HirExprKind::Swizzle {
-            base: Box::new(substitute_expr(module, base, subst)),
+            base: Box::new(substitute_expr(base, subst)),
             components: components.clone(),
             is_write: *is_write,
         },
@@ -1610,33 +1972,54 @@ fn substitute_expr(
 /// Rewrites every eligible call inside `block` into a `HirExprKind::Block` holding the expanded
 /// callee body. Nested calls are expanded recursively up to [`MAX_IMAGE_HELPER_INLINE_DEPTH`].
 fn inline_block(
-    module: &HirModule,
+    module: &mut HirModule,
     eligible: &IndexSet<HirFnId>,
     block: &HirBlock,
     stack: &mut Vec<HirFnId>,
     depth: usize,
+    diags: &mut DiagnosticBag,
+    reported_early_returns: &mut IndexSet<HirFnId>,
 ) -> HirBlock {
     HirBlock {
         stmts: block
             .stmts
             .iter()
-            .map(|stmt| inline_stmt(module, eligible, stmt, stack, depth))
+            .map(|stmt| {
+                inline_stmt(
+                    module,
+                    eligible,
+                    stmt,
+                    stack,
+                    depth,
+                    diags,
+                    reported_early_returns,
+                )
+            })
             .collect(),
-        tail_expr: block
-            .tail_expr
-            .as_deref()
-            .map(|expr| Box::new(inline_expr(module, eligible, expr, stack, depth))),
+        tail_expr: block.tail_expr.as_deref().map(|expr| {
+            Box::new(inline_expr(
+                module,
+                eligible,
+                expr,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            ))
+        }),
         ty: block.ty,
         span: block.span,
     }
 }
 
 fn inline_stmt(
-    module: &HirModule,
+    module: &mut HirModule,
     eligible: &IndexSet<HirFnId>,
     stmt: &HirStmt,
     stack: &mut Vec<HirFnId>,
     depth: usize,
+    diags: &mut DiagnosticBag,
+    reported_early_returns: &mut IndexSet<HirFnId>,
 ) -> HirStmt {
     match stmt {
         HirStmt::Let {
@@ -1651,15 +2034,31 @@ fn inline_stmt(
             is_mut: *is_mut,
             name: name.clone(),
             ty: *ty,
-            init: init
-                .as_ref()
-                .map(|expr| inline_expr(module, eligible, expr, stack, depth)),
+            init: init.as_ref().map(|expr| {
+                inline_expr(
+                    module,
+                    eligible,
+                    expr,
+                    stack,
+                    depth,
+                    diags,
+                    reported_early_returns,
+                )
+            }),
             span: *span,
         },
         HirStmt::Return { value, span } => HirStmt::Return {
-            value: value
-                .as_ref()
-                .map(|expr| inline_expr(module, eligible, expr, stack, depth)),
+            value: value.as_ref().map(|expr| {
+                inline_expr(
+                    module,
+                    eligible,
+                    expr,
+                    stack,
+                    depth,
+                    diags,
+                    reported_early_returns,
+                )
+            }),
             span: *span,
         },
         HirStmt::For {
@@ -1673,17 +2072,57 @@ fn inline_stmt(
             binding_symbol: *binding_symbol,
             binding: binding.clone(),
             binding_ty: *binding_ty,
-            iter: inline_expr(module, eligible, iter, stack, depth),
-            body: inline_block(module, eligible, body, stack, depth),
+            iter: inline_expr(
+                module,
+                eligible,
+                iter,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            ),
+            body: inline_block(
+                module,
+                eligible,
+                body,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            ),
             span: *span,
         },
         HirStmt::While { cond, body, span } => HirStmt::While {
-            cond: inline_expr(module, eligible, cond, stack, depth),
-            body: inline_block(module, eligible, body, stack, depth),
+            cond: inline_expr(
+                module,
+                eligible,
+                cond,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            ),
+            body: inline_block(
+                module,
+                eligible,
+                body,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            ),
             span: *span,
         },
         HirStmt::Loop { body, span } => HirStmt::Loop {
-            body: inline_block(module, eligible, body, stack, depth),
+            body: inline_block(
+                module,
+                eligible,
+                body,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            ),
             span: *span,
         },
         HirStmt::Switch {
@@ -1692,18 +2131,50 @@ fn inline_stmt(
             default,
             span,
         } => HirStmt::Switch {
-            selector: inline_expr(module, eligible, selector, stack, depth),
+            selector: inline_expr(
+                module,
+                eligible,
+                selector,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            ),
             cases: cases
                 .iter()
                 .map(|case| HirSwitchCase {
-                    value: inline_expr(module, eligible, &case.value, stack, depth),
-                    body: inline_block(module, eligible, &case.body, stack, depth),
+                    value: inline_expr(
+                        module,
+                        eligible,
+                        &case.value,
+                        stack,
+                        depth,
+                        diags,
+                        reported_early_returns,
+                    ),
+                    body: inline_block(
+                        module,
+                        eligible,
+                        &case.body,
+                        stack,
+                        depth,
+                        diags,
+                        reported_early_returns,
+                    ),
                     span: case.span,
                 })
                 .collect(),
-            default: default
-                .as_ref()
-                .map(|block| inline_block(module, eligible, block, stack, depth)),
+            default: default.as_ref().map(|block| {
+                inline_block(
+                    module,
+                    eligible,
+                    block,
+                    stack,
+                    depth,
+                    diags,
+                    reported_early_returns,
+                )
+            }),
             span: *span,
         },
         HirStmt::Break(span) => HirStmt::Break(*span),
@@ -1713,7 +2184,15 @@ fn inline_stmt(
             has_semi,
             span,
         } => HirStmt::Expr {
-            expr: inline_expr(module, eligible, expr, stack, depth),
+            expr: inline_expr(
+                module,
+                eligible,
+                expr,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            ),
             has_semi: *has_semi,
             span: *span,
         },
@@ -1721,11 +2200,13 @@ fn inline_stmt(
 }
 
 fn inline_expr(
-    module: &HirModule,
+    module: &mut HirModule,
     eligible: &IndexSet<HirFnId>,
     expr: &HirExpr,
     stack: &mut Vec<HirFnId>,
     depth: usize,
+    diags: &mut DiagnosticBag,
+    reported_early_returns: &mut IndexSet<HirFnId>,
 ) -> HirExpr {
     if let HirExprKind::Call {
         resolved_fn: Some(fn_id),
@@ -1735,14 +2216,40 @@ fn inline_expr(
         && eligible.contains(fn_id)
         && depth < MAX_IMAGE_HELPER_INLINE_DEPTH
         && !stack.contains(fn_id)
-        && let Some(expanded) = expand_image_helper(module, eligible, *fn_id, args, stack, depth)
     {
-        return HirExpr {
-            kind: HirExprKind::Block(expanded),
-            ty: expr.ty,
-            symbol: expr.symbol,
-            span: expr.span,
-        };
+        let inlined_args: Vec<HirCallArg> = args
+            .iter()
+            .map(|arg| HirCallArg {
+                name: arg.name.clone(),
+                value: inline_expr(
+                    module,
+                    eligible,
+                    &arg.value,
+                    stack,
+                    depth,
+                    diags,
+                    reported_early_returns,
+                ),
+                span: arg.span,
+            })
+            .collect();
+        if let Some(expanded) = expand_image_helper(
+            module,
+            eligible,
+            *fn_id,
+            &inlined_args,
+            stack,
+            depth,
+            diags,
+            reported_early_returns,
+        ) {
+            return HirExpr {
+                kind: HirExprKind::Block(expanded),
+                ty: expr.ty,
+                symbol: expr.symbol,
+                span: expr.span,
+            };
+        }
     }
 
     let kind = match &expr.kind {
@@ -1758,7 +2265,17 @@ fn inline_expr(
         HirExprKind::ArrayLit { elements } => HirExprKind::ArrayLit {
             elements: elements
                 .iter()
-                .map(|e| inline_expr(module, eligible, e, stack, depth))
+                .map(|e| {
+                    inline_expr(
+                        module,
+                        eligible,
+                        e,
+                        stack,
+                        depth,
+                        diags,
+                        reported_early_returns,
+                    )
+                })
                 .collect(),
         },
         HirExprKind::StructLit {
@@ -1768,30 +2285,83 @@ fn inline_expr(
             struct_name: struct_name.clone(),
             fields: fields
                 .iter()
-                .map(|(name, e)| (name.clone(), inline_expr(module, eligible, e, stack, depth)))
+                .map(|(name, e)| {
+                    (
+                        name.clone(),
+                        inline_expr(
+                            module,
+                            eligible,
+                            e,
+                            stack,
+                            depth,
+                            diags,
+                            reported_early_returns,
+                        ),
+                    )
+                })
                 .collect(),
         },
         HirExprKind::Unary { op, operand } => HirExprKind::Unary {
             op: *op,
-            operand: Box::new(inline_expr(module, eligible, operand, stack, depth)),
+            operand: Box::new(inline_expr(
+                module,
+                eligible,
+                operand,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
         },
         HirExprKind::Binary { op, lhs, rhs } => HirExprKind::Binary {
             op: *op,
-            lhs: Box::new(inline_expr(module, eligible, lhs, stack, depth)),
-            rhs: Box::new(inline_expr(module, eligible, rhs, stack, depth)),
+            lhs: Box::new(inline_expr(
+                module,
+                eligible,
+                lhs,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
+            rhs: Box::new(inline_expr(
+                module,
+                eligible,
+                rhs,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
         },
         HirExprKind::Call {
             callee,
             resolved_fn,
             args,
         } => HirExprKind::Call {
-            callee: Box::new(inline_expr(module, eligible, callee, stack, depth)),
+            callee: Box::new(inline_expr(
+                module,
+                eligible,
+                callee,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
             resolved_fn: *resolved_fn,
             args: args
                 .iter()
                 .map(|arg| HirCallArg {
                     name: arg.name.clone(),
-                    value: inline_expr(module, eligible, &arg.value, stack, depth),
+                    value: inline_expr(
+                        module,
+                        eligible,
+                        &arg.value,
+                        stack,
+                        depth,
+                        diags,
+                        reported_early_returns,
+                    ),
                     span: arg.span,
                 })
                 .collect(),
@@ -1803,7 +2373,15 @@ fn inline_expr(
             turbofish,
             args,
         } => HirExprKind::MethodCall {
-            receiver: Box::new(inline_expr(module, eligible, receiver, stack, depth)),
+            receiver: Box::new(inline_expr(
+                module,
+                eligible,
+                receiver,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
             method: method.clone(),
             resolved_fn: *resolved_fn,
             turbofish: turbofish.clone(),
@@ -1811,7 +2389,15 @@ fn inline_expr(
                 .iter()
                 .map(|arg| HirCallArg {
                     name: arg.name.clone(),
-                    value: inline_expr(module, eligible, &arg.value, stack, depth),
+                    value: inline_expr(
+                        module,
+                        eligible,
+                        &arg.value,
+                        stack,
+                        depth,
+                        diags,
+                        reported_early_returns,
+                    ),
                     span: arg.span,
                 })
                 .collect(),
@@ -1821,34 +2407,96 @@ fn inline_expr(
             field,
             field_index,
         } => HirExprKind::Field {
-            receiver: Box::new(inline_expr(module, eligible, receiver, stack, depth)),
+            receiver: Box::new(inline_expr(
+                module,
+                eligible,
+                receiver,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
             field: field.clone(),
             field_index: *field_index,
         },
         HirExprKind::Index { receiver, index } => HirExprKind::Index {
-            receiver: Box::new(inline_expr(module, eligible, receiver, stack, depth)),
-            index: Box::new(inline_expr(module, eligible, index, stack, depth)),
+            receiver: Box::new(inline_expr(
+                module,
+                eligible,
+                receiver,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
+            index: Box::new(inline_expr(
+                module,
+                eligible,
+                index,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
         },
         HirExprKind::If {
             cond,
             then_branch,
             else_branch,
         } => HirExprKind::If {
-            cond: Box::new(inline_expr(module, eligible, cond, stack, depth)),
-            then_branch: inline_block(module, eligible, then_branch, stack, depth),
-            else_branch: else_branch
-                .as_deref()
-                .map(|e| Box::new(inline_expr(module, eligible, e, stack, depth))),
+            cond: Box::new(inline_expr(
+                module,
+                eligible,
+                cond,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
+            then_branch: inline_block(
+                module,
+                eligible,
+                then_branch,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            ),
+            else_branch: else_branch.as_deref().map(|e| {
+                Box::new(inline_expr(
+                    module,
+                    eligible,
+                    e,
+                    stack,
+                    depth,
+                    diags,
+                    reported_early_returns,
+                ))
+            }),
         },
-        HirExprKind::Block(block) => {
-            HirExprKind::Block(inline_block(module, eligible, block, stack, depth))
-        }
+        HirExprKind::Block(block) => HirExprKind::Block(inline_block(
+            module,
+            eligible,
+            block,
+            stack,
+            depth,
+            diags,
+            reported_early_returns,
+        )),
         HirExprKind::Swizzle {
             base,
             components,
             is_write,
         } => HirExprKind::Swizzle {
-            base: Box::new(inline_expr(module, eligible, base, stack, depth)),
+            base: Box::new(inline_expr(
+                module,
+                eligible,
+                base,
+                stack,
+                depth,
+                diags,
+                reported_early_returns,
+            )),
             components: components.clone(),
             is_write: *is_write,
         },
@@ -1861,30 +2509,129 @@ fn inline_expr(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_image_helper(
-    module: &HirModule,
+    module: &mut HirModule,
     eligible: &IndexSet<HirFnId>,
     fn_id: HirFnId,
     args: &[HirCallArg],
     stack: &mut Vec<HirFnId>,
     depth: usize,
+    diags: &mut DiagnosticBag,
+    reported_early_returns: &mut IndexSet<HirFnId>,
 ) -> Option<HirBlock> {
-    let func = &module.functions[fn_id];
-    let original = func.body_hir.as_ref()?;
+    let (callee_name, callee_params, callee_return_ty, original) = {
+        let func = &module.functions[fn_id];
+        let body = func.body_hir.clone()?;
+        (func.name.clone(), func.params.clone(), func.return_ty, body)
+    };
+
+    if let Some(ret_span) = find_non_trailing_return_block(&original, true) {
+        if reported_early_returns.insert(fn_id) {
+            diags.push(Diagnostic::error(
+                "E0276",
+                format!(
+                    "inlineable image helper `{callee_name}` cannot contain a non-trailing `return`"
+                ),
+                ret_span,
+            ));
+        }
+        return None;
+    }
+
+    // Bind non-descriptor value arguments to fresh `HirStmt::Let` locals (call-by-value) so
+    // side effects are evaluated exactly once; substitute descriptor and `inout`/`out` arguments
+    // directly so image receivers and caller lvalues remain intact.
+    let mut raw_args: IndexMap<SmolStr, HirExpr> = IndexMap::new();
+    for (idx, param) in callee_params.iter().enumerate() {
+        if let Some(arg) = args.get(idx)
+            && arg.name.is_none()
+        {
+            raw_args.insert(param.name.clone(), arg.value.clone());
+        }
+    }
+    for arg in args {
+        if let Some(name) = &arg.name {
+            raw_args.insert(name.clone(), arg.value.clone());
+        }
+    }
+
+    let mut arg_bindings: Vec<HirStmt> = Vec::new();
+    let mut by_name: IndexMap<SmolStr, HirExpr> = IndexMap::new();
+    for param in &callee_params {
+        let Some(arg_expr) = raw_args.get(&param.name) else {
+            continue;
+        };
+        let is_descriptor = param.ty.is_some_and(|ty| {
+            is_image_param_type(&module.types, ty)
+                || classify_resource_type(module.types.get(ty), param.mode).is_some()
+        });
+        let is_by_ref = matches!(param.mode, ParamMode::InOut | ParamMode::Out);
+        if is_descriptor || is_by_ref {
+            by_name.insert(param.name.clone(), arg_expr.clone());
+        } else {
+            let local_ty = param.ty.unwrap_or(arg_expr.ty);
+            let is_mut = matches!(param.mode, ParamMode::Mut);
+            let fresh_sym = module.alloc_symbol(
+                param.name.clone(),
+                SymbolKind::Local,
+                local_ty,
+                is_mut,
+                arg_expr.span,
+            );
+            arg_bindings.push(HirStmt::Let {
+                symbol: fresh_sym,
+                is_mut,
+                name: param.name.clone(),
+                ty: local_ty,
+                init: Some(arg_expr.clone()),
+                span: arg_expr.span,
+            });
+            by_name.insert(
+                param.name.clone(),
+                HirExpr {
+                    kind: HirExprKind::Path {
+                        path: param.name.clone(),
+                        turbofish: Vec::new(),
+                    },
+                    ty: local_ty,
+                    symbol: Some(fresh_sym),
+                    span: arg_expr.span,
+                },
+            );
+        }
+    }
 
     // Capture formal-parameter symbols before recursion: the recursively expanded body may
     // contain other inlined helpers whose parameters share the same spelling but different ids.
     let mut subst = IndexMap::new();
-    collect_param_substitution(module, func, original, args, &mut subst);
+    collect_param_substitution(module, &original, &by_name, &mut subst);
 
     stack.push(fn_id);
-    let expanded = inline_block(module, eligible, original, stack, depth + 1);
+    let expanded = inline_block(
+        module,
+        eligible,
+        &original,
+        stack,
+        depth + 1,
+        diags,
+        reported_early_returns,
+    );
     stack.pop();
 
-    let mut substituted = substitute_block(module, &expanded, &subst);
-    // A trailing `return expr` is the block's value once the call frame disappears. Conditional
-    // early returns remain `HirStmt::Return` and exit the caller, matching inline semantics.
-    if func.return_ty.is_some()
+    // Alpha-rename callee `Let`/`For` `SymbolId`s so multiple inlined call sites never share
+    // local symbol IDs.
+    let mut rename = IndexMap::new();
+    let renamed = alpha_rename_block(module, &expanded, &mut rename);
+
+    let mut substituted = substitute_block(&renamed, &subst);
+    if !arg_bindings.is_empty() {
+        arg_bindings.append(&mut substituted.stmts);
+        substituted.stmts = arg_bindings;
+    }
+
+    // A trailing `return expr` is the block's value once the call frame disappears.
+    if callee_return_ty.is_some()
         && let Some(HirStmt::Return {
             value: Some(value), ..
         }) = substituted.stmts.last()
@@ -1892,6 +2639,10 @@ fn expand_image_helper(
         let value = value.clone();
         substituted.stmts.pop();
         substituted.tail_expr = Some(Box::new(value));
+    } else if callee_return_ty.is_none()
+        && matches!(substituted.stmts.last(), Some(HirStmt::Return { value: None, .. }))
+    {
+        substituted.stmts.pop();
     }
     Some(substituted)
 }
@@ -2028,9 +2779,9 @@ fn collect_remaining_calls_expr(
 
 /// Expands every private monomorphic helper that takes an image/texture parameter into its call
 /// sites, then drops the bodies of helpers that are no longer referenced. Helpers left referenced
-/// by a cycle or by the depth cap keep their original bodies so IR lowering still reports the
-/// same diagnostics as before rather than calling a function without a body.
-fn inline_image_param_helpers(module: &mut HirModule) {
+/// by a cycle, non-trailing return error, or depth cap keep their original bodies so IR lowering
+/// still reports the same diagnostics rather than calling a function without a body.
+fn inline_image_param_helpers(module: &mut HirModule, diags: &mut DiagnosticBag) {
     let candidates: IndexSet<HirFnId> = module
         .functions
         .iter()
@@ -2041,6 +2792,7 @@ fn inline_image_param_helpers(module: &mut HirModule) {
         return;
     }
 
+    let mut reported_early_returns: IndexSet<HirFnId> = IndexSet::new();
     let all_ids: Vec<HirFnId> = module.functions.iter().map(|(id, _)| id).collect();
     for fn_id in &all_ids {
         if candidates.contains(fn_id) {
@@ -2049,7 +2801,15 @@ fn inline_image_param_helpers(module: &mut HirModule) {
         let Some(body) = module.functions[*fn_id].body_hir.clone() else {
             continue;
         };
-        let expanded = inline_block(module, &candidates, &body, &mut Vec::new(), 0);
+        let expanded = inline_block(
+            module,
+            &candidates,
+            &body,
+            &mut Vec::new(),
+            0,
+            diags,
+            &mut reported_early_returns,
+        );
         module.functions[*fn_id].body_hir = Some(expanded);
     }
 
@@ -2144,17 +2904,25 @@ struct LowerCtx<'a> {
     fallback_param_layouts: IndexMap<SmolStr, (u32, u32)>,
     next_fallback_param_offset: u32,
     bool_checked_structs: &'a mut IndexSet<SmolStr>,
+    explicit_block_layout_structs: &'a IndexSet<SmolStr>,
+    legality_checked_mono_structs: &'a mut IndexSet<SmolStr>,
+    fn_scans: IndexMap<HirFnId, BodyScan>,
+    fn_entry_meta: IndexMap<HirFnId, (Option<HirStructId>, bool)>,
 }
 
 impl LowerCtx<'_> {
     fn type_ctx(&mut self) -> TypeLowerCtx<'_> {
-        TypeLowerCtx::full(
+        TypeLowerCtx::full_with_diags(
             &mut self.module.types,
             &mut self.module.structs,
             self.struct_types,
             self.struct_ids,
             self.builtin_struct_types,
             self.struct_generic_args,
+            self.diags,
+            self.bool_checked_structs,
+            self.explicit_block_layout_structs,
+            self.legality_checked_mono_structs,
         )
     }
 
@@ -2546,6 +3314,7 @@ impl LowerCtx<'_> {
         // Lower parameters and check per-parameter capability and SPIR-V legality.
         let mut params = Vec::with_capacity(func.params.len());
         let mut param_push_constant_struct: Option<HirStructId> = None;
+        let mut seen_push_constant_param = false;
         let mut uses_bda = false;
         let mut root_scope: IndexMap<SmolStr, ScopedVar> = IndexMap::new();
 
@@ -2614,16 +3383,56 @@ impl LowerCtx<'_> {
             };
 
             if let Some(ty_id) = resolved_ty {
+                let mut pc_sid: Option<(HirStructId, SmolStr)> = None;
                 if let Type::Struct { name, .. } = self.module.types.get(ty_id) {
                     let struct_name = name.clone();
                     if let Some(&sid) = self.struct_ids.get(struct_name.as_str())
                         && (param_is_pc || self.module.structs[sid].is_push_constant)
                     {
-                        param_push_constant_struct = Some(sid);
+                        pc_sid = Some((sid, struct_name));
                         param_is_pc = true;
                     }
                 }
                 if param_is_pc {
+                    if seen_push_constant_param {
+                        self.diags.push(
+                            Diagnostic::error(
+                                "E0222",
+                                format!(
+                                    "duplicate `#[push_constant]` parameter `{}` on function `{}`",
+                                    param.name.name, func.name.name
+                                ),
+                                param.span,
+                            )
+                            .with_note("Vulkan allows at most one push-constant block per entry point"),
+                        );
+                    } else {
+                        seen_push_constant_param = true;
+                    }
+                    if let Some((sid, struct_name)) = pc_sid {
+                        if param_push_constant_struct.is_none() {
+                            param_push_constant_struct = Some(sid);
+                        }
+                        if !self.module.structs[sid].is_push_constant
+                            && let Some(ref computed) = self.module.structs[sid].computed_layout
+                            && computed.size > MAX_PUSH_CONSTANT_BYTES
+                        {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    "E0220",
+                                    format!(
+                                        "push constant struct `{struct_name}` is {} bytes, exceeding the {MAX_PUSH_CONSTANT_BYTES} byte limit",
+                                        computed.size
+                                    ),
+                                    param.span,
+                                )
+                                .with_primary_label(
+                                    param.span,
+                                    "exceeds 128-byte Vulkan push-constant budget",
+                                ),
+                            );
+                        }
+                    }
                     self.check_push_constant_struct_bool(ty_id, param.span);
                 }
                 if self.module.types.contains_pointer(ty_id) {
@@ -2773,26 +3582,52 @@ impl LowerCtx<'_> {
                 local_types: &mut local_types,
                 scan: &mut scan,
             };
-            scanner.lower_block(body).0
+            let (hir_block, tail_ty) = scanner.lower_block(body);
+            if let Some(actual_ty) = tail_ty {
+                let tail_span = hir_block
+                    .tail_expr
+                    .as_ref()
+                    .map_or(body.span, |e| e.span);
+                match return_ty {
+                    Some(exp_ty)
+                        if scanner.is_concrete_value_ty(exp_ty)
+                            && scanner.is_concrete_value_ty(actual_ty)
+                            && exp_ty != actual_ty =>
+                    {
+                        let exp_name = format_type_name(&scanner.ctx.module.types, exp_ty);
+                        let act_name = format_type_name(&scanner.ctx.module.types, actual_ty);
+                        scanner.ctx.diags.push(Diagnostic::error(
+                            "E0275",
+                            format!(
+                                "return type mismatch: expected `{exp_name}`, found `{act_name}`"
+                            ),
+                            tail_span,
+                        ));
+                    }
+                    None if scanner.is_concrete_value_ty(actual_ty) => {
+                        let act_name = format_type_name(&scanner.ctx.module.types, actual_ty);
+                        scanner.ctx.diags.push(Diagnostic::error(
+                            "E0275",
+                            format!(
+                                "cannot return a value of type `{act_name}` from a void function"
+                            ),
+                            tail_span,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            hir_block
         });
         uses_bda |= scan.has(FLAG_BDA);
 
-        // Build single-source-of-truth reflection for entry points (and record BDA/subgroup flags for all fns).
+        // Record per-function BodyScan and defer entry-point EntryReflection until after all
+        // functions are lowered so transitive helper usage propagates into every entry point.
         let is_entry = parsed_attrs.stage.is_some() || parsed_attrs.hook.is_some();
-        let reflection = if is_entry {
-            self.build_entry_reflection(
-                &params,
-                param_push_constant_struct,
-                &scan,
-                uses_bda,
-                func.span,
-            )
-        } else {
-            EntryReflection {
-                uses_bda,
-                uses_subgroups: scan.has(FLAG_SUBGROUPS),
-                ..EntryReflection::default()
-            }
+        let reflection = EntryReflection {
+            uses_bda,
+            uses_subgroups: scan.has(FLAG_SUBGROUPS),
+            ..EntryReflection::default()
         };
 
         let fn_name = override_name.unwrap_or_else(|| func.name.name.clone());
@@ -2837,6 +3672,11 @@ impl LowerCtx<'_> {
             reflection,
             span: func.span,
         });
+        self.fn_scans.insert(fn_id, scan);
+        if is_entry {
+            self.fn_entry_meta
+                .insert(fn_id, (param_push_constant_struct, uses_bda));
+        }
         Some(fn_id)
     }
 
@@ -3261,6 +4101,241 @@ impl LowerCtx<'_> {
             uses_subgroups: scan.has(FLAG_SUBGROUPS),
         }
     }
+
+    fn finalize_entry_reflections(&mut self) {
+        if self.fn_entry_meta.is_empty() {
+            return;
+        }
+
+        // Build name -> HirFnId lookup for forward-declared helpers whose `resolved_fn` was not
+        // yet populated when the caller was lowered.
+        let mut fn_by_name: IndexMap<SmolStr, HirFnId> = IndexMap::new();
+        for (fid, f) in self.module.functions.iter() {
+            fn_by_name.entry(f.name.clone()).or_insert(fid);
+        }
+        for (name, sig) in self.fn_sigs.iter() {
+            if let Some(fid) = sig.fn_id {
+                fn_by_name.entry(name.clone()).or_insert(fid);
+            }
+        }
+
+        let mut call_graph: IndexMap<HirFnId, Vec<HirFnId>> = IndexMap::new();
+        for (fid, f) in self.module.functions.iter() {
+            let mut callees = IndexSet::new();
+            if let Some(ref body) = f.body_hir {
+                collect_direct_callees_block(body, &fn_by_name, &mut callees);
+            }
+            call_graph.insert(fid, callees.into_iter().collect());
+        }
+
+        let entries: Vec<(HirFnId, Option<HirStructId>, bool)> = self
+            .fn_entry_meta
+            .iter()
+            .map(|(&fid, &(pc, bda))| (fid, pc, bda))
+            .collect();
+
+        for (entry_id, param_pc_struct, param_uses_bda) in entries {
+            let mut merged_scan = self.fn_scans.get(&entry_id).cloned().unwrap_or_default();
+            let own_has_debug_write = !merged_scan.debug_channels.is_empty();
+            let mut merged_bda = param_uses_bda || merged_scan.has(FLAG_BDA);
+            let mut merged_caps = self.module.functions[entry_id].required_caps;
+
+            let mut visited: IndexSet<HirFnId> = IndexSet::new();
+            visited.insert(entry_id);
+            let mut queue: Vec<HirFnId> = call_graph
+                .get(&entry_id)
+                .cloned()
+                .unwrap_or_default();
+
+            while let Some(callee_id) = queue.pop() {
+                if !visited.insert(callee_id) {
+                    continue;
+                }
+                if let Some(callee_scan) = self.fn_scans.get(&callee_id) {
+                    merged_scan.merge_from(callee_scan);
+                }
+                let callee_fn = &self.module.functions[callee_id];
+                merged_bda |= callee_fn.reflection.uses_bda;
+                merged_caps |= callee_fn.required_caps;
+
+                if let Some(next_callees) = call_graph.get(&callee_id) {
+                    for &next_id in next_callees {
+                        if !visited.contains(&next_id) {
+                            queue.push(next_id);
+                        }
+                    }
+                }
+            }
+
+            let entry_stage = self.module.functions[entry_id].stage;
+            let entry_span = self.module.functions[entry_id].span;
+            if matches!(
+                entry_stage,
+                Some(ShaderStage::Vertex | ShaderStage::Fragment)
+            ) && !merged_scan.debug_channels.is_empty()
+            {
+                if !own_has_debug_write {
+                    self.diags.push(Diagnostic::error(
+                        "E0250",
+                        "`mc::debug_write` is only valid inside `@stage(compute(...))` entry points",
+                        entry_span,
+                    ));
+                }
+                merged_scan.debug_channels.clear();
+            }
+
+            self.module.functions[entry_id].required_caps = merged_caps;
+            let params = self.module.functions[entry_id].params.clone();
+            let reflection = self.build_entry_reflection(
+                &params,
+                param_pc_struct,
+                &merged_scan,
+                merged_bda,
+                entry_span,
+            );
+            self.module.functions[entry_id].reflection = reflection;
+        }
+    }
+}
+
+fn collect_direct_callees_block(
+    block: &HirBlock,
+    fn_by_name: &IndexMap<SmolStr, HirFnId>,
+    out: &mut IndexSet<HirFnId>,
+) {
+    for stmt in &block.stmts {
+        collect_direct_callees_stmt(stmt, fn_by_name, out);
+    }
+    if let Some(tail) = &block.tail_expr {
+        collect_direct_callees_expr(tail, fn_by_name, out);
+    }
+}
+
+fn collect_direct_callees_stmt(
+    stmt: &HirStmt,
+    fn_by_name: &IndexMap<SmolStr, HirFnId>,
+    out: &mut IndexSet<HirFnId>,
+) {
+    match stmt {
+        HirStmt::Let { init, .. } => {
+            if let Some(init) = init {
+                collect_direct_callees_expr(init, fn_by_name, out);
+            }
+        }
+        HirStmt::Return { value, .. } => {
+            if let Some(value) = value {
+                collect_direct_callees_expr(value, fn_by_name, out);
+            }
+        }
+        HirStmt::For { iter, body, .. } => {
+            collect_direct_callees_expr(iter, fn_by_name, out);
+            collect_direct_callees_block(body, fn_by_name, out);
+        }
+        HirStmt::While { cond, body, .. } => {
+            collect_direct_callees_expr(cond, fn_by_name, out);
+            collect_direct_callees_block(body, fn_by_name, out);
+        }
+        HirStmt::Loop { body, .. } => collect_direct_callees_block(body, fn_by_name, out),
+        HirStmt::Switch {
+            selector,
+            cases,
+            default,
+            ..
+        } => {
+            collect_direct_callees_expr(selector, fn_by_name, out);
+            for case in cases {
+                collect_direct_callees_expr(&case.value, fn_by_name, out);
+                collect_direct_callees_block(&case.body, fn_by_name, out);
+            }
+            if let Some(default) = default {
+                collect_direct_callees_block(default, fn_by_name, out);
+            }
+        }
+        HirStmt::Break(_) | HirStmt::Continue(_) => {}
+        HirStmt::Expr { expr, .. } => collect_direct_callees_expr(expr, fn_by_name, out),
+    }
+}
+
+fn collect_direct_callees_expr(
+    expr: &HirExpr,
+    fn_by_name: &IndexMap<SmolStr, HirFnId>,
+    out: &mut IndexSet<HirFnId>,
+) {
+    match &expr.kind {
+        HirExprKind::Call {
+            callee,
+            resolved_fn,
+            args,
+        } => {
+            if let Some(fid) = resolved_fn {
+                out.insert(*fid);
+            } else if let HirExprKind::Path { path, .. } = &callee.kind
+                && let Some(&fid) = fn_by_name.get(path.as_str())
+            {
+                out.insert(fid);
+            }
+            collect_direct_callees_expr(callee, fn_by_name, out);
+            for arg in args {
+                collect_direct_callees_expr(&arg.value, fn_by_name, out);
+            }
+        }
+        HirExprKind::MethodCall {
+            receiver,
+            resolved_fn,
+            args,
+            ..
+        } => {
+            if let Some(fid) = resolved_fn {
+                out.insert(*fid);
+            }
+            collect_direct_callees_expr(receiver, fn_by_name, out);
+            for arg in args {
+                collect_direct_callees_expr(&arg.value, fn_by_name, out);
+            }
+        }
+        HirExprKind::ArrayLit { elements } => {
+            for element in elements {
+                collect_direct_callees_expr(element, fn_by_name, out);
+            }
+        }
+        HirExprKind::StructLit { fields, .. } => {
+            for (_, field) in fields {
+                collect_direct_callees_expr(field, fn_by_name, out);
+            }
+        }
+        HirExprKind::Unary { operand, .. } | HirExprKind::Swizzle { base: operand, .. } => {
+            collect_direct_callees_expr(operand, fn_by_name, out);
+        }
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            collect_direct_callees_expr(lhs, fn_by_name, out);
+            collect_direct_callees_expr(rhs, fn_by_name, out);
+        }
+        HirExprKind::Field { receiver, .. } => {
+            collect_direct_callees_expr(receiver, fn_by_name, out);
+        }
+        HirExprKind::Index { receiver, index } => {
+            collect_direct_callees_expr(receiver, fn_by_name, out);
+            collect_direct_callees_expr(index, fn_by_name, out);
+        }
+        HirExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_direct_callees_expr(cond, fn_by_name, out);
+            collect_direct_callees_block(then_branch, fn_by_name, out);
+            if let Some(else_branch) = else_branch {
+                collect_direct_callees_expr(else_branch, fn_by_name, out);
+            }
+        }
+        HirExprKind::Block(block) => collect_direct_callees_block(block, fn_by_name, out),
+        HirExprKind::IntLit(_)
+        | HirExprKind::FloatLit(_)
+        | HirExprKind::BoolLit(_)
+        | HirExprKind::StringLit(_)
+        | HirExprKind::NoneLit
+        | HirExprKind::Path { .. } => {}
+    }
 }
 
 fn validate_generic_bounds(
@@ -3592,6 +4667,14 @@ fn classify_resource_type(ty: &Type, mode: ParamMode) -> Option<ClassifiedResour
             access: DescriptorAccess::ReadWrite,
             is_unsized: false,
         }),
+        Type::AccelStruct => Some(ClassifiedResource {
+            kind: DescriptorKind::AccelerationStructure,
+            dim: None,
+            sample_scalar: None,
+            image_format: None,
+            access: DescriptorAccess::ReadOnly,
+            is_unsized: false,
+        }),
         _ => None,
     }
 }
@@ -3604,7 +4687,7 @@ const fn rw_image_access(mode: ParamMode) -> DescriptorAccess {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct BodyScan {
     flags: u16,
     debug_channels: IndexSet<SmolStr>,
@@ -3620,6 +4703,22 @@ impl BodyScan {
 
     fn set(&mut self, flag: u16) {
         self.flags |= flag;
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        self.flags |= other.flags;
+        for ch in &other.debug_channels {
+            self.debug_channels.insert(ch.clone());
+        }
+        for spec in &other.used_specs {
+            self.used_specs.insert(spec.clone());
+        }
+        for param in &other.used_params {
+            self.used_params.insert(param.clone());
+        }
+        for res in &other.pack_resources {
+            self.pack_resources.insert(res.clone());
+        }
     }
 }
 
@@ -3709,6 +4808,63 @@ const fn is_integer_scalar(s: ScalarKind) -> bool {
         s,
         ScalarKind::I32 | ScalarKind::U32 | ScalarKind::I64 | ScalarKind::U64
     )
+}
+
+const fn is_opaque_handle_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::RayQuery
+            | Type::AccelStruct
+            | Type::Texture2D { .. }
+            | Type::Texture2DArray { .. }
+            | Type::Texture3D { .. }
+            | Type::TextureCube { .. }
+            | Type::RwImage2D(_)
+            | Type::RwImage2DArray(_)
+            | Type::RwImage3D(_)
+            | Type::Sampler
+            | Type::SamplerShadow
+            | Type::Buffer { .. }
+            | Type::RwBuffer { .. }
+    )
+}
+
+fn eval_const_int_expr(expr: &Expr) -> Option<i128> {
+    match expr {
+        Expr::IntLit(raw, _) => {
+            let clean = raw
+                .trim_end_matches("u64")
+                .trim_end_matches("i64")
+                .trim_end_matches("u32")
+                .trim_end_matches("i32")
+                .trim_end_matches(['u', 'i'])
+                .replace('_', "");
+            if let Some(hex) = clean
+                .strip_prefix("0x")
+                .or_else(|| clean.strip_prefix("0X"))
+            {
+                i128::from_str_radix(hex, 16).ok()
+            } else if let Some(bin) = clean
+                .strip_prefix("0b")
+                .or_else(|| clean.strip_prefix("0B"))
+            {
+                i128::from_str_radix(bin, 2).ok()
+            } else if let Some(oct) = clean
+                .strip_prefix("0o")
+                .or_else(|| clean.strip_prefix("0O"))
+            {
+                i128::from_str_radix(oct, 8).ok()
+            } else {
+                clean.parse::<i128>().ok()
+            }
+        }
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+            ..
+        } => eval_const_int_expr(operand).and_then(i128::checked_neg),
+        _ => None,
+    }
 }
 
 const fn is_assignment_op(op: BinaryOp) -> bool {
@@ -4164,7 +5320,16 @@ impl BodyScanner<'_, '_> {
                 Some(bool_ty)
             }
             BinaryOp::Eq | BinaryOp::Ne => {
-                if lt != rt {
+                if is_opaque_handle_type(&lhs_t) || is_opaque_handle_type(&rhs_t) {
+                    let ln = format_type_name(&self.ctx.module.types, lt);
+                    let rn = format_type_name(&self.ctx.module.types, rt);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("cannot compare opaque handle types `{ln}` and `{rn}`"),
+                        span,
+                    ));
+                    Some(bool_ty)
+                } else if lt != rt {
                     let ln = format_type_name(&self.ctx.module.types, lt);
                     let rn = format_type_name(&self.ctx.module.types, rt);
                     self.ctx.diags.push(Diagnostic::error(
@@ -4172,8 +5337,15 @@ impl BodyScanner<'_, '_> {
                         format!("cannot compare `{ln}` with `{rn}`"),
                         span,
                     ));
+                    Some(bool_ty)
+                } else if let Type::Vector { len, .. } = lhs_t {
+                    Some(self.ctx.module.types.alloc(Type::Vector {
+                        scalar: ScalarKind::Bool,
+                        len,
+                    }))
+                } else {
+                    Some(bool_ty)
                 }
-                Some(bool_ty)
             }
             BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => match (&lhs_t, &rhs_t) {
                 (Type::Scalar(a), Type::Scalar(b)) if a == b && is_numeric_scalar(*a) => {
@@ -4460,7 +5632,21 @@ impl BodyScanner<'_, '_> {
             Stmt::While {
                 cond, body, span, ..
             } => {
-                let (hir_cond, _) = self.lower_expr(cond, false);
+                let (hir_cond, cond_ty) = self.lower_expr(cond, false);
+                if let Some(ct) = cond_ty
+                    && self.is_concrete_value_ty(ct)
+                    && !matches!(
+                        self.ctx.module.types.get(ct),
+                        Type::Scalar(ScalarKind::Bool)
+                    )
+                {
+                    let tname = format_type_name(&self.ctx.module.types, ct);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("`while` condition must be `bool`, found `{tname}`"),
+                        hir_cond.span,
+                    ));
+                }
                 let (hir_body, _) = self.lower_block(body);
                 HirStmt::While {
                     cond: hir_cond,
@@ -4481,10 +5667,40 @@ impl BodyScanner<'_, '_> {
                 default,
                 span,
             } => {
-                let (hir_sel, _) = self.lower_expr(selector, false);
+                let (hir_sel, sel_ty) = self.lower_expr(selector, false);
+                if let Some(st) = sel_ty
+                    && self.is_concrete_value_ty(st)
+                    && !matches!(
+                        self.ctx.module.types.get(st),
+                        Type::Scalar(s) if is_integer_scalar(*s)
+                    )
+                {
+                    let tname = format_type_name(&self.ctx.module.types, st);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("`switch` selector must be an integer scalar, found `{tname}`"),
+                        hir_sel.span,
+                    ));
+                }
+                let mut seen_cases: IndexSet<i128> = IndexSet::new();
                 let mut hir_cases = Vec::with_capacity(cases.len());
                 for case in cases {
                     let (val, _) = self.lower_expr(&case.value, false);
+                    if let Some(const_val) = eval_const_int_expr(&case.value) {
+                        if !seen_cases.insert(const_val) {
+                            self.ctx.diags.push(Diagnostic::error(
+                                "E0270",
+                                format!("duplicate `switch` case value `{const_val}`"),
+                                case.span,
+                            ));
+                        }
+                    } else {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0270",
+                            "`switch` case label must be a constant integer expression",
+                            case.span,
+                        ));
+                    }
                     let (b, _) = self.lower_block(&case.body);
                     hir_cases.push(HirSwitchCase {
                         value: val,
@@ -4552,9 +5768,51 @@ impl BodyScanner<'_, '_> {
             ));
         }
 
-        for ((param_name, mode, expected_ty_opt), (hir_arg, actual_ty_opt)) in
-            sig_params.iter().zip(hir_args.iter().zip(arg_types.iter()))
+        let mut bound_params = vec![false; sig_params.len()];
+        for (idx, (hir_arg, actual_ty_opt)) in
+            hir_args.iter().zip(arg_types.iter()).enumerate()
         {
+            let param_idx = if let Some(ref arg_name) = hir_arg.name {
+                if let Some(pos) = sig_params.iter().position(|(pname, _, _)| pname == arg_name) {
+                    if bound_params[pos] {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0274",
+                            format!(
+                                "duplicate argument for parameter `{arg_name}` of `{callee_label}`"
+                            ),
+                            hir_arg.span,
+                        ));
+                        continue;
+                    }
+                    bound_params[pos] = true;
+                    pos
+                } else {
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0274",
+                        format!("unknown named argument `{arg_name}` for `{callee_label}`"),
+                        hir_arg.span,
+                    ));
+                    continue;
+                }
+            } else if idx < sig_params.len() {
+                if bound_params[idx] {
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0274",
+                        format!(
+                            "duplicate argument for parameter `{}` of `{callee_label}`",
+                            sig_params[idx].0
+                        ),
+                        hir_arg.span,
+                    ));
+                    continue;
+                }
+                bound_params[idx] = true;
+                idx
+            } else {
+                continue;
+            };
+
+            let (param_name, mode, expected_ty_opt) = &sig_params[param_idx];
             if matches!(mode, ParamMode::InOut | ParamMode::Out)
                 && !self.is_lvalue_mutable(&hir_arg.value)
             {
@@ -4960,18 +6218,16 @@ impl BodyScanner<'_, '_> {
                 if let Expr::Path { path, .. } = callee.as_ref() {
                     let joined = path.joined();
                     if joined == "mc::debug_write" {
-                        if self.is_compute {
-                            if let Some(first_arg) = args.first()
-                                && let Expr::StringLit(channel, _) = &first_arg.value
-                            {
-                                self.scan.debug_channels.insert(channel.clone());
-                            }
-                        } else {
+                        if self.is_non_compute_stage {
                             self.ctx.diags.push(Diagnostic::error(
                                 "E0250",
                                 "`mc::debug_write` is only valid inside `@stage(compute(...))` entry points",
                                 *span,
                             ));
+                        } else if let Some(first_arg) = args.first()
+                            && let Expr::StringLit(channel, _) = &first_arg.value
+                        {
+                            self.scan.debug_channels.insert(channel.clone());
                         }
                     } else if joined == "mc::param" {
                         if let Some(name) = extract_name_arg(args.first().map(|a| &a.value)) {
@@ -5562,6 +6818,8 @@ impl BodyScanner<'_, '_> {
                 let (hir_op, inner_ty) = self.lower_expr(operand, false);
                 let result_ty = match op {
                     UnaryOp::Not => {
+                        let mut res =
+                            Some(self.ctx.module.types.alloc(Type::Scalar(ScalarKind::Bool)));
                         if let Some(it) = inner_ty
                             && self.is_concrete_value_ty(it)
                         {
@@ -5570,20 +6828,22 @@ impl BodyScanner<'_, '_> {
                                 | Type::Vector {
                                     scalar: ScalarKind::Bool,
                                     ..
-                                } => {}
+                                } => {
+                                    res = Some(it);
+                                }
                                 _ => {
                                     let tname = format_type_name(&self.ctx.module.types, it);
                                     self.ctx.diags.push(Diagnostic::error(
                                         "E0270",
                                         format!(
-                                            "logical `!` requires `bool` operand, found `{tname}`"
+                                            "logical `!` requires `bool` or `bvecN` operand, found `{tname}`"
                                         ),
                                         *span,
                                     ));
                                 }
                             }
                         }
-                        Some(self.ctx.module.types.alloc(Type::Scalar(ScalarKind::Bool)))
+                        res
                     }
                     UnaryOp::Neg => {
                         if let Some(it) = inner_ty
@@ -5697,12 +6957,29 @@ impl BodyScanner<'_, '_> {
                 span,
             } => {
                 let (hir_recv, recv_ty) = self.lower_expr(receiver, false);
-                let (hir_idx, _) = self.lower_expr(index, false);
+                let (hir_idx, idx_ty) = self.lower_expr(index, false);
+                if let Some(it) = idx_ty
+                    && self.is_concrete_value_ty(it)
+                    && !matches!(
+                        self.ctx.module.types.get(it),
+                        Type::Scalar(s) if is_integer_scalar(*s)
+                    )
+                {
+                    let tname = format_type_name(&self.ctx.module.types, it);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("index expression must be an integer scalar, found `{tname}`"),
+                        hir_idx.span,
+                    ));
+                }
                 let elem_ty =
                     recv_ty.and_then(|ty_id| match self.ctx.module.types.get(ty_id).clone() {
                         Type::Array { element, .. }
                         | Type::Buffer { element }
-                        | Type::RwBuffer { element } => Some(element),
+                        | Type::RwBuffer { element }
+                        | Type::Pointer {
+                            pointee: element, ..
+                        } => Some(element),
                         Type::Texture2D {
                             sample_scalar,
                             unsized_array: true,
@@ -5719,16 +6996,18 @@ impl BodyScanner<'_, '_> {
                                 .types
                                 .alloc(Type::Vector { scalar, len: rows }),
                         ),
-                        Type::Struct { fields, .. }
-                            if fields.len() == 1 && fields[0].0 == "items" =>
-                        {
-                            match self.ctx.module.types.get(fields[0].1) {
-                                Type::Buffer { element } | Type::RwBuffer { element } => {
-                                    Some(*element)
+                        Type::Struct { fields, .. } => fields.last().and_then(|(fname, fty)| {
+                            if fname == "items" {
+                                match self.ctx.module.types.get(*fty) {
+                                    Type::Buffer { element } | Type::RwBuffer { element } => {
+                                        Some(*element)
+                                    }
+                                    _ => None,
                                 }
-                                _ => None,
+                            } else {
+                                None
                             }
-                        }
+                        }),
                         _ => None,
                     });
                 let ty = elem_ty.unwrap_or_else(|| self.void_ty());
@@ -5751,7 +7030,21 @@ impl BodyScanner<'_, '_> {
                 else_branch,
                 span,
             } => {
-                let (hir_cond, _) = self.lower_expr(cond, false);
+                let (hir_cond, cond_ty) = self.lower_expr(cond, false);
+                if let Some(ct) = cond_ty
+                    && self.is_concrete_value_ty(ct)
+                    && !matches!(
+                        self.ctx.module.types.get(ct),
+                        Type::Scalar(ScalarKind::Bool)
+                    )
+                {
+                    let tname = format_type_name(&self.ctx.module.types, ct);
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("`if` condition must be `bool`, found `{tname}`"),
+                        hir_cond.span,
+                    ));
+                }
                 let (hir_then, then_ty) = self.lower_block(then_branch);
                 let (hir_else, else_ty) = if let Some(eb) = else_branch.as_deref() {
                     let (e, ty) = self.lower_expr(eb, false);
@@ -5774,7 +7067,26 @@ impl BodyScanner<'_, '_> {
                         ),
                     );
                 }
-                let res_ty = then_ty.or(else_ty);
+                let res_ty = if else_branch.is_some() {
+                    if let (Some(tt), Some(et)) = (then_ty, else_ty)
+                        && self.is_concrete_value_ty(tt)
+                        && self.is_concrete_value_ty(et)
+                        && tt != et
+                    {
+                        let tn = format_type_name(&self.ctx.module.types, tt);
+                        let en = format_type_name(&self.ctx.module.types, et);
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0270",
+                            format!(
+                                "`if` and `else` branches have incompatible types: `{tn}` vs `{en}`"
+                            ),
+                            *span,
+                        ));
+                    }
+                    then_ty.or(else_ty)
+                } else {
+                    None
+                };
                 let ty = res_ty.unwrap_or_else(|| self.void_ty());
                 (
                     HirExpr {
@@ -5934,10 +7246,20 @@ fn infer_builtin_call_return_type(
         | "refract"
         | "cross"
         | "fma"
-        | "smoothstep"
-        | "step"
         | "saturate" => arg_types.first().copied().flatten(),
-        "dot" | "length" | "distance" => Some(types.alloc(Type::Scalar(ScalarKind::F32))),
+        "smoothstep" | "step" => arg_types.last().copied().flatten(),
+        "dot" | "length" | "distance" => {
+            let scalar = arg_types
+                .first()
+                .copied()
+                .flatten()
+                .and_then(|ty_id| match types.get(ty_id) {
+                    Type::Scalar(s) | Type::Vector { scalar: s, .. } => Some(*s),
+                    _ => None,
+                })
+                .unwrap_or(ScalarKind::F32);
+            Some(types.alloc(Type::Scalar(scalar)))
+        }
         "mc::reconstruct_world_pos" | "mc::view_dir" | "mc::sample_sky" => {
             Some(types.alloc(Type::Vector {
                 scalar: ScalarKind::F32,
@@ -6018,6 +7340,18 @@ fn infer_builtin_constructor_type(name: &str, types: &mut TypeArena) -> Option<T
         },
         "f16vec4" => Type::Vector {
             scalar: ScalarKind::F16,
+            len: 4,
+        },
+        "bvec2" => Type::Vector {
+            scalar: ScalarKind::Bool,
+            len: 2,
+        },
+        "bvec3" => Type::Vector {
+            scalar: ScalarKind::Bool,
+            len: 3,
+        },
+        "bvec4" => Type::Vector {
+            scalar: ScalarKind::Bool,
             len: 4,
         },
         "mat2" => Type::Matrix {
@@ -6218,6 +7552,10 @@ struct TypeLowerCtx<'a> {
     struct_ids: Option<&'a mut IndexMap<SmolStr, HirStructId>>,
     builtin_struct_types: &'a IndexMap<SmolStr, TypeId>,
     struct_generic_args: Option<&'a mut IndexMap<SmolStr, (SmolStr, Vec<TypeId>)>>,
+    diags: Option<&'a mut DiagnosticBag>,
+    bool_checked_structs: Option<&'a mut IndexSet<SmolStr>>,
+    explicit_block_layout_structs: Option<&'a IndexSet<SmolStr>>,
+    legality_checked_mono_structs: Option<&'a mut IndexSet<SmolStr>>,
 }
 
 impl<'a> TypeLowerCtx<'a> {
@@ -6225,6 +7563,7 @@ impl<'a> TypeLowerCtx<'a> {
         types: &'a mut TypeArena,
         struct_types: &'a mut IndexMap<SmolStr, TypeId>,
         builtin_struct_types: &'a IndexMap<SmolStr, TypeId>,
+        diags: Option<&'a mut DiagnosticBag>,
     ) -> Self {
         Self {
             types,
@@ -6233,6 +7572,10 @@ impl<'a> TypeLowerCtx<'a> {
             struct_ids: None,
             builtin_struct_types,
             struct_generic_args: None,
+            diags,
+            bool_checked_structs: None,
+            explicit_block_layout_structs: None,
+            legality_checked_mono_structs: None,
         }
     }
 
@@ -6251,6 +7594,37 @@ impl<'a> TypeLowerCtx<'a> {
             struct_ids: Some(struct_ids),
             builtin_struct_types,
             struct_generic_args: Some(struct_generic_args),
+            diags: None,
+            bool_checked_structs: None,
+            explicit_block_layout_structs: None,
+            legality_checked_mono_structs: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    const fn full_with_diags(
+        types: &'a mut TypeArena,
+        structs: &'a mut Arena<HirStruct>,
+        struct_types: &'a mut IndexMap<SmolStr, TypeId>,
+        struct_ids: &'a mut IndexMap<SmolStr, HirStructId>,
+        builtin_struct_types: &'a IndexMap<SmolStr, TypeId>,
+        struct_generic_args: &'a mut IndexMap<SmolStr, (SmolStr, Vec<TypeId>)>,
+        diags: &'a mut DiagnosticBag,
+        bool_checked_structs: &'a mut IndexSet<SmolStr>,
+        explicit_block_layout_structs: &'a IndexSet<SmolStr>,
+        legality_checked_mono_structs: &'a mut IndexSet<SmolStr>,
+    ) -> Self {
+        Self {
+            types,
+            structs: Some(structs),
+            struct_types,
+            struct_ids: Some(struct_ids),
+            builtin_struct_types,
+            struct_generic_args: Some(struct_generic_args),
+            diags: Some(diags),
+            bool_checked_structs: Some(bool_checked_structs),
+            explicit_block_layout_structs: Some(explicit_block_layout_structs),
+            legality_checked_mono_structs: Some(legality_checked_mono_structs),
         }
     }
 }
@@ -6283,25 +7657,38 @@ fn check_buffer_struct_bool_inner(
     while let Type::Array { element, .. } = types.get(elem_id) {
         elem_id = *element;
     }
-    let Type::Struct { name, .. } = types.get(elem_id) else {
-        return;
-    };
-    let struct_name = name.clone();
-    if bool_checked_structs.contains(struct_name.as_str()) {
-        return;
-    }
-    if types.contains_bool(elem_id) {
-        bool_checked_structs.insert(struct_name.clone());
+    if let Type::Struct { name, .. } = types.get(elem_id) {
+        let struct_name = name.clone();
+        if bool_checked_structs.contains(struct_name.as_str()) {
+            return;
+        }
+        if types.contains_bool(elem_id) {
+            bool_checked_structs.insert(struct_name.clone());
+            diags.push(
+                Diagnostic::error(
+                    "E0223",
+                    format!(
+                        "`bool` is forbidden inside interface (`Block`) struct `{struct_name}` used as a buffer element"
+                    ),
+                    span,
+                )
+                .with_note(
+                    "Vulkan SPIR-V forbids OpTypeBool inside Block-decorated push-constant, UBO, and SSBO structs; use `u32` instead",
+                ),
+            );
+        }
+    } else if types.contains_bool(elem_id) {
+        let type_name = format_type_name(types, ty_id);
         diags.push(
             Diagnostic::error(
                 "E0223",
                 format!(
-                    "`bool` is forbidden inside interface (`Block`) struct `{struct_name}` used as a buffer element"
+                    "`bool` is forbidden inside buffer or physical pointer type `{type_name}`"
                 ),
                 span,
             )
             .with_note(
-                "Vulkan SPIR-V forbids OpTypeBool inside Block-decorated push-constant, UBO, and SSBO structs; use `u32` instead",
+                "Vulkan SPIR-V forbids OpTypeBool inside Block-decorated push-constant, UBO, SSBO, and physical storage buffer types; use `u32` instead",
             ),
         );
     }
@@ -6414,18 +7801,23 @@ fn format_type_name(types: &TypeArena, id: TypeId) -> String {
     }
 }
 
-fn substitute_type(types: &mut TypeArena, id: TypeId, subst: &IndexMap<SmolStr, TypeId>) -> TypeId {
-    if !contains_type_param(types, id) {
+fn substitute_type(
+    ctx: &mut TypeLowerCtx<'_>,
+    id: TypeId,
+    subst: &IndexMap<SmolStr, TypeId>,
+    use_span: Span,
+) -> TypeId {
+    if !contains_type_param(ctx.types, id) {
         return id;
     }
-    match types.get(id).clone() {
+    match ctx.types.get(id).clone() {
         Type::TypeParam(param) => subst.get(&param).copied().unwrap_or(id),
         Type::Array { element, len } => {
-            let new_elem = substitute_type(types, element, subst);
+            let new_elem = substitute_type(ctx, element, subst, use_span);
             if new_elem == element {
                 id
             } else {
-                types.alloc(Type::Array {
+                ctx.types.alloc(Type::Array {
                     element: new_elem,
                     len,
                 })
@@ -6436,11 +7828,11 @@ fn substitute_type(types: &mut TypeArena, id: TypeId, subst: &IndexMap<SmolStr, 
             mutable,
             align,
         } => {
-            let new_pointee = substitute_type(types, pointee, subst);
+            let new_pointee = substitute_type(ctx, pointee, subst, use_span);
             if new_pointee == pointee {
                 id
             } else {
-                types.alloc(Type::Pointer {
+                ctx.types.alloc(Type::Pointer {
                     pointee: new_pointee,
                     mutable,
                     align,
@@ -6448,19 +7840,19 @@ fn substitute_type(types: &mut TypeArena, id: TypeId, subst: &IndexMap<SmolStr, 
             }
         }
         Type::Buffer { element } => {
-            let new_elem = substitute_type(types, element, subst);
+            let new_elem = substitute_type(ctx, element, subst, use_span);
             if new_elem == element {
                 id
             } else {
-                types.alloc(Type::Buffer { element: new_elem })
+                ctx.types.alloc(Type::Buffer { element: new_elem })
             }
         }
         Type::RwBuffer { element } => {
-            let new_elem = substitute_type(types, element, subst);
+            let new_elem = substitute_type(ctx, element, subst, use_span);
             if new_elem == element {
                 id
             } else {
-                types.alloc(Type::RwBuffer { element: new_elem })
+                ctx.types.alloc(Type::RwBuffer { element: new_elem })
             }
         }
         Type::Struct {
@@ -6468,17 +7860,59 @@ fn substitute_type(types: &mut TypeArena, id: TypeId, subst: &IndexMap<SmolStr, 
             layout,
             fields,
         } => {
+            // Route nested generic structs through `monomorphize_struct_with_args` so they get
+            // registered in `module.structs` and undergo full Pass 3 legality validation.
+            let nested_generic = ctx
+                .struct_generic_args
+                .as_deref()
+                .and_then(|sga| sga.get(name.as_str()).cloned());
+            if let Some((base_name, orig_args)) = nested_generic {
+                let new_args: Vec<TypeId> = orig_args
+                    .into_iter()
+                    .map(|arg_ty| substitute_type(ctx, arg_ty, subst, use_span))
+                    .collect();
+                if let Some(mono_id) =
+                    monomorphize_struct_with_args(&base_name, new_args, ctx, use_span)
+                {
+                    return mono_id;
+                }
+            } else if let Some(base_params) = ctx
+                .structs
+                .as_deref()
+                .zip(ctx.struct_ids.as_deref())
+                .and_then(|(structs, struct_ids)| {
+                    let &base_sid = struct_ids.get(name.as_str())?;
+                    let params = &structs[base_sid].generic_params;
+                    (!params.is_empty()).then(|| params.clone())
+                })
+            {
+                let new_args: Vec<TypeId> = base_params
+                    .into_iter()
+                    .map(|gp| {
+                        subst
+                            .get(&gp)
+                            .copied()
+                            .unwrap_or_else(|| ctx.types.alloc(Type::TypeParam(gp)))
+                    })
+                    .collect();
+                if let Some(mono_id) =
+                    monomorphize_struct_with_args(name.as_str(), new_args, ctx, use_span)
+                {
+                    return mono_id;
+                }
+            }
+
             let mut changed = false;
             let mut new_fields = Vec::with_capacity(fields.len());
             for (field_name, field_ty) in fields {
-                let sub_ty = substitute_type(types, field_ty, subst);
+                let sub_ty = substitute_type(ctx, field_ty, subst, use_span);
                 if sub_ty != field_ty {
                     changed = true;
                 }
                 new_fields.push((field_name, sub_ty));
             }
             if changed {
-                types.alloc(Type::Struct {
+                ctx.types.alloc(Type::Struct {
                     name,
                     layout,
                     fields: new_fields,
@@ -6491,31 +7925,145 @@ fn substitute_type(types: &mut TypeArena, id: TypeId, subst: &IndexMap<SmolStr, 
     }
 }
 
-fn try_monomorphize_struct(
+/// Runs Pass 3 SPIR-V legality checks on a concretely monomorphized generic struct once per
+/// instantiation (when diagnostics are enabled in `ctx`).
+fn validate_monomorphized_struct(
     base_name: &str,
-    args: &[TypeArg],
+    mono_name: &SmolStr,
+    mono_type_id: TypeId,
     ctx: &mut TypeLowerCtx<'_>,
-    generic_params: &IndexSet<SmolStr>,
-    type_subst: &IndexMap<SmolStr, TypeId>,
-) -> Option<TypeId> {
-    let type_args: Vec<&TypeExpr> = args
-        .iter()
-        .filter_map(|arg| match arg {
-            TypeArg::Type(inner) => Some(inner),
-            TypeArg::NamedExpr { .. } => None,
+    use_span: Span,
+) {
+    if ctx.diags.is_none() {
+        return;
+    }
+    if let Some(checked) = ctx.legality_checked_mono_structs.as_deref_mut()
+        && !checked.insert(mono_name.clone())
+    {
+        return;
+    }
+    let Some((is_push_constant, required_caps, fields, computed_layout)) = ctx
+        .structs
+        .as_deref()
+        .zip(ctx.struct_ids.as_deref())
+        .and_then(|(structs, struct_ids)| {
+            let &sid = struct_ids.get(mono_name.as_str())?;
+            let st = &structs[sid];
+            Some((
+                st.is_push_constant,
+                st.required_caps,
+                st.fields.clone(),
+                st.computed_layout.clone(),
+            ))
         })
-        .collect();
-    if type_args.is_empty() {
-        return None;
+    else {
+        return;
+    };
+
+    let has_explicit_block_layout = ctx
+        .explicit_block_layout_structs
+        .is_some_and(|set| set.contains(base_name));
+    let is_interface_block = is_push_constant || has_explicit_block_layout;
+    if is_interface_block
+        && let Some(bool_checked) = ctx.bool_checked_structs.as_deref_mut()
+    {
+        bool_checked.insert(mono_name.clone());
     }
 
+    let Some(diags) = ctx.diags.as_deref_mut() else {
+        return;
+    };
+
+    for field in &fields {
+        if ctx.types.contains_ray_query(field.ty) {
+            diags.push(
+                Diagnostic::error(
+                    "E0210",
+                    format!(
+                        "`RayQuery` is forbidden inside struct `{mono_name}` field `{}`",
+                        field.name
+                    ),
+                    use_span,
+                )
+                .with_note(
+                    "SPV_KHR_ray_query forbids RayQueryKHR in aggregates or OpPhi merges; declare it as a local variable",
+                ),
+            );
+        }
+        if !required_caps.contains(HardwareCaps::FLOAT16) && ctx.types.requires_float16(field.ty) {
+            diags.push(
+                Diagnostic::error(
+                    "E0232",
+                    format!(
+                        "`f16` field `{}` in struct `{mono_name}` requires `#[cap(float16)]`",
+                        field.name
+                    ),
+                    use_span,
+                )
+                .with_note(
+                    "Hyaloclast does not enable shader_float16 unconditionally in device_merger.rs",
+                ),
+            );
+        }
+        if is_interface_block && ctx.types.contains_bool(field.ty) {
+            diags.push(
+                Diagnostic::error(
+                    "E0223",
+                    format!(
+                        "`bool` is forbidden inside interface (`Block`) struct `{mono_name}` field `{}`",
+                        field.name
+                    ),
+                    use_span,
+                )
+                .with_note(
+                    "Vulkan SPIR-V forbids OpTypeBool inside Block-decorated push-constant, UBO, and SSBO structs; use `u32` instead",
+                ),
+            );
+        }
+    }
+
+    if ctx.types.has_layout_cycle(mono_type_id) {
+        diags.push(Diagnostic::error(
+            "E0204",
+            format!("recursive struct `{mono_name}` has infinite size"),
+            use_span,
+        ));
+    }
+
+    if is_push_constant
+        && let Some(ref computed) = computed_layout
+        && computed.size > MAX_PUSH_CONSTANT_BYTES
+    {
+        diags.push(
+            Diagnostic::error(
+                "E0220",
+                format!(
+                    "push constant struct `{mono_name}` is {} bytes, exceeding the {MAX_PUSH_CONSTANT_BYTES} byte limit",
+                    computed.size
+                ),
+                use_span,
+            )
+            .with_primary_label(
+                use_span,
+                "exceeds 128-byte Vulkan push-constant budget",
+            ),
+        );
+    }
+}
+
+fn monomorphize_struct_with_args(
+    base_name: &str,
+    lowered_args: Vec<TypeId>,
+    ctx: &mut TypeLowerCtx<'_>,
+    use_span: Span,
+) -> Option<TypeId> {
     let (base_generic_params, base_layout, base_is_pc, base_caps, base_fields, base_span) = {
         let structs = ctx.structs.as_deref()?;
         let struct_ids = ctx.struct_ids.as_deref()?;
         let &base_sid = struct_ids.get(base_name)?;
         let base_struct = &structs[base_sid];
         if base_struct.generic_params.is_empty()
-            || base_struct.generic_params.len() != type_args.len()
+            || base_struct.generic_params.len() != lowered_args.len()
         {
             return None;
         }
@@ -6529,14 +8077,9 @@ fn try_monomorphize_struct(
         )
     };
 
-    let mut lowered_args = Vec::with_capacity(type_args.len());
-    for arg_expr in type_args {
-        let arg_ty = lower_type_expr(arg_expr, ctx, generic_params, type_subst)?;
-        if contains_type_param(ctx.types, arg_ty) {
-            return None;
-        }
-        lowered_args.push(arg_ty);
-    }
+    let is_concrete = !lowered_args
+        .iter()
+        .any(|&arg_ty| contains_type_param(ctx.types, arg_ty));
 
     let arg_names: Vec<String> = lowered_args
         .iter()
@@ -6545,6 +8088,9 @@ fn try_monomorphize_struct(
     let mono_name = SmolStr::from(format!("{base_name}<{}>", arg_names.join(", ")));
 
     if let Some(&existing_ty) = ctx.struct_types.get(mono_name.as_str()) {
+        if is_concrete {
+            validate_monomorphized_struct(base_name, &mono_name, existing_ty, ctx, use_span);
+        }
         return Some(existing_ty);
     }
 
@@ -6556,7 +8102,7 @@ fn try_monomorphize_struct(
     let mut hir_fields = Vec::with_capacity(base_fields.len());
     let mut type_fields = Vec::with_capacity(base_fields.len());
     for field in base_fields {
-        let concrete_ty = substitute_type(ctx.types, field.ty, &subst);
+        let concrete_ty = substitute_type(ctx, field.ty, &subst, use_span);
         type_fields.push((field.name.clone(), concrete_ty));
         hir_fields.push(HirStructField {
             name: field.name,
@@ -6565,33 +8111,95 @@ fn try_monomorphize_struct(
         });
     }
 
-    let computed_layout = ctx.types.compute_struct_layout(&type_fields, base_layout);
     let mono_type_id = ctx.types.alloc(Type::Struct {
         name: mono_name.clone(),
         layout: base_layout,
-        fields: type_fields,
+        fields: type_fields.clone(),
     });
 
-    if let (Some(structs), Some(struct_ids)) =
-        (ctx.structs.as_deref_mut(), ctx.struct_ids.as_deref_mut())
-    {
-        let mono_sid = structs.alloc(HirStruct {
-            name: mono_name.clone(),
-            generic_params: Vec::new(),
-            layout: base_layout,
-            is_push_constant: base_is_pc,
-            required_caps: base_caps,
-            fields: hir_fields,
-            computed_layout,
-            span: base_span,
-        });
-        struct_ids.insert(mono_name.clone(), mono_sid);
+    if is_concrete {
+        let computed_layout = if ctx.types.has_layout_cycle(mono_type_id) {
+            None
+        } else {
+            ctx.types.compute_struct_layout(&type_fields, base_layout)
+        };
+        if let (Some(structs), Some(struct_ids)) =
+            (ctx.structs.as_deref_mut(), ctx.struct_ids.as_deref_mut())
+        {
+            let mono_sid = structs.alloc(HirStruct {
+                name: mono_name.clone(),
+                generic_params: Vec::new(),
+                layout: base_layout,
+                is_push_constant: base_is_pc,
+                required_caps: base_caps,
+                fields: hir_fields,
+                computed_layout,
+                span: base_span,
+            });
+            struct_ids.insert(mono_name.clone(), mono_sid);
+        }
     }
+
     if let Some(sga) = ctx.struct_generic_args.as_deref_mut() {
         sga.insert(mono_name.clone(), (SmolStr::new(base_name), lowered_args));
     }
-    ctx.struct_types.insert(mono_name, mono_type_id);
+    ctx.struct_types.insert(mono_name.clone(), mono_type_id);
+
+    if is_concrete {
+        validate_monomorphized_struct(base_name, &mono_name, mono_type_id, ctx, use_span);
+    }
+
     Some(mono_type_id)
+}
+
+fn try_monomorphize_struct(
+    base_name: &str,
+    args: &[TypeArg],
+    ctx: &mut TypeLowerCtx<'_>,
+    generic_params: &IndexSet<SmolStr>,
+    type_subst: &IndexMap<SmolStr, TypeId>,
+    use_span: Span,
+) -> Option<TypeId> {
+    let type_args: Vec<&TypeExpr> = args
+        .iter()
+        .filter_map(|arg| match arg {
+            TypeArg::Type(inner) => Some(inner),
+            TypeArg::NamedExpr { .. } => None,
+        })
+        .collect();
+
+    let expected_arity = {
+        let structs = ctx.structs.as_deref()?;
+        let struct_ids = ctx.struct_ids.as_deref()?;
+        let &base_sid = struct_ids.get(base_name)?;
+        structs[base_sid].generic_params.len()
+    };
+
+    if expected_arity != type_args.len() {
+        if let Some(diags) = ctx.diags.as_deref_mut() {
+            diags.push(Diagnostic::error(
+                "E0274",
+                format!(
+                    "struct `{base_name}` expects {expected_arity} generic type argument(s), but {} were supplied",
+                    type_args.len()
+                ),
+                use_span,
+            ));
+        }
+        return None;
+    }
+
+    if type_args.is_empty() {
+        return None;
+    }
+
+    let mut lowered_args = Vec::with_capacity(type_args.len());
+    for arg_expr in type_args {
+        let arg_ty = lower_type_expr(arg_expr, ctx, generic_params, type_subst)?;
+        lowered_args.push(arg_ty);
+    }
+
+    monomorphize_struct_with_args(base_name, lowered_args, ctx, use_span)
 }
 
 fn lower_type_expr(
@@ -6605,7 +8213,7 @@ fn lower_type_expr(
             path,
             args,
             unsized_array,
-            ..
+            span,
         } => {
             let name = path.joined();
             if args.is_empty() && !*unsized_array {
@@ -6617,11 +8225,26 @@ fn lower_type_expr(
                 }
             }
             if let Some(&id) = ctx.struct_types.get(name.as_str()) {
-                if !args.is_empty()
-                    && let Some(mono_id) =
-                        try_monomorphize_struct(&name, args, ctx, generic_params, type_subst)
+                let expected_arity = ctx
+                    .structs
+                    .as_deref()
+                    .zip(ctx.struct_ids.as_deref())
+                    .and_then(|(structs, struct_ids)| {
+                        struct_ids
+                            .get(name.as_str())
+                            .map(|&sid| structs[sid].generic_params.len())
+                    });
+                if (!args.is_empty() || expected_arity.is_some_and(|n| n > 0))
+                    && ctx.structs.is_some()
                 {
-                    return Some(mono_id);
+                    return try_monomorphize_struct(
+                        &name,
+                        args,
+                        ctx,
+                        generic_params,
+                        type_subst,
+                        *span,
+                    );
                 }
                 return Some(id);
             }
@@ -6682,6 +8305,18 @@ fn lower_type_expr(
                 },
                 "f16vec4" => Type::Vector {
                     scalar: ScalarKind::F16,
+                    len: 4,
+                },
+                "bvec2" => Type::Vector {
+                    scalar: ScalarKind::Bool,
+                    len: 2,
+                },
+                "bvec3" => Type::Vector {
+                    scalar: ScalarKind::Bool,
+                    len: 3,
+                },
+                "bvec4" => Type::Vector {
+                    scalar: ScalarKind::Bool,
                     len: 4,
                 },
                 "mat2" => Type::Matrix {
@@ -6782,9 +8417,19 @@ fn lower_type_expr(
             };
             Some(ctx.types.alloc(resolved))
         }
-        TypeExpr::Array { element, len, .. } => {
+        TypeExpr::Array { element, len, span } => {
             let elem_id = lower_type_expr(element, ctx, generic_params, type_subst)?;
             let count = parse_u32_lit(Some(len))?;
+            if count == 0 {
+                if let Some(diags) = ctx.diags.as_deref_mut() {
+                    diags.push(Diagnostic::error(
+                        "E0205",
+                        "array length must be at least 1 (SPIR-V `OpTypeArray` forbids zero-length arrays)",
+                        *span,
+                    ));
+                }
+                return None;
+            }
             Some(ctx.types.alloc(Type::Array {
                 element: elem_id,
                 len: count,
@@ -8227,5 +9872,393 @@ mod tests {
             *hir.types.get(func.local_types["bounces"]),
             Type::Scalar(ScalarKind::I32)
         );
+    }
+
+    #[test]
+    fn rejects_bool_in_buffers_arrays_and_pointers_directly() {
+        let src = r"
+            @stage(compute(8, 8, 1))
+            pub fn bad_bool_buffers(
+                b1: Buffer<bool>,
+                b2: RWBuffer<bool>,
+                b3: Buffer<[bool; 4]>,
+                p1: ptr<bool, align = 4>,
+                p2: ptr_mut<bvec4, align = 16>,
+            ) {}
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (_, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
+        let bool_errs: Vec<_> = diags
+            .as_slice()
+            .iter()
+            .filter(|d| d.code == "E0223")
+            .collect();
+        assert_eq!(bool_errs.len(), 5, "expected 5 E0223 errors: {diags:?}");
+    }
+
+    #[test]
+    fn rejects_zero_length_arrays_in_type_expr() {
+        let src = r"
+            struct BadArr {
+                data: [f32; 0],
+            }
+            pub fn bad_local() {
+                let arr: [u32; 0];
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (_, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
+        let arr_errs: Vec<_> = diags
+            .as_slice()
+            .iter()
+            .filter(|d| d.code == "E0205")
+            .collect();
+        assert_eq!(arr_errs.len(), 2, "expected 2 E0205 errors: {diags:?}");
+    }
+
+    #[test]
+    fn classifies_accel_struct_entry_point_param() {
+        let src = r"
+            @stage(compute(8, 8, 1))
+            pub fn trace_custom(scene: AccelStruct) {}
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier2RayQuery, HardwareCaps::all());
+        assert!(!diags.has_errors(), "{:?}", diags.as_slice());
+
+        let func = hir.find_function("trace_custom").expect("trace_custom");
+        assert!(
+            func.reflection.descriptors.iter().any(|d| {
+                d.name == "scene"
+                    && d.set == DESCRIPTOR_SET_PER_PASS
+                    && d.binding == 1
+                    && d.kind == DescriptorKind::AccelerationStructure
+            }),
+            "expected AccelStruct param descriptor: {:?}",
+            func.reflection.descriptors
+        );
+    }
+
+    #[test]
+    fn enforces_duplicate_and_oversized_push_constant_params() {
+        let src = r"
+            #[layout(scalar)]
+            struct SmallPc {
+                x: f32,
+            }
+
+            #[layout(scalar)]
+            struct OversizedUnannotated {
+                a: mat4,
+                b: mat4,
+                c: vec4,
+            }
+
+            @stage(compute(8, 8, 1))
+            pub fn bad_pcs(
+                #[push_constant] pc1: SmallPc,
+                #[push_constant] pc2: OversizedUnannotated,
+            ) {}
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (_, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
+        let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0222"), "expected E0222: {diags:?}");
+        assert!(codes.contains(&"E0220"), "expected E0220: {diags:?}");
+    }
+
+    #[test]
+    fn typechecks_bvec_not_vec_eq_opaque_eq_builtins_and_indexing() {
+        let src = r"
+            #[cap(float16, ray_query)]
+            pub fn test_ops(
+                bv: bvec3,
+                v1: vec3,
+                v2: vec3,
+                h1: f16vec3,
+                h2: f16vec3,
+                p: ptr<vec4, align = 16>,
+                idx: u32,
+            ) {
+                let nb: bvec3 = !bv;
+                let eqv: bvec3 = v1 == v2;
+                let d16: f16 = dot(h1, h2);
+                let l16: f16 = length(h1);
+                let dist16: f16 = distance(h1, h2);
+                let st: vec3 = step(0.5, v1);
+                let sm: vec3 = smoothstep(0.0, 1.0, v1);
+                let elem: vec4 = p[idx];
+                let light_pos: vec3 = mc::lights[idx].pos;
+                let res_w: f32 = mc::reservoirs[idx].w;
+            }
+
+            #[cap(ray_query)]
+            pub fn bad_ops(tex1: Texture2D<f32>, tex2: Texture2D<f32>, v: vec4) {
+                let bad_eq: bool = tex1 == tex2;
+                let bad_idx: f32 = v[1.5];
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (_, diags) = lower_unit(&parsed.unit, RenderTier::Tier2RayQuery, HardwareCaps::all());
+        let e0270: Vec<_> = diags
+            .as_slice()
+            .iter()
+            .filter(|d| d.code == "E0270")
+            .collect();
+        assert_eq!(e0270.len(), 2, "expected 2 E0270 errors in bad_ops: {diags:?}");
+    }
+
+    #[test]
+    fn validates_control_flow_switch_const_tail_return_and_named_args() {
+        let src = r"
+            const BAD_CONST: u32 = 1.5;
+
+            fn pair(a: f32, b: u32) -> f32 {
+                return a;
+            }
+
+            fn bad_tail() -> f32 {
+                42u32
+            }
+
+            pub fn test_cf(c: bool, x: i32) {
+                let ok: f32 = pair(b = 1u32, a = 2.0);
+                let dup: f32 = pair(a = 1.0, a = 2.0);
+                let unk: f32 = pair(a = 1.0, z = 2u32);
+
+                if 123 {
+                    let y: i32 = 1;
+                }
+                while 1.0 {
+                    break;
+                }
+                let bad_if = if c { 1.0 } else { 2u32 };
+                let void_if = if c { 1.0 };
+
+                switch 1.5 {
+                    case 0: { break; }
+                    case 0: { break; }
+                    default: { break; }
+                }
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
+        let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0275"), "expected E0275 for bad_tail: {diags:?}");
+        assert!(
+            codes.iter().filter(|&&c| c == "E0274").count() >= 2,
+            "expected E0274 for duplicate/unknown named args: {diags:?}"
+        );
+        assert!(
+            codes.iter().filter(|&&c| c == "E0270").count() >= 6,
+            "expected E0270 for const/if/while/switch errors: {diags:?}"
+        );
+
+        // Else-less `if` must yield `Void` (not `f32`).
+        let func = hir.find_function("test_cf").expect("test_cf");
+        assert!(
+            !func.local_types.contains_key("void_if"),
+            "else-less if should yield Void, got {:?}",
+            func.local_types.get("void_if")
+        );
+    }
+
+    #[test]
+    fn propagates_reflection_and_caps_transitively_across_helpers() {
+        let src = r#"
+            @stage(compute(8, 8, 1))
+            pub fn entry_main(#[builtin(global_invocation_id)] gid: uvec3) {
+                helper_mid(gid.xy);
+            }
+
+            fn helper_mid(px: uvec2) {
+                helper_leaf(px);
+            }
+
+            #[cap(ray_query)]
+            fn helper_leaf(px: uvec2) {
+                let _t = mc::tlas;
+                let _l = mc::lights.count;
+                let _b = mc::bindless[0u];
+                let _r = mc::resources::noise;
+                let _p = mc::param(exposure);
+                let _s = mc::spec(enable_gi);
+                let _sg = subgroup_ballot(true);
+                mc::debug_write("transitive_dbg", px, vec4(1.0, 0.0, 0.0, 1.0));
+                let _ptr: ptr<f32, align = 4>;
+            }
+        "#;
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier2RayQuery, HardwareCaps::all());
+        assert!(!diags.has_errors(), "{:?}", diags.as_slice());
+
+        let entry = hir.find_function("entry_main").expect("entry_main");
+        assert!(entry.required_caps.contains(HardwareCaps::RAY_QUERY));
+        assert!(entry.reflection.uses_bda);
+        assert!(entry.reflection.uses_subgroups);
+        assert!(entry
+            .reflection
+            .descriptors
+            .iter()
+            .any(|d| d.name == "tlas" && d.set == DESCRIPTOR_SET_SCENE_GLOBALS));
+        assert!(entry
+            .reflection
+            .descriptors
+            .iter()
+            .any(|d| d.name == "lights" && d.set == DESCRIPTOR_SET_SCENE_GLOBALS));
+        assert!(entry
+            .reflection
+            .descriptors
+            .iter()
+            .any(|d| d.name == "bindless" && d.set == DESCRIPTOR_SET_BINDLESS));
+        assert!(entry
+            .reflection
+            .descriptors
+            .iter()
+            .any(|d| d.name == "noise" && d.set == DESCRIPTOR_SET_PACK_RESOURCES));
+        assert!(entry
+            .reflection
+            .used_params
+            .iter()
+            .any(|p| p.name == "exposure"));
+        assert!(entry
+            .reflection
+            .used_specs
+            .iter()
+            .any(|s| s.name == "enable_gi"));
+        assert!(entry
+            .reflection
+            .debug_channels
+            .iter()
+            .any(|c| c.channel_name == "transitive_dbg"));
+    }
+
+    #[test]
+    fn inlines_image_helpers_with_cbv_lets_alpha_renaming_and_rejects_early_return() {
+        let src = r"
+            fn sample_twice(img: Texture2D<f32>, uv: vec2) -> vec4 {
+                let doubled: vec2 = uv + uv;
+                return img.load(doubled);
+            }
+
+            fn bad_early_return(img: Texture2D<f32>, cond: bool, uv: vec2) -> vec4 {
+                if cond {
+                    return vec4(0.0, 0.0, 0.0, 1.0);
+                }
+                return img.load(uv);
+            }
+
+            @stage(compute(8, 8, 1))
+            pub fn main_cs(tex: Texture2D<f32>, uv: vec2) {
+                let a: vec4 = sample_twice(tex, uv + vec2(1.0, 0.0));
+                let b: vec4 = sample_twice(tex, uv + vec2(0.0, 1.0));
+                let c: vec4 = bad_early_return(tex, true, uv);
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
+        assert!(
+            diags.as_slice().iter().any(|d| d.code == "E0276"),
+            "expected E0276 for non-trailing return in inlineable image helper: {diags:?}"
+        );
+
+        let main_fn = hir.find_function("main_cs").expect("main_cs");
+        let body = main_fn.body_hir.as_ref().expect("main_cs body");
+
+        // Extract the two expanded blocks for `sample_twice` and verify:
+        // 1. Non-descriptor arg `uv` is bound to a fresh `HirStmt::Let`.
+        // 2. Both expansions have distinct alpha-renamed `SymbolId`s for `uv` and `doubled`.
+        let mut let_syms_a = Vec::new();
+        if let HirStmt::Let {
+            init: Some(HirExpr {
+                kind: HirExprKind::Block(blk),
+                ..
+            }),
+            ..
+        } = &body.stmts[0]
+        {
+            for s in &blk.stmts {
+                if let HirStmt::Let { symbol, .. } = s {
+                    let_syms_a.push(*symbol);
+                }
+            }
+        }
+        let mut let_syms_b = Vec::new();
+        if let HirStmt::Let {
+            init: Some(HirExpr {
+                kind: HirExprKind::Block(blk),
+                ..
+            }),
+            ..
+        } = &body.stmts[1]
+        {
+            for s in &blk.stmts {
+                if let HirStmt::Let { symbol, .. } = s {
+                    let_syms_b.push(*symbol);
+                }
+            }
+        }
+        assert_eq!(let_syms_a.len(), 2, "expected CBV arg Let + local Let");
+        assert_eq!(let_syms_b.len(), 2, "expected CBV arg Let + local Let");
+        assert_ne!(let_syms_a[0], let_syms_b[0]);
+        assert_ne!(let_syms_a[1], let_syms_b[1]);
+    }
+
+    #[test]
+    fn validates_monomorphized_generic_structs_nested_generics_and_arity() {
+        let src = r"
+            struct Inner<T> {
+                val: T,
+            }
+
+            struct Outer<U> {
+                inner: Inner<U>,
+            }
+
+            #[push_constant, layout(scalar)]
+            struct GenericPc<T> {
+                data: T,
+            }
+
+            pub fn test_generics(
+                a: Outer<f32>,
+                b: Outer<RayQuery>,
+                c: Inner<f16>,
+                d: GenericPc<[vec4; 9]>,
+                e: Inner<f32, u32>,
+            ) {}
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier2RayQuery, HardwareCaps::all());
+        assert!(
+            hir.find_struct("Inner<f32>").is_some(),
+            "nested Inner<f32> should be registered via monomorphization"
+        );
+        assert!(hir.find_struct("Outer<f32>").is_some());
+
+        let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0210"), "expected E0210 for Outer<RayQuery>: {diags:?}");
+        assert!(codes.contains(&"E0232"), "expected E0232 for Inner<f16>: {diags:?}");
+        assert!(codes.contains(&"E0220"), "expected E0220 for oversized GenericPc: {diags:?}");
+        assert!(codes.contains(&"E0274"), "expected E0274 for wrong generic arity: {diags:?}");
     }
 }

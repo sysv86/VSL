@@ -199,6 +199,7 @@ impl TypeArena {
             Type::Array { element, .. } | Type::Buffer { element } | Type::RwBuffer { element } => {
                 self.contains_ray_query_inner(*element, visited)
             }
+            Type::Pointer { pointee, .. } => self.contains_ray_query_inner(*pointee, visited),
             Type::Struct { fields, .. } => fields
                 .iter()
                 .any(|(_, field_ty)| self.contains_ray_query_inner(*field_ty, visited)),
@@ -253,7 +254,12 @@ impl TypeArena {
                 scalar: ScalarKind::Bool,
                 ..
             } => true,
-            Type::Array { element, .. } => self.contains_bool_inner(*element, visited),
+            Type::Array { element, .. }
+            | Type::Buffer { element }
+            | Type::RwBuffer { element }
+            | Type::Pointer {
+                pointee: element, ..
+            } => self.contains_bool_inner(*element, visited),
             Type::Struct { fields, .. } => fields
                 .iter()
                 .any(|(_, field_ty)| self.contains_bool_inner(*field_ty, visited)),
@@ -338,8 +344,8 @@ impl TypeArena {
                         base.max(16)
                     }
                 };
-                let stride = round_up(elem * u32::from(*rows), col_align);
-                Some((stride * u32::from(*cols), col_align))
+                let stride = round_up(elem * u32::from(*rows), col_align)?;
+                Some((stride.checked_mul(u32::from(*cols))?, col_align))
             }
             Type::Pointer { .. } => Some((8, 8)),
             Type::Array { element, len } => {
@@ -348,7 +354,7 @@ impl TypeArena {
                     LayoutKind::Std140 => elem_align.max(16),
                     LayoutKind::Scalar | LayoutKind::Std430 => elem_align,
                 };
-                let stride = round_up(elem_sz, align);
+                let stride = round_up(elem_sz, align)?;
                 Some((stride.checked_mul(*len)?, align))
             }
             Type::Struct {
@@ -356,12 +362,14 @@ impl TypeArena {
                 layout: struct_layout,
                 ..
             } => {
-                let effective = *struct_layout;
+                // Propagate the stricter enclosing layout (Scalar < Std430 < Std140) so nested
+                // structs inside std140 UBOs obey Vulkan std140 alignment and array-stride rules.
+                let effective = stricter_layout(layout, *struct_layout);
                 let computed = self.compute_struct_layout_inner(fields, effective, visited)?;
-                if matches!(layout, LayoutKind::Std140) {
+                if matches!(effective, LayoutKind::Std140) {
                     // Vulkan/GLSL std140 rounds nested struct base alignment up to a multiple of 16 bytes.
-                    let align = round_up(computed.align.max(16), 16);
-                    let size = round_up(computed.size, align);
+                    let align = round_up(computed.align.max(16), 16)?;
+                    let size = round_up(computed.size, align)?;
                     Some((size, align))
                 } else {
                     Some((computed.size, computed.align))
@@ -399,13 +407,13 @@ impl TypeArena {
 
         for (name, ty_id) in fields {
             let (sz, align) = self.size_and_align_inner(*ty_id, layout, visited)?;
-            offset = round_up(offset, align);
+            offset = round_up(offset, align)?;
             field_offsets.push((name.clone(), offset, sz));
             offset = offset.checked_add(sz)?;
             max_align = max_align.max(align);
         }
 
-        let size = round_up(offset, max_align);
+        let size = round_up(offset, max_align)?;
         Some(StructLayout {
             field_offsets,
             size,
@@ -414,15 +422,23 @@ impl TypeArena {
     }
 }
 
-const fn round_up(value: u32, align: u32) -> u32 {
+const fn stricter_layout(enclosing: LayoutKind, inner: LayoutKind) -> LayoutKind {
+    match (enclosing, inner) {
+        (LayoutKind::Std140, _) | (_, LayoutKind::Std140) => LayoutKind::Std140,
+        (LayoutKind::Std430, _) | (_, LayoutKind::Std430) => LayoutKind::Std430,
+        (LayoutKind::Scalar, LayoutKind::Scalar) => LayoutKind::Scalar,
+    }
+}
+
+const fn round_up(value: u32, align: u32) -> Option<u32> {
     if align <= 1 {
-        return value;
+        return Some(value);
     }
     let rem = value % align;
     if rem == 0 {
-        value
+        Some(value)
     } else {
-        value + (align - rem)
+        value.checked_add(align - rem)
     }
 }
 
@@ -492,6 +508,88 @@ mod tests {
         assert_eq!(
             outer.field_offsets[1],
             (SmolStr::new_static("inner"), 16, 16)
+        );
+        assert_eq!(outer.align, 16);
+        assert_eq!(outer.size, 32);
+    }
+
+    #[test]
+    fn round_up_overflow_returns_none_instead_of_wrapping() {
+        assert_eq!(round_up(u32::MAX, 16), None);
+        assert_eq!(round_up(u32::MAX - 3, 16), None);
+        assert_eq!(round_up(16, 16), Some(16));
+
+        let mut arena = TypeArena::new();
+        let f32_ty = arena.alloc(Type::Scalar(ScalarKind::F32));
+        // 4 * 0x3FFF_FFFF = 0xFFFF_FFFC, which overflows when rounded up to 16-byte std140 alignment.
+        let huge_arr = arena.alloc(Type::Array {
+            element: f32_ty,
+            len: 0x3FFF_FFFF,
+        });
+        assert_eq!(
+            arena.compute_struct_layout(
+                &[
+                    (SmolStr::new_static("a"), huge_arr),
+                    (SmolStr::new_static("b"), f32_ty),
+                ],
+                LayoutKind::Std430,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn contains_ray_query_and_bool_traverse_pointers_and_buffers() {
+        let mut arena = TypeArena::new();
+        let rq_ty = arena.alloc(Type::RayQuery);
+        let rq_ptr = arena.alloc(Type::Pointer {
+            pointee: rq_ty,
+            mutable: false,
+            align: 8,
+        });
+        assert!(arena.contains_ray_query(rq_ptr));
+
+        let bool_ty = arena.alloc(Type::Scalar(ScalarKind::Bool));
+        let bvec4_ty = arena.alloc(Type::Vector {
+            scalar: ScalarKind::Bool,
+            len: 4,
+        });
+        let buf_bool = arena.alloc(Type::Buffer { element: bool_ty });
+        let rwbuf_bool = arena.alloc(Type::RwBuffer { element: bool_ty });
+        let ptr_bvec4 = arena.alloc(Type::Pointer {
+            pointee: bvec4_ty,
+            mutable: true,
+            align: 16,
+        });
+        assert!(arena.contains_bool(buf_bool));
+        assert!(arena.contains_bool(rwbuf_bool));
+        assert!(arena.contains_bool(ptr_bvec4));
+    }
+
+    #[test]
+    fn std140_enclosing_layout_propagates_to_nested_structs() {
+        let mut arena = TypeArena::new();
+        let f32_ty = arena.alloc(Type::Scalar(ScalarKind::F32));
+        let arr_f32_2 = arena.alloc(Type::Array {
+            element: f32_ty,
+            len: 2,
+        });
+        let inner_scalar = arena.alloc(Type::Struct {
+            name: SmolStr::new_static("InnerScalar"),
+            layout: LayoutKind::Scalar,
+            fields: vec![(SmolStr::new_static("vals"), arr_f32_2)],
+        });
+
+        // Under std140, `[f32; 2]` inside `InnerScalar` must use 16-byte array stride (32 bytes total).
+        let outer = arena
+            .compute_struct_layout(
+                &[(SmolStr::new_static("inner"), inner_scalar)],
+                LayoutKind::Std140,
+            )
+            .expect("std140 nested scalar struct layout");
+        assert_eq!(
+            outer.field_offsets[0],
+            (SmolStr::new_static("inner"), 0, 32)
         );
         assert_eq!(outer.align, 16);
         assert_eq!(outer.size, 32);
