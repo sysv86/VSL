@@ -11,7 +11,7 @@ mod modules;
 
 use crate::cache::{L1CacheKey, hash_pack_schema, load_l2_from_disk, save_l2_to_disk};
 use crate::hooks::{build_hook_chain_unit, compile_hook_chain_sources};
-use crate::lower_ir::lower_entry_module_to_ir;
+use crate::lower_ir::{collect_reachable_helpers, lower_entry_module_to_ir};
 use crate::modules::{ModuleExports, module_graph_dependency_path, resolve_module_imports};
 use indexmap::{IndexMap, IndexSet};
 use smol_str::SmolStr;
@@ -333,8 +333,22 @@ impl VslCompiler {
         let mut graph = ModuleGraph::new();
         let mut by_module: IndexMap<SmolStr, (FileId, ParseResult, String)> =
             IndexMap::with_capacity(parsed_modules.len());
+        let mut diagnostics = Vec::new();
 
         for (mod_name, file_id, parsed, source) in parsed_modules {
+            if by_module.contains_key(&mod_name) {
+                let span = parsed
+                    .unit
+                    .module_decl
+                    .as_ref()
+                    .map_or_else(|| Span::new(file_id, 0, 0), |m| m.span);
+                diagnostics.push(Diagnostic::error(
+                    "E0503",
+                    format!("duplicate module declaration `{mod_name}` in project"),
+                    span,
+                ));
+                continue;
+            }
             let imports: Vec<SmolStr> = parsed
                 .unit
                 .imports
@@ -344,8 +358,6 @@ impl VslCompiler {
             graph.register_module(mod_name.clone(), &source, imports);
             by_module.insert(mod_name, (file_id, parsed, source));
         }
-
-        let mut diagnostics = Vec::new();
 
         let module_order = match graph.topological_order() {
             Ok(order) => order,
@@ -394,19 +406,23 @@ impl VslCompiler {
         let mut exports_by_module: IndexMap<SmolStr, ModuleExports> = IndexMap::new();
         let mut native_hooks_by_stage: IndexMap<
             HookStage,
-            Vec<(HirModule, HirFunction, Vec<Item>)>,
+            Vec<(L1ModuleHash, HirModule, HirFunction, Vec<Item>)>,
         > = IndexMap::new();
 
         for mod_name in &module_order {
             if let Some((file_id, mut parsed, source)) = by_module.shift_remove(mod_name) {
-                // Record this module's own `pub` exports before prepending imported items.
-                let exports = ModuleExports::from_unit(&parsed.unit);
-                exports_by_module.insert(mod_name.clone(), exports);
+                // Collect this module's own `pub` + private declarations before prepending imports,
+                // then attach resolved upstream items for downstream transitive closure (C4).
+                let mut exports = ModuleExports::from_unit(&parsed.unit);
 
                 let mut import_diags = Vec::new();
                 let mut imported_items =
                     resolve_module_imports(&parsed.unit, &exports_by_module, &mut import_diags);
+                let has_import_errors = import_diags.iter().any(Diagnostic::is_error);
                 diagnostics.extend(import_diags);
+
+                exports.record_upstream_items(&imported_items);
+                exports_by_module.insert(mod_name.clone(), exports);
 
                 if !imported_items.is_empty() {
                     imported_items.append(&mut parsed.unit.items);
@@ -418,13 +434,20 @@ impl VslCompiler {
                     .get(mod_name)
                     .copied()
                     .unwrap_or_else(|| L1ModuleHash(*blake3::hash(source.as_bytes()).as_bytes()));
-                let out = self.compile_shader_with_parsed(file_id, parsed, l1_hash, options);
+                let out = self.compile_shader_with_parsed_inner(
+                    file_id,
+                    parsed,
+                    l1_hash,
+                    options,
+                    !has_import_errors,
+                );
 
                 for (_, func) in out.hir.functions.iter() {
                     if let Some(hook_stage) = func.hook
                         && hook_stage.abi_route() == HookAbiRoute::NativeSpirv
                     {
                         native_hooks_by_stage.entry(hook_stage).or_default().push((
+                            l1_hash,
                             out.hir.clone(),
                             func.clone(),
                             module_items_snapshot.clone(),
@@ -446,14 +469,19 @@ impl VslCompiler {
                     let mut hasher = blake3::Hasher::new();
                     hasher.update(b"vsl2-project-hook-chain-v1");
                     hasher.update(stage.as_str().as_bytes());
-                    for (hir, func, _) in &hook_entries {
+                    let mut lowered_entries = Vec::with_capacity(hook_entries.len());
+                    for (mod_l1, hir, func, items) in hook_entries {
+                        hasher.update(&mod_l1.0);
+                        hasher.update(&(hir.module_name.len() as u64).to_le_bytes());
                         hasher.update(hir.module_name.as_bytes());
+                        hasher.update(&(func.name.len() as u64).to_le_bytes());
                         hasher.update(func.name.as_bytes());
+                        lowered_entries.push((hir, func, items));
                     }
                     let chain_l1 = L1ModuleHash(*hasher.finalize().as_bytes());
                     if let Some(chain_unit) = build_hook_chain_unit(
                         stage,
-                        &hook_entries,
+                        &lowered_entries,
                         chain_l1,
                         options,
                         &mut diagnostics,
@@ -480,6 +508,17 @@ impl VslCompiler {
         l1_hash: L1ModuleHash,
         options: &CompileOptions,
     ) -> ShaderCompileOutput {
+        self.compile_shader_with_parsed_inner(file, parsed, l1_hash, options, true)
+    }
+
+    fn compile_shader_with_parsed_inner(
+        &mut self,
+        file: FileId,
+        parsed: ParseResult,
+        l1_hash: L1ModuleHash,
+        options: &CompileOptions,
+        allow_l1_cache: bool,
+    ) -> ShaderCompileOutput {
         let mut diagnostics = parsed.diagnostics;
         let has_parse_errors = diagnostics.iter().any(Diagnostic::is_error);
 
@@ -491,7 +530,10 @@ impl VslCompiler {
             pack_schema_hash,
         };
 
-        let hir = if !has_parse_errors && let Some(cached_hir) = self.l1_cache.get(&l1_key) {
+        let hir = if allow_l1_cache
+            && !has_parse_errors
+            && let Some(cached_hir) = self.l1_cache.get(&l1_key)
+        {
             cached_hir.clone()
         } else {
             let (lowered_hir, hir_diags) = lower_unit_with_schema(
@@ -501,7 +543,7 @@ impl VslCompiler {
                 options.pack_schema.as_ref(),
             );
             diagnostics.extend(hir_diags.into_vec());
-            if !diagnostics.iter().any(Diagnostic::is_error) {
+            if allow_l1_cache && !diagnostics.iter().any(Diagnostic::is_error) {
                 self.l1_cache.insert(l1_key, lowered_hir.clone());
             }
             lowered_hir
@@ -569,15 +611,22 @@ impl VslCompiler {
                 continue;
             };
 
-            let used_spec_pairs: Vec<(u32, u32)> = func
-                .reflection
-                .used_specs
-                .iter()
-                .map(|s| {
+            let mut seen_spec_names: IndexSet<SmolStr> = IndexSet::new();
+            let mut used_spec_pairs: Vec<(u32, u32)> = Vec::new();
+            for s in &func.reflection.used_specs {
+                if seen_spec_names.insert(s.name.clone()) {
                     let raw = options.spec_values.get(&s.name).copied().unwrap_or(0);
-                    (s.spec_id, raw)
-                })
-                .collect();
+                    used_spec_pairs.push((s.spec_id, raw));
+                }
+            }
+            for helper in collect_reachable_helpers(&hir, func) {
+                for s in &helper.reflection.used_specs {
+                    if seen_spec_names.insert(s.name.clone()) {
+                        let raw = options.spec_values.get(&s.name).copied().unwrap_or(0);
+                        used_spec_pairs.push((s.spec_id, raw));
+                    }
+                }
+            }
             let cache_key = compute_l2_artifact_hash(
                 l1_hash,
                 func.name.as_str(),
@@ -608,50 +657,78 @@ impl VslCompiler {
 
         // Compile cache-missed entry points (in parallel via `std::thread::scope` when 2+ exist),
         // placing compiled units back into `slots` by original `entry_idx` for deterministic order.
-        let compiled_results: Vec<(usize, [u8; 32], CompiledShaderUnit, Vec<Diagnostic>)> =
-            if pending.len() <= 1 {
-                pending
-                    .into_iter()
-                    .map(|(entry_idx, func, stage, wg_size, cache_key)| {
+        let compiled_results: Vec<
+            Result<(usize, [u8; 32], CompiledShaderUnit, Vec<Diagnostic>), Diagnostic>,
+        > = if pending.len() <= 1 {
+            pending
+                .into_iter()
+                .map(|(entry_idx, func, stage, wg_size, cache_key)| {
+                    let (unit, diags) = compile_single_entry_unit(
+                        &hir,
+                        func,
+                        &parsed.unit.items,
+                        options.pack_schema.as_ref(),
+                        stage,
+                        wg_size,
+                        cache_key,
+                    );
+                    Ok((entry_idx, cache_key, unit, diags))
+                })
+                .collect()
+        } else {
+            let hir_ref = &hir;
+            let items_ref = parsed.unit.items.as_slice();
+            let schema_ref = options.pack_schema.as_ref();
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(pending.len());
+                for (entry_idx, func, stage, wg_size, cache_key) in pending {
+                    let fn_name = func.name.clone();
+                    let fn_span = func.span;
+                    let handle = scope.spawn(move || {
                         let (unit, diags) = compile_single_entry_unit(
-                            &hir,
-                            func,
-                            &parsed.unit.items,
-                            options.pack_schema.as_ref(),
-                            stage,
-                            wg_size,
-                            cache_key,
+                            hir_ref, func, items_ref, schema_ref, stage, wg_size, cache_key,
                         );
                         (entry_idx, cache_key, unit, diags)
+                    });
+                    handles.push((fn_name, fn_span, handle));
+                }
+                handles
+                    .into_iter()
+                    .map(|(fn_name, fn_span, handle)| match handle.join() {
+                        Ok(res) => Ok(res),
+                        Err(payload) => {
+                            let reason = payload
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                                .unwrap_or("unknown panic payload");
+                            Err(Diagnostic::error(
+                                "E0599",
+                                format!(
+                                    "internal compiler error: worker thread panicked while compiling entry point `{fn_name}`: {reason}"
+                                ),
+                                fn_span,
+                            ))
+                        }
                     })
                     .collect()
-            } else {
-                let hir_ref = &hir;
-                let items_ref = parsed.unit.items.as_slice();
-                let schema_ref = options.pack_schema.as_ref();
-                std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(pending.len());
-                    for (entry_idx, func, stage, wg_size, cache_key) in pending {
-                        handles.push(scope.spawn(move || {
-                            let (unit, diags) = compile_single_entry_unit(
-                                hir_ref, func, items_ref, schema_ref, stage, wg_size, cache_key,
-                            );
-                            (entry_idx, cache_key, unit, diags)
-                        }));
-                    }
-                    handles.into_iter().filter_map(|h| h.join().ok()).collect()
-                })
-            };
+            })
+        };
 
-        for (entry_idx, cache_key, unit, entry_diags) in compiled_results {
-            let has_entry_err = entry_diags.iter().any(Diagnostic::is_error);
-            diagnostics.extend(entry_diags);
-            if !has_entry_err {
-                self.l2_cache.insert(cache_key, unit.clone());
-                if let Some(dir) = disk_cache_dir {
-                    save_l2_to_disk(dir, &cache_key, &unit);
+        for res in compiled_results {
+            match res {
+                Ok((entry_idx, cache_key, unit, entry_diags)) => {
+                    let has_entry_err = entry_diags.iter().any(Diagnostic::is_error);
+                    diagnostics.extend(entry_diags);
+                    if !has_entry_err {
+                        self.l2_cache.insert(cache_key, unit.clone());
+                        if let Some(dir) = disk_cache_dir {
+                            save_l2_to_disk(dir, &cache_key, &unit);
+                        }
+                        slots[entry_idx] = Some(unit);
+                    }
                 }
-                slots[entry_idx] = Some(unit);
+                Err(ice_diag) => diagnostics.push(ice_diag),
             }
         }
 
@@ -744,6 +821,65 @@ fn compile_single_entry_unit(
         lower_entry_module_to_ir(hir, func, module_items, pack_schema, stage, workgroup_size);
     let pipeline = PassPipeline::default();
     pipeline.run_module(&mut lowered.ir_module);
+
+    // Merge transitive helper reflection (`required_caps`, `used_specs`, `used_params`,
+    // `debug_channels`, `push_constants`) and reconcile IR flags (`uses_bda`, `uses_subgroups`,
+    // `uses_quad_control`) before SPIR-V emission and `CompiledShaderUnit` construction.
+    let mut required_caps = func.required_caps;
+    let mut used_specs = func.reflection.used_specs.clone();
+    let mut seen_specs: IndexSet<SmolStr> = used_specs.iter().map(|s| s.name.clone()).collect();
+    let mut used_params = func.reflection.used_params.clone();
+    let mut seen_params: IndexSet<SmolStr> = used_params.iter().map(|p| p.name.clone()).collect();
+    let mut debug_channels = func.reflection.debug_channels.clone();
+    let mut seen_debug: IndexSet<SmolStr> = debug_channels
+        .iter()
+        .map(|d| d.channel_name.clone())
+        .collect();
+    let mut push_constants = func.reflection.push_constants.clone();
+    let mut push_constant_size = func.reflection.push_constant_size;
+
+    for helper in collect_reachable_helpers(hir, func) {
+        required_caps |= helper.required_caps;
+        for spec in &helper.reflection.used_specs {
+            if seen_specs.insert(spec.name.clone()) {
+                used_specs.push(spec.clone());
+            }
+        }
+        for param in &helper.reflection.used_params {
+            if seen_params.insert(param.name.clone()) {
+                used_params.push(param.clone());
+            }
+        }
+        for dbg in &helper.reflection.debug_channels {
+            if seen_debug.insert(dbg.channel_name.clone()) {
+                debug_channels.push(dbg.clone());
+            }
+        }
+        if push_constant_size == 0 && helper.reflection.push_constant_size > 0 {
+            push_constant_size = helper.reflection.push_constant_size;
+            push_constants = helper.reflection.push_constants.clone();
+        }
+    }
+
+    let mut any_bda = false;
+    let mut any_subgroups = false;
+    let mut any_quad_control = false;
+    for ir_fn in &lowered.ir_module.functions {
+        required_caps |= ir_fn.required_caps;
+        any_bda |= ir_fn.uses_bda;
+        any_subgroups |= ir_fn.uses_subgroups;
+        any_quad_control |= ir_fn.uses_quad_control;
+    }
+    if any_quad_control {
+        required_caps |= HardwareCaps::QUAD_CONTROL;
+    }
+    if let Some(entry_ir) = lowered.ir_module.functions.first_mut() {
+        entry_ir.uses_bda |= any_bda;
+        entry_ir.uses_subgroups |= any_subgroups;
+        entry_ir.uses_quad_control |= any_quad_control;
+        entry_ir.required_caps |= required_caps;
+    }
+
     let spirv = emit_module_spirv(&lowered.ir_module);
 
     let unit = CompiledShaderUnit {
@@ -751,13 +887,13 @@ fn compile_single_entry_unit(
         stage,
         spirv,
         descriptors: lowered.unified_descriptors,
-        push_constants: func.reflection.push_constants.clone(),
-        push_constant_size: func.reflection.push_constant_size,
+        push_constants,
+        push_constant_size,
         workgroup_size,
-        required_caps: func.required_caps,
-        used_specs: func.reflection.used_specs.clone(),
-        used_params: func.reflection.used_params.clone(),
-        debug_channels: func.reflection.debug_channels.clone(),
+        required_caps,
+        used_specs,
+        used_params,
+        debug_channels,
         cache_key,
     };
     (unit, lowered.diagnostics)
@@ -1106,10 +1242,8 @@ mod tests {
         let out = compiler.compile_shader_to_glsl("tiled_lighting.vsl", TILED_LIGHTING_VSL);
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
         assert!(out.glsl.contains("#version 460 core"));
-        assert!(
-            out.glsl
-                .contains("layout(push_constant, scalar) uniform AtrousPush")
-        );
+        assert!(out.glsl.contains("layout(set = 0, binding = 0, std140) uniform WorldUBO"));
+        assert!(out.glsl.contains("shared uint tile_light_count;"));
     }
 
     #[test]
@@ -1569,5 +1703,263 @@ mod tests {
         let names: Vec<&str> = out.units.iter().map(|u| u.entry_point.as_str()).collect();
         assert_eq!(names, vec!["entry_alpha", "entry_beta", "entry_gamma"]);
         assert_eq!(compiler.l2_cache_len(), 3);
+    }
+
+    #[test]
+    fn lowers_short_circuit_and_or_with_structured_if_guards() {
+        let src = r"
+            @stage(compute(8, 8, 1))
+            pub fn short_circuit_cs(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let cond_and = gid.x < 16u && gid.y < 16u;
+                let cond_or = gid.x == 0u || gid.y == 0u;
+                let v = if cond_and && cond_or { 1.0 } else { 0.0 };
+                out_img.store(ivec2(gid.xy), vec4(v, v, v, 1.0));
+            }
+        ";
+        let file = FileId(0);
+        let parsed = parse_source(file, src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (hir, hir_diags) = lower_unit_with_schema(
+            &parsed.unit,
+            RenderTier::Tier2RayQuery,
+            HardwareCaps::INT64_ATOMICS,
+            None,
+        );
+        assert!(!hir_diags.has_errors(), "{:?}", hir_diags.as_slice());
+        let (_, entry_fn) = hir.entry_points().next().expect("entry point");
+        let lowered = lower_entry_module_to_ir(
+            &hir,
+            entry_fn,
+            &parsed.unit.items,
+            None,
+            ShaderStage::Compute,
+            Some([8, 8, 1]),
+        );
+        assert!(lowered.diagnostics.is_empty(), "{:?}", lowered.diagnostics);
+
+        let ir_fn = &lowered.ir_module.functions[0];
+        let if_count = ir_fn
+            .body
+            .iter()
+            .filter(|s| matches!(s, vsl_ir::StructuredStmt::If { .. }))
+            .count();
+        assert!(
+            if_count >= 3,
+            "expected structured `If` guards for short-circuit `&&`/`||`, got {if_count}"
+        );
+        let has_eager_logical = ir_fn.insts.iter().any(|(_, inst)| {
+            matches!(inst.data, InstData::LogicalAnd(_, _) | InstData::LogicalOr(_, _))
+        });
+        assert!(
+            !has_eager_logical,
+            "short-circuit `&&`/`||` should lower to `If` rather than eager LogicalAnd/LogicalOr"
+        );
+
+        let mut compiler = VslCompiler::new();
+        let out = compiler.compile_shader_source("short_circuit.vsl", src, &CompileOptions::default());
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        validate_spirv_with_spirv_val("short_circuit", &out.units[0].spirv);
+    }
+
+    #[test]
+    fn lowers_unrolled_u32_for_loop_with_canonical_exit_and_continuing() {
+        let src = r"
+            @stage(compute(8, 8, 1))
+            pub fn unroll_u32_cs(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let mut acc = 0u;
+                #[unroll]
+                for i in 0u..4u {
+                    acc += i + gid.x;
+                }
+                let f = f32(acc);
+                out_img.store(ivec2(gid.xy), vec4(f, f, f, 1.0));
+            }
+        ";
+        let file = FileId(0);
+        let parsed = parse_source(file, src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (hir, hir_diags) = lower_unit_with_schema(
+            &parsed.unit,
+            RenderTier::Tier2RayQuery,
+            HardwareCaps::INT64_ATOMICS,
+            None,
+        );
+        assert!(!hir_diags.has_errors(), "{:?}", hir_diags.as_slice());
+        let (_, entry_fn) = hir.entry_points().next().expect("entry point");
+        let lowered = lower_entry_module_to_ir(
+            &hir,
+            entry_fn,
+            &parsed.unit.items,
+            None,
+            ShaderStage::Compute,
+            Some([8, 8, 1]),
+        );
+        assert!(lowered.diagnostics.is_empty(), "{:?}", lowered.diagnostics);
+
+        let ir_fn = &lowered.ir_module.functions[0];
+        let loop_stmt = ir_fn
+            .body
+            .iter()
+            .find_map(|s| match s {
+                vsl_ir::StructuredStmt::Loop {
+                    body,
+                    continuing,
+                    unroll,
+                    trip_count,
+                    induction_init,
+                    ..
+                } => Some((body, continuing, *unroll, *trip_count, *induction_init)),
+                _ => None,
+            })
+            .expect("expected StructuredStmt::Loop");
+        assert!(loop_stmt.2, "expected unroll flag to be set");
+        assert_eq!(loop_stmt.3, Some(4));
+        assert!(
+            !loop_stmt.1.is_empty(),
+            "expected canonical continuing increment even with #[unroll]"
+        );
+        assert!(
+            matches!(
+                loop_stmt.0.first(),
+                Some(vsl_ir::StructuredStmt::If { else_body, .. })
+                    if matches!(else_body.as_slice(), [vsl_ir::StructuredStmt::Break])
+            ),
+            "expected canonical exit guard `If {{ else: Break }}` in loop body"
+        );
+        let init_id = loop_stmt.4.expect("expected induction_init");
+        assert_eq!(
+            ir_fn.insts[init_id].ir_ty,
+            IrType::Scalar(ScalarIrTy::U32),
+            "expected u32 induction init type for `0u..4u`"
+        );
+
+        let mut compiler = VslCompiler::new();
+        let out = compiler.compile_shader_source("unroll_u32.vsl", src, &CompileOptions::default());
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        validate_spirv_with_spirv_val("unroll_u32", &out.units[0].spirv);
+    }
+
+    #[test]
+    fn links_transitive_private_and_upstream_module_helpers() {
+        let mut compiler = VslCompiler::new();
+        let files = vec![
+            (
+                "base.vsl".to_owned(),
+                r"
+                module pack::base;
+                const SCALE: f32 = 2.0;
+                fn private_leaf(x: f32) -> f32 {
+                    x * SCALE
+                }
+                pub fn base_eval(x: f32) -> f32 {
+                    private_leaf(x) + 1.0
+                }
+                "
+                .to_owned(),
+            ),
+            (
+                "mid.vsl".to_owned(),
+                r"
+                module pack::mid;
+                import pack::base::{base_eval};
+                fn private_mid(x: f32) -> f32 {
+                    base_eval(x) * 0.5
+                }
+                pub fn mid_eval(x: f32) -> f32 {
+                    private_mid(x)
+                }
+                "
+                .to_owned(),
+            ),
+            (
+                "main.vsl".to_owned(),
+                r"
+                module pack::main;
+                import pack::mid::{mid_eval};
+                @stage(compute(8, 8, 1))
+                pub fn run(out_img: RWImage2D<rgba16f>) {
+                    let v = mid_eval(3.0);
+                    out_img.store(ivec2(0, 0), vec4(v, v, v, 1.0));
+                }
+                "
+                .to_owned(),
+            ),
+        ];
+        let out = compiler.compile_project(&files, &CompileOptions::default());
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        validate_spirv_with_spirv_val("transitive_modules", &out.units[0].spirv);
+    }
+
+    #[test]
+    fn project_hook_chain_l2_cache_key_changes_when_hook_source_changes() {
+        let mut compiler = VslCompiler::new();
+        let files_v1 = vec![
+            (
+                "clouds_a.vsl".to_owned(),
+                r"
+                module pack::clouds_a;
+                @hook(clouds)
+                pub fn layer_a(dir: vec3) -> vec4 {
+                    vec4(0.8, 0.85, 0.9, 0.4)
+                }
+                "
+                .to_owned(),
+            ),
+            (
+                "clouds_b.vsl".to_owned(),
+                r"
+                module pack::clouds_b;
+                @hook(clouds)
+                pub fn layer_b(dir: vec3) -> vec4 {
+                    vec4(1.0, 0.98, 0.95, 0.2)
+                }
+                "
+                .to_owned(),
+            ),
+        ];
+        let files_v2 = vec![
+            (
+                "clouds_a.vsl".to_owned(),
+                r"
+                module pack::clouds_a;
+                @hook(clouds)
+                pub fn layer_a(dir: vec3) -> vec4 {
+                    vec4(0.5, 0.6, 0.7, 0.5)
+                }
+                "
+                .to_owned(),
+            ),
+            files_v1[1].clone(),
+        ];
+
+        let out1 = compiler.compile_project(&files_v1, &CompileOptions::default());
+        assert!(!out1.has_errors(), "{:?}", out1.diagnostics);
+        let chain1 = out1
+            .units
+            .iter()
+            .find(|u| u.entry_point == "vs_hook_chain_clouds")
+            .expect("expected synthesized clouds hook chain unit");
+
+        let out2 = compiler.compile_project(&files_v2, &CompileOptions::default());
+        assert!(!out2.has_errors(), "{:?}", out2.diagnostics);
+        let chain2 = out2
+            .units
+            .iter()
+            .find(|u| u.entry_point == "vs_hook_chain_clouds")
+            .expect("expected synthesized clouds hook chain unit");
+
+        assert_ne!(
+            chain1.cache_key, chain2.cache_key,
+            "hook chain L2 cache_key must change when any hook module source changes"
+        );
     }
 }

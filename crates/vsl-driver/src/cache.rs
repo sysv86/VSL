@@ -4,9 +4,14 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use vsl_hir::PackSchema;
 use vsl_hir::module::L1ModuleHash;
 use vsl_mc::{CompiledShaderUnit, HardwareCaps, PackParamType, RenderTier};
+
+/// Monotonic intra-process counter appended to temporary cache filenames so concurrent worker
+/// threads writing the same L2 key never race on the same temp file.
+static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Composite L1 cache key incorporating source/import hash, target tier, active hardware caps,
 /// and `pack.vsl` schema hash so HIR caching is sound across configurations.
@@ -120,14 +125,20 @@ pub(crate) fn save_l2_to_disk(dir: &Path, key: &[u8; 32], unit: &CompiledShaderU
     };
     let final_path = l2_cache_file_path(dir, key);
     let hex = l2_cache_hex(key);
-    let tmp_path = dir.join(format!("{hex}.vsl-l2.json.tmp.{}", std::process::id()));
+    let seq = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = dir.join(format!(
+        "{hex}.vsl-l2.json.tmp.{}.{seq}",
+        std::process::id()
+    ));
     if fs::write(&tmp_path, &bytes).is_err() {
         let _ = fs::remove_file(&tmp_path);
         return;
     }
     if fs::rename(&tmp_path, &final_path).is_err() {
-        let _ = fs::remove_file(&final_path);
-        if fs::rename(&tmp_path, &final_path).is_err() {
+        // Another thread/process may have already published the identical content-addressed file.
+        if final_path.exists() {
+            let _ = fs::remove_file(&tmp_path);
+        } else if fs::rename(&tmp_path, &final_path).is_err() {
             let _ = fs::remove_file(&tmp_path);
         }
     }

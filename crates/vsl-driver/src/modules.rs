@@ -3,14 +3,16 @@
 
 use indexmap::{IndexMap, IndexSet};
 use smol_str::SmolStr;
+use std::collections::VecDeque;
 use vsl_diagnostics::{Diagnostic, Span};
 use vsl_hir::module::ModuleGraph;
 use vsl_syntax::ast::{
-    ConstDecl, FnDecl, ImplBlock, ImportDecl, ImportTree, Item, SourceUnit, StructDecl, TraitDecl,
-    TypeExpr,
+    Block, ConstDecl, Expr, FnDecl, ImplBlock, ImportDecl, ImportTree, Item, SourceUnit, Stmt,
+    StructDecl, TraitDecl, TypeArg, TypeExpr,
 };
 
-/// Exported `pub` symbols and associated `impl` blocks collected from a single project module.
+/// Exported `pub` symbols, private/upstream dependency items, and associated `impl` blocks
+/// collected from a single project module.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ModuleExports {
     pub(crate) structs: IndexMap<SmolStr, StructDecl>,
@@ -21,29 +23,36 @@ pub(crate) struct ModuleExports {
     /// All top-level symbol names declared in this module (including non-`pub`) so explicit
     /// imports of private symbols produce a clear `E0502` visibility error.
     pub(crate) all_declared: IndexSet<SmolStr>,
+    /// Complete symbol lookup table for transitive dependency closure when another module imports
+    /// from this module: includes this module's own `pub` + private items as well as upstream
+    /// items imported into this module.
+    pub(crate) all_items: IndexMap<SmolStr, Item>,
 }
 
 impl ModuleExports {
-    /// Collects all `pub` items (`Struct`, `Const`, non-entry `Function`, `Trait`) and `Impl`
-    /// blocks from a parsed [`SourceUnit`].
+    /// Collects all `pub` items (`Struct`, `Const`, non-entry `Function`, `Trait`), private
+    /// dependency items, and `Impl` blocks from a parsed [`SourceUnit`].
     pub(crate) fn from_unit(unit: &SourceUnit) -> Self {
         let mut exports = Self::default();
         for item in &unit.items {
             match item {
                 Item::Struct(s) => {
                     exports.all_declared.insert(s.name.name.clone());
+                    exports.all_items.insert(s.name.name.clone(), item.clone());
                     if s.is_pub {
                         exports.structs.insert(s.name.name.clone(), s.clone());
                     }
                 }
                 Item::Const(c) => {
                     exports.all_declared.insert(c.name.name.clone());
+                    exports.all_items.insert(c.name.name.clone(), item.clone());
                     if c.is_pub {
                         exports.consts.insert(c.name.name.clone(), c.clone());
                     }
                 }
                 Item::Trait(t) => {
                     exports.all_declared.insert(t.name.name.clone());
+                    exports.all_items.insert(t.name.name.clone(), item.clone());
                     if t.is_pub {
                         exports.traits.insert(t.name.name.clone(), t.clone());
                     }
@@ -55,8 +64,11 @@ impl ModuleExports {
                             .iter()
                             .any(|e| e.name.name == "stage" || e.name.name == "hook")
                     });
-                    if f.is_pub && !is_entry_or_hook {
-                        exports.functions.insert(f.name.name.clone(), f.clone());
+                    if !is_entry_or_hook {
+                        exports.all_items.insert(f.name.name.clone(), item.clone());
+                        if f.is_pub {
+                            exports.functions.insert(f.name.name.clone(), f.clone());
+                        }
                     }
                 }
                 Item::Impl(imp) => {
@@ -66,6 +78,39 @@ impl ModuleExports {
             }
         }
         exports
+    }
+
+    /// Records resolved upstream items (from modules this module imports) into the transitive
+    /// dependency pool without exposing them as this module's direct `pub` exports.
+    pub(crate) fn record_upstream_items(&mut self, upstream_items: &[Item]) {
+        for item in upstream_items {
+            match item {
+                Item::Struct(s) => {
+                    self.all_items
+                        .entry(s.name.name.clone())
+                        .or_insert_with(|| item.clone());
+                }
+                Item::Const(c) => {
+                    self.all_items
+                        .entry(c.name.name.clone())
+                        .or_insert_with(|| item.clone());
+                }
+                Item::Trait(t) => {
+                    self.all_items
+                        .entry(t.name.name.clone())
+                        .or_insert_with(|| item.clone());
+                }
+                Item::Function(f) => {
+                    self.all_items
+                        .entry(f.name.name.clone())
+                        .or_insert_with(|| item.clone());
+                }
+                Item::Impl(imp) => {
+                    self.impls.push(imp.clone());
+                }
+                _ => {}
+            }
+        }
     }
 
     fn get_pub_item(&self, name: &str) -> Option<Item> {
@@ -160,8 +205,19 @@ fn collect_local_declarations(unit: &SourceUnit) -> IndexMap<SmolStr, Span> {
     locals
 }
 
+struct ImportResolutionState<'a> {
+    local_decls: &'a IndexMap<SmolStr, Span>,
+    imported_sources: IndexMap<SmolStr, SmolStr>,
+    emitted_names: IndexSet<SmolStr>,
+    imported_items: Vec<Item>,
+    imported_types_or_traits: IndexSet<SmolStr>,
+    seen_impl_keys: IndexSet<(Option<SmolStr>, Option<SmolStr>, usize)>,
+}
+
 /// Resolves all project imports for `unit` against `exports_by_module`, respecting
-/// `ImportTree::Single`, `ImportTree::Group`, and `ImportTree::Glob`.
+/// `ImportTree::Single`, `ImportTree::Group`, and `ImportTree::Glob`, and pulls in the full
+/// transitive closure of private helpers, structs, constants, sibling `pub` items, `impl` blocks,
+/// and upstream imported items referenced by each imported symbol.
 ///
 /// Emits:
 /// - `E0502` when an explicitly imported symbol does not exist or is not marked `pub`.
@@ -172,10 +228,14 @@ pub(crate) fn resolve_module_imports(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<Item> {
     let local_decls = collect_local_declarations(unit);
-    let mut imported_sources: IndexMap<SmolStr, SmolStr> = IndexMap::new();
-    let mut imported_items: Vec<Item> = Vec::new();
-    let mut imported_types_or_traits: IndexSet<SmolStr> = IndexSet::new();
-    let mut seen_impl_keys: IndexSet<(Option<SmolStr>, Option<SmolStr>, usize)> = IndexSet::new();
+    let mut state = ImportResolutionState {
+        local_decls: &local_decls,
+        imported_sources: IndexMap::new(),
+        emitted_names: IndexSet::new(),
+        imported_items: Vec::new(),
+        imported_types_or_traits: IndexSet::new(),
+        seen_impl_keys: IndexSet::new(),
+    };
 
     for imp in &unit.imports {
         let full_prefix = SmolStr::new(imp.prefix.joined());
@@ -191,11 +251,7 @@ pub(crate) fn resolve_module_imports(
                         &full_prefix,
                         exports,
                         imp.span,
-                        &local_decls,
-                        &mut imported_sources,
-                        &mut imported_items,
-                        &mut imported_types_or_traits,
-                        &mut seen_impl_keys,
+                        &mut state,
                         diagnostics,
                     );
                 } else if imp.prefix.segments.len() >= 2 {
@@ -226,11 +282,7 @@ pub(crate) fn resolve_module_imports(
                         exports,
                         &sym_ident.name,
                         sym_ident.span,
-                        &local_decls,
-                        &mut imported_sources,
-                        &mut imported_items,
-                        &mut imported_types_or_traits,
-                        &mut seen_impl_keys,
+                        &mut state,
                         diagnostics,
                     );
                 } else {
@@ -256,11 +308,7 @@ pub(crate) fn resolve_module_imports(
                         exports,
                         &ident.name,
                         ident.span,
-                        &local_decls,
-                        &mut imported_sources,
-                        &mut imported_items,
-                        &mut imported_types_or_traits,
-                        &mut seen_impl_keys,
+                        &mut state,
                         diagnostics,
                     );
                 }
@@ -280,31 +328,22 @@ pub(crate) fn resolve_module_imports(
                     &full_prefix,
                     exports,
                     imp.span,
-                    &local_decls,
-                    &mut imported_sources,
-                    &mut imported_items,
-                    &mut imported_types_or_traits,
-                    &mut seen_impl_keys,
+                    &mut state,
                     diagnostics,
                 );
             }
         }
     }
 
-    imported_items
+    state.imported_items
 }
 
-#[allow(clippy::too_many_arguments)]
 fn import_named_symbol(
     source_mod: &SmolStr,
     exports: &ModuleExports,
     sym_name: &SmolStr,
     span: Span,
-    local_decls: &IndexMap<SmolStr, Span>,
-    imported_sources: &mut IndexMap<SmolStr, SmolStr>,
-    imported_items: &mut Vec<Item>,
-    imported_types_or_traits: &mut IndexSet<SmolStr>,
-    seen_impl_keys: &mut IndexSet<(Option<SmolStr>, Option<SmolStr>, usize)>,
+    state: &mut ImportResolutionState<'_>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(item) = exports.get_pub_item(sym_name.as_str()) else {
@@ -317,7 +356,7 @@ fn import_named_symbol(
         return;
     };
 
-    if local_decls.contains_key(sym_name) {
+    if state.local_decls.contains_key(sym_name) {
         diagnostics.push(Diagnostic::error(
             "E0503",
             format!(
@@ -328,45 +367,45 @@ fn import_named_symbol(
         return;
     }
 
-    if let Some(prev_mod) = imported_sources.get(sym_name) {
-        diagnostics.push(Diagnostic::error(
-            "E0503",
-            format!(
-                "name collision: symbol `{sym_name}` is imported from both `{prev_mod}` and `{source_mod}`"
-            ),
-            span,
-        ));
+    if let Some(prev_mod) = state.imported_sources.get(sym_name) {
+        if prev_mod != source_mod {
+            diagnostics.push(Diagnostic::error(
+                "E0503",
+                format!(
+                    "name collision: symbol `{sym_name}` is imported from both `{prev_mod}` and `{source_mod}`"
+                ),
+                span,
+            ));
+        }
         return;
     }
 
-    imported_sources.insert(sym_name.clone(), source_mod.clone());
+    state
+        .imported_sources
+        .insert(sym_name.clone(), source_mod.clone());
     if matches!(item, Item::Struct(_) | Item::Trait(_)) {
-        imported_types_or_traits.insert(sym_name.clone());
+        state.imported_types_or_traits.insert(sym_name.clone());
     }
-    imported_items.push(item);
 
-    attach_matching_impls(
-        exports,
-        imported_types_or_traits,
-        seen_impl_keys,
-        imported_items,
-    );
+    let mut worklist = VecDeque::new();
+    if state.emitted_names.insert(sym_name.clone()) {
+        worklist.push_back(item.clone());
+        state.imported_items.push(item);
+    }
+
+    expand_transitive_closure(exports, worklist, state);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn import_all_pub_from_module(
     source_mod: &SmolStr,
     exports: &ModuleExports,
     span: Span,
-    local_decls: &IndexMap<SmolStr, Span>,
-    imported_sources: &mut IndexMap<SmolStr, SmolStr>,
-    imported_items: &mut Vec<Item>,
-    imported_types_or_traits: &mut IndexSet<SmolStr>,
-    seen_impl_keys: &mut IndexSet<(Option<SmolStr>, Option<SmolStr>, usize)>,
+    state: &mut ImportResolutionState<'_>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let mut worklist = VecDeque::new();
     for (sym_name, item) in exports.all_pub_items() {
-        if local_decls.contains_key(&sym_name) {
+        if state.local_decls.contains_key(&sym_name) {
             diagnostics.push(Diagnostic::error(
                 "E0503",
                 format!(
@@ -376,36 +415,71 @@ fn import_all_pub_from_module(
             ));
             continue;
         }
-        if let Some(prev_mod) = imported_sources.get(&sym_name) {
-            diagnostics.push(Diagnostic::error(
-                "E0503",
-                format!(
-                    "name collision: symbol `{sym_name}` is imported from both `{prev_mod}` and `{source_mod}`"
-                ),
-                span,
-            ));
+        if let Some(prev_mod) = state.imported_sources.get(&sym_name) {
+            if prev_mod != source_mod {
+                diagnostics.push(Diagnostic::error(
+                    "E0503",
+                    format!(
+                        "name collision: symbol `{sym_name}` is imported from both `{prev_mod}` and `{source_mod}`"
+                    ),
+                    span,
+                ));
+            }
             continue;
         }
-        imported_sources.insert(sym_name.clone(), source_mod.clone());
+        state
+            .imported_sources
+            .insert(sym_name.clone(), source_mod.clone());
         if matches!(item, Item::Struct(_) | Item::Trait(_)) {
-            imported_types_or_traits.insert(sym_name);
+            state.imported_types_or_traits.insert(sym_name.clone());
         }
-        imported_items.push(item);
+        if state.emitted_names.insert(sym_name) {
+            worklist.push_back(item.clone());
+            state.imported_items.push(item);
+        }
     }
 
-    attach_matching_impls(
-        exports,
-        imported_types_or_traits,
-        seen_impl_keys,
-        imported_items,
-    );
+    expand_transitive_closure(exports, worklist, state);
+}
+
+fn expand_transitive_closure(
+    exports: &ModuleExports,
+    mut worklist: VecDeque<Item>,
+    state: &mut ImportResolutionState<'_>,
+) {
+    attach_matching_impls(exports, &mut worklist, state);
+
+    while let Some(item) = worklist.pop_front() {
+        let mut refs = IndexSet::new();
+        collect_referenced_idents_in_item(&item, &mut refs);
+
+        let mut added_type_or_trait = false;
+        for dep_name in refs {
+            if state.local_decls.contains_key(&dep_name) || state.emitted_names.contains(&dep_name)
+            {
+                continue;
+            }
+            if let Some(dep_item) = exports.all_items.get(&dep_name).cloned() {
+                state.emitted_names.insert(dep_name.clone());
+                if matches!(dep_item, Item::Struct(_) | Item::Trait(_)) {
+                    state.imported_types_or_traits.insert(dep_name);
+                    added_type_or_trait = true;
+                }
+                worklist.push_back(dep_item.clone());
+                state.imported_items.push(dep_item);
+            }
+        }
+
+        if added_type_or_trait {
+            attach_matching_impls(exports, &mut worklist, state);
+        }
+    }
 }
 
 fn attach_matching_impls(
     exports: &ModuleExports,
-    imported_types_or_traits: &IndexSet<SmolStr>,
-    seen_impl_keys: &mut IndexSet<(Option<SmolStr>, Option<SmolStr>, usize)>,
-    imported_items: &mut Vec<Item>,
+    worklist: &mut VecDeque<Item>,
+    state: &mut ImportResolutionState<'_>,
 ) {
     for imp_block in &exports.impls {
         let target_name = impl_target_name(&imp_block.target);
@@ -416,15 +490,249 @@ fn attach_matching_impls(
             .map(|s| s.name.clone());
         let matches_target = target_name
             .as_ref()
-            .is_some_and(|t| imported_types_or_traits.contains(t));
+            .is_some_and(|t| state.imported_types_or_traits.contains(t));
         let matches_trait = trait_name
             .as_ref()
-            .is_some_and(|t| imported_types_or_traits.contains(t));
+            .is_some_and(|t| state.imported_types_or_traits.contains(t));
         if matches_target || matches_trait {
             let key = (trait_name, target_name, imp_block.methods.len());
-            if seen_impl_keys.insert(key) {
-                imported_items.push(Item::Impl(imp_block.clone()));
+            if state.seen_impl_keys.insert(key) {
+                let item = Item::Impl(imp_block.clone());
+                worklist.push_back(item.clone());
+                state.imported_items.push(item);
             }
         }
+    }
+}
+
+fn collect_referenced_idents_in_item(item: &Item, out: &mut IndexSet<SmolStr>) {
+    match item {
+        Item::Struct(s) => {
+            for g in &s.generics {
+                if let Some(ref b) = g.bound
+                    && let Some(last) = b.segments.last()
+                {
+                    out.insert(last.name.clone());
+                }
+            }
+            for f in &s.fields {
+                collect_referenced_idents_in_type(&f.ty, out);
+            }
+        }
+        Item::Const(c) => {
+            collect_referenced_idents_in_type(&c.ty, out);
+            collect_referenced_idents_in_expr(&c.value, out);
+        }
+        Item::Trait(t) => {
+            for m in &t.methods {
+                collect_referenced_idents_in_fn(m, out);
+            }
+        }
+        Item::Impl(imp) => {
+            for g in &imp.generics {
+                if let Some(ref b) = g.bound
+                    && let Some(last) = b.segments.last()
+                {
+                    out.insert(last.name.clone());
+                }
+            }
+            if let Some(ref tp) = imp.trait_path
+                && let Some(last) = tp.segments.last()
+            {
+                out.insert(last.name.clone());
+            }
+            collect_referenced_idents_in_type(&imp.target, out);
+            for m in &imp.methods {
+                collect_referenced_idents_in_fn(m, out);
+            }
+        }
+        Item::Function(f) => collect_referenced_idents_in_fn(f, out),
+        Item::WorkgroupVar(w) => collect_referenced_idents_in_type(&w.ty, out),
+        _ => {}
+    }
+}
+
+fn collect_referenced_idents_in_fn(f: &FnDecl, out: &mut IndexSet<SmolStr>) {
+    for g in &f.generics {
+        if let Some(ref b) = g.bound
+            && let Some(last) = b.segments.last()
+        {
+            out.insert(last.name.clone());
+        }
+    }
+    for p in &f.params {
+        if let Some(ref ty) = p.ty {
+            collect_referenced_idents_in_type(ty, out);
+        }
+    }
+    if let Some(ref ret) = f.return_ty {
+        collect_referenced_idents_in_type(ret, out);
+    }
+    if let Some(ref body) = f.body {
+        collect_referenced_idents_in_block(body, out);
+    }
+}
+
+fn collect_referenced_idents_in_type(ty: &TypeExpr, out: &mut IndexSet<SmolStr>) {
+    match ty {
+        TypeExpr::Named { path, args, .. } => {
+            if let Some(last) = path.segments.last() {
+                out.insert(last.name.clone());
+            }
+            for arg in args {
+                match arg {
+                    TypeArg::Type(inner) => collect_referenced_idents_in_type(inner, out),
+                    TypeArg::NamedExpr { value, .. } => {
+                        collect_referenced_idents_in_expr(value, out);
+                    }
+                }
+            }
+        }
+        TypeExpr::Array { element, len, .. } => {
+            collect_referenced_idents_in_type(element, out);
+            collect_referenced_idents_in_expr(len, out);
+        }
+    }
+}
+
+fn collect_referenced_idents_in_block(block: &Block, out: &mut IndexSet<SmolStr>) {
+    for stmt in &block.stmts {
+        collect_referenced_idents_in_stmt(stmt, out);
+    }
+    if let Some(ref tail) = block.tail_expr {
+        collect_referenced_idents_in_expr(tail, out);
+    }
+}
+
+fn collect_referenced_idents_in_stmt(stmt: &Stmt, out: &mut IndexSet<SmolStr>) {
+    match stmt {
+        Stmt::Let { ty, init, .. } => {
+            if let Some(t) = ty {
+                collect_referenced_idents_in_type(t, out);
+            }
+            if let Some(e) = init {
+                collect_referenced_idents_in_expr(e, out);
+            }
+        }
+        Stmt::Return { value: Some(e), .. } | Stmt::Expr { expr: e, .. } => {
+            collect_referenced_idents_in_expr(e, out);
+        }
+        Stmt::For { iter, body, .. } => {
+            collect_referenced_idents_in_expr(iter, out);
+            collect_referenced_idents_in_block(body, out);
+        }
+        Stmt::While { cond, body, .. } => {
+            collect_referenced_idents_in_expr(cond, out);
+            collect_referenced_idents_in_block(body, out);
+        }
+        Stmt::Loop { body, .. } => {
+            collect_referenced_idents_in_block(body, out);
+        }
+        Stmt::Switch {
+            selector,
+            cases,
+            default,
+            ..
+        } => {
+            collect_referenced_idents_in_expr(selector, out);
+            for c in cases {
+                collect_referenced_idents_in_expr(&c.value, out);
+                collect_referenced_idents_in_block(&c.body, out);
+            }
+            if let Some(d) = default {
+                collect_referenced_idents_in_block(d, out);
+            }
+        }
+        Stmt::Return { value: None, .. } | Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
+}
+
+fn collect_referenced_idents_in_expr(expr: &Expr, out: &mut IndexSet<SmolStr>) {
+    match expr {
+        Expr::Path {
+            path, turbofish, ..
+        } => {
+            if let Some(last) = path.segments.last() {
+                out.insert(last.name.clone());
+            }
+            for arg in turbofish {
+                match arg {
+                    TypeArg::Type(t) => collect_referenced_idents_in_type(t, out),
+                    TypeArg::NamedExpr { value, .. } => {
+                        collect_referenced_idents_in_expr(value, out);
+                    }
+                }
+            }
+        }
+        Expr::StructLit { path, fields, .. } => {
+            if let Some(last) = path.segments.last() {
+                out.insert(last.name.clone());
+            }
+            for (_, fexpr) in fields {
+                collect_referenced_idents_in_expr(fexpr, out);
+            }
+        }
+        Expr::ArrayLit { elements, .. } => {
+            for e in elements {
+                collect_referenced_idents_in_expr(e, out);
+            }
+        }
+        Expr::Unary { operand, .. }
+        | Expr::Field {
+            receiver: operand, ..
+        } => collect_referenced_idents_in_expr(operand, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_referenced_idents_in_expr(lhs, out);
+            collect_referenced_idents_in_expr(rhs, out);
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_referenced_idents_in_expr(callee, out);
+            for a in args {
+                collect_referenced_idents_in_expr(&a.value, out);
+            }
+        }
+        Expr::MethodCall {
+            receiver,
+            turbofish,
+            args,
+            ..
+        } => {
+            collect_referenced_idents_in_expr(receiver, out);
+            for arg in turbofish {
+                match arg {
+                    TypeArg::Type(t) => collect_referenced_idents_in_type(t, out),
+                    TypeArg::NamedExpr { value, .. } => {
+                        collect_referenced_idents_in_expr(value, out);
+                    }
+                }
+            }
+            for a in args {
+                collect_referenced_idents_in_expr(&a.value, out);
+            }
+        }
+        Expr::Index {
+            receiver, index, ..
+        } => {
+            collect_referenced_idents_in_expr(receiver, out);
+            collect_referenced_idents_in_expr(index, out);
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_referenced_idents_in_expr(cond, out);
+            collect_referenced_idents_in_block(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_referenced_idents_in_expr(eb, out);
+            }
+        }
+        Expr::Block(b) => collect_referenced_idents_in_block(b, out),
+        Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::NoneLit(_) => {}
     }
 }
