@@ -48,8 +48,20 @@ impl Span {
     }
 
     /// Merges two spans from the same file into the minimal enclosing span.
+    ///
+    /// Synthetic spans yield to real file spans; cross-file merges return `self`
+    /// without mixing byte offsets from different files.
     #[must_use]
     pub const fn merge(self, other: Self) -> Self {
+        if other.file.0 == FileId::SYNTHETIC.0 {
+            return self;
+        }
+        if self.file.0 == FileId::SYNTHETIC.0 {
+            return other;
+        }
+        if self.file.0 != other.file.0 {
+            return self;
+        }
         let start = if self.start < other.start {
             self.start
         } else {
@@ -138,10 +150,22 @@ impl SourceFile {
         }
     }
 
+    /// Clamps `span` to `0..=self.text.len()`, snaps both endpoints down to valid UTF-8
+    /// character boundaries, and guarantees `start <= end`.
+    pub(crate) fn clamp_range(&self, span: Span) -> Range<usize> {
+        let mut start = (span.start as usize).min(self.text.len());
+        while start > 0 && !self.text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = (span.end as usize).clamp(start, self.text.len());
+        while end > start && !self.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        start..end
+    }
+
     pub fn slice(&self, span: Span) -> &str {
-        let start = (span.start as usize).min(self.text.len());
-        let end = (span.end as usize).clamp(start, self.text.len());
-        &self.text[start..end]
+        &self.text[self.clamp_range(span)]
     }
 }
 
@@ -183,5 +207,33 @@ mod tests {
         assert_eq!(file.line_col(0), LineCol { line: 0, col: 0 });
         assert_eq!(file.line_col(10), LineCol { line: 1, col: 0 });
         assert_eq!(file.line_col_utf16(14), LineCol { line: 1, col: 4 });
+    }
+
+    #[test]
+    fn slice_snaps_to_utf8_char_boundaries() {
+        let mut db = SourceDatabase::new();
+        // 'α' occupies bytes 4..6 and 'β' occupies bytes 9..11.
+        let id = db.add_file("utf8.vsl", "let α = β;");
+        let file = db.get(id).expect("file registered");
+        assert_eq!(file.slice(Span::new(id, 5, 6)), "α");
+        assert_eq!(file.slice(Span::new(id, 4, 5)), "");
+        assert_eq!(file.slice(Span::new(id, 5, 10)), "α = ");
+        assert_eq!(file.slice(Span::new(id, 100, 200)), "");
+        assert_eq!(file.slice(Span::new(id, 10, 4)), "");
+    }
+
+    #[test]
+    fn span_merge_guards_synthetic_and_cross_file() {
+        let f0 = FileId(0);
+        let f1 = FileId(1);
+        let a = Span::new(f0, 4, 8);
+        let b = Span::new(f0, 2, 10);
+        let c = Span::new(f1, 0, 100);
+        let syn = Span::synthetic();
+
+        assert_eq!(a.merge(b), Span::new(f0, 2, 10));
+        assert_eq!(a.merge(syn), a);
+        assert_eq!(syn.merge(c), c);
+        assert_eq!(a.merge(c), a);
     }
 }

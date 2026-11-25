@@ -1,8 +1,9 @@
-use crate::{Diagnostic, FileId, Severity, SourceDatabase};
+use crate::{Diagnostic, FileId, Severity, SourceDatabase, Span};
 use ariadne::{Cache, Color, Config, IndexType, Label, Report, ReportKind, Source};
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
+use std::ops::Range;
 
 struct DbCache<'a> {
     db: &'a SourceDatabase,
@@ -39,6 +40,10 @@ impl<'a> Cache<FileId> for DbCache<'a> {
     }
 }
 
+fn clamped_span_range(db: &SourceDatabase, span: Span) -> Range<usize> {
+    db.get(span.file).map_or(0..0, |file| file.clamp_range(span))
+}
+
 /// Renders a slice of diagnostics into `writer` using `ariadne` 0.6 multi-file reports
 /// configured with UTF-8 byte indexing matching [`crate::Span`].
 pub fn render_diagnostics(
@@ -56,15 +61,15 @@ pub fn render_diagnostics(
             Severity::Advice => (ReportKind::Advice, Color::Cyan),
         };
 
-        let mut builder =
-            Report::build(kind, (diag.primary_span.file, diag.primary_span.to_range()))
-                .with_config(config)
-                .with_code(diag.code.as_str())
-                .with_message(&diag.message);
+        let primary_range = clamped_span_range(db, diag.primary_span);
+        let mut builder = Report::build(kind, (diag.primary_span.file, primary_range.clone()))
+            .with_config(config)
+            .with_code(diag.code.as_str())
+            .with_message(&diag.message);
 
         if diag.labels.is_empty() {
             builder = builder.with_label(
-                Label::new((diag.primary_span.file, diag.primary_span.to_range()))
+                Label::new((diag.primary_span.file, primary_range))
                     .with_message(&diag.message)
                     .with_color(primary_color),
             );
@@ -75,8 +80,9 @@ pub fn render_diagnostics(
                 } else {
                     Color::Blue
                 };
+                let range = clamped_span_range(db, label.span);
                 builder = builder.with_label(
-                    Label::new((label.span.file, label.span.to_range()))
+                    Label::new((label.span.file, range))
                         .with_message(&label.message)
                         .with_color(color),
                 );
@@ -95,7 +101,6 @@ pub fn render_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Span;
 
     #[test]
     fn renders_ariadne_report_and_synthetic_spans() {
@@ -110,5 +115,19 @@ mod tests {
         let rendered = String::from_utf8(out).expect("utf-8 output");
         assert!(rendered.contains("E0301"));
         assert!(rendered.contains("W0001"));
+    }
+
+    #[test]
+    fn clamps_out_of_bounds_and_mid_utf8_label_spans() {
+        let mut db = SourceDatabase::new();
+        let file = db.add_file("utf8.vsl", "let α = 1;\n");
+        let diag = Diagnostic::error("E0302", "bad span", Span::new(file, 5, 999))
+            .with_primary_label(Span::new(file, 5, 6), "mid-char primary")
+            .with_secondary_label(Span::new(file, 200, 10), "inverted out-of-bounds secondary");
+
+        let mut out = Vec::new();
+        render_diagnostics(&db, &[diag], &mut out).expect("render succeeds");
+        let rendered = String::from_utf8(out).expect("utf-8 output");
+        assert!(rendered.contains("E0302"));
     }
 }

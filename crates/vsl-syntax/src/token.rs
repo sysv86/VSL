@@ -195,7 +195,7 @@ pub enum Token {
     #[regex(r"0[xX][0-9a-fA-F_]+(?:u64|i64|u32|i32|u|i)?|0[bB][01_]+(?:u64|i64|u32|i32|u|i)?|0[oO][0-7_]+(?:u64|i64|u32|i32|u|i)?", |lex| SmolStr::new(lex.slice()))]
     HexLit(SmolStr),
 
-    #[regex(r"[0-9][0-9_]*(?:\.[0-9][0-9_]*)?(?:[eE][+-]?[0-9]+)(?:f16|f32|f)?|[0-9][0-9_]*\.[0-9][0-9_]*(?:f16|f32|f)?", |lex| SmolStr::new(lex.slice()))]
+    #[regex(r"[0-9][0-9_]*(?:\.[0-9][0-9_]*)?[eE][+-]?[0-9][0-9_]*(?:f16|f32|f)?|[0-9][0-9_]*\.[0-9][0-9_]*(?:f16|f32|f)?|[0-9][0-9_]*(?:f16|f32|f)", |lex| SmolStr::new(lex.slice()))]
     FloatLit(SmolStr),
 
     #[regex(r"[0-9][0-9_]*(?:u64|i64|u32|i32|u|i)?", |lex| SmolStr::new(lex.slice()))]
@@ -285,6 +285,50 @@ mod tests {
             tokens
                 .iter()
                 .any(|t| t.token == Token::FloatLit(SmolStr::new_static("1e-6")))
+        );
+    }
+
+    #[test]
+    fn lexes_integer_form_floats_and_underscore_exponents() {
+        let src = r"
+            let a = 1f32;
+            let b = 1f16;
+            let c = 1f;
+            let d = 1e+1_0;
+            let e = 42u32;
+            let f = 0x1f;
+        ";
+        let (tokens, diags) = lex(FileId(0), src);
+        assert_eq!(diags, Vec::new());
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.token == Token::FloatLit(SmolStr::new_static("1f32")))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.token == Token::FloatLit(SmolStr::new_static("1f16")))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.token == Token::FloatLit(SmolStr::new_static("1f")))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.token == Token::FloatLit(SmolStr::new_static("1e+1_0")))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.token == Token::IntLit(SmolStr::new_static("42u32")))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.token == Token::HexLit(SmolStr::new_static("0x1f")))
         );
     }
 }

@@ -820,6 +820,27 @@ impl Parser {
                     span,
                 }))
             }
+            Some(Token::LBrace) => {
+                // Parse statement-level blocks directly so a following `(` or `[` on the next
+                // statement is never misparsed as a postfix call or index, while still allowing
+                // member access and infix continuations such as `{ 1 } + 2`.
+                let mut expr = Expr::Block(self.parse_block()?);
+                let has_continuation = self.peek() == Some(&Token::Dot)
+                    || self.peek().and_then(infix_binding_power).is_some();
+                if has_continuation {
+                    expr = self.parse_expr_bp_with_lhs(expr, 0)?;
+                }
+                let has_semi = self.eat(&Token::Semi).is_some();
+                if allow_tail && !has_semi && self.peek() == Some(&Token::RBrace) {
+                    return Some(ParsedStmt::TailExpr(expr));
+                }
+                let span = expr.span();
+                Some(ParsedStmt::Stmt(Stmt::Expr {
+                    expr,
+                    has_semi,
+                    span,
+                }))
+            }
             _ => {
                 let expr = self.parse_expr()?;
                 let has_semi = self.eat(&Token::Semi).is_some();
@@ -998,16 +1019,16 @@ impl Parser {
                 Some(Token::Dot) => {
                     self.bump();
                     let field = self.parse_ident()?;
-                    let turbofish = if self.peek() == Some(&Token::ColonColon)
+                    let (turbofish, turbofish_span) = if self.peek() == Some(&Token::ColonColon)
                         && self.peek_n(1) == Some(&Token::Lt)
                     {
-                        self.bump();
+                        let tf_start = self.bump()?.span;
                         self.bump();
                         let args = self.parse_type_args();
-                        self.expect_gt();
-                        args
+                        let tf_end = self.expect_gt().unwrap_or(tf_start);
+                        (args, Some(tf_start.merge(tf_end)))
                     } else {
-                        Vec::new()
+                        (Vec::new(), None)
                     };
                     if self.peek() == Some(&Token::LParen) {
                         let (args, end) = self.parse_call_args();
@@ -1020,6 +1041,19 @@ impl Parser {
                             span,
                         };
                     } else {
+                        if let Some(tf_span) = turbofish_span {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "E0109",
+                                    "generic arguments are not allowed on field access; expected `(` for a method call",
+                                    tf_span,
+                                )
+                                .with_primary_label(
+                                    tf_span,
+                                    "unexpected generic arguments on field access",
+                                ),
+                            );
+                        }
                         let span = lhs.span().merge(field.span);
                         lhs = Expr::Field {
                             receiver: Box::new(lhs),
@@ -1186,10 +1220,11 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
-                if self.allow_struct_lit
-                    && turbofish.is_empty()
-                    && self.peek() == Some(&Token::LBrace)
-                {
+                // Allow turbofish on generic struct literals such as
+                // `Reservoir::<LightSample> { ... }`. `Expr::StructLit` keeps its existing
+                // fields for downstream compatibility with `vsl-hir`, which destructures
+                // `Expr::StructLit { path, fields, span }` without `..`.
+                if self.allow_struct_lit && self.peek() == Some(&Token::LBrace) {
                     self.bump(); // `{`
                     let mut fields = Vec::new();
                     while !self.is_eof() && self.peek() != Some(&Token::RBrace) {
@@ -1790,5 +1825,88 @@ mod tests {
             &inner_args[1],
             TypeArg::NamedExpr { name, .. } if name.name == "align"
         ));
+    }
+
+    #[test]
+    fn parses_standalone_block_followed_by_bracket_and_paren() {
+        let src = r"
+            pub fn blocks_then_exprs(a: u32) -> [u32; 2] {
+                {
+                    let x = a;
+                }
+                (a + 1u);
+                {
+                    let y = a;
+                }
+                [1u, 2u]
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let Item::Function(func) = &parsed.unit.items[0] else {
+            panic!("expected function item");
+        };
+        let body = func.body.as_ref().expect("function body");
+        assert_eq!(body.stmts.len(), 3);
+        assert!(matches!(
+            &body.stmts[0],
+            Stmt::Expr {
+                expr: Expr::Block(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &body.stmts[1],
+            Stmt::Expr {
+                expr: Expr::Binary { .. },
+                has_semi: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &body.stmts[2],
+            Stmt::Expr {
+                expr: Expr::Block(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            body.tail_expr.as_deref(),
+            Some(Expr::ArrayLit { elements, .. }) if elements.len() == 2
+        ));
+    }
+
+    #[test]
+    fn rejects_turbofish_on_non_call_field_access() {
+        let src = r"
+            pub fn bad_field(x: Foo) {
+                let y = x.field::<f32>;
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(parsed.has_errors());
+        assert!(parsed.diagnostics.iter().any(|d| d.code == "E0109"));
+    }
+
+    #[test]
+    fn parses_generic_struct_literal_with_turbofish() {
+        let src = r"
+            pub fn make_res(s: LightSample) -> Reservoir<LightSample> {
+                Reservoir::<LightSample> { sample: s }
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let Item::Function(func) = &parsed.unit.items[0] else {
+            panic!("expected function item");
+        };
+        let body = func.body.as_ref().expect("function body");
+        let Some(Expr::StructLit { path, fields, .. }) = body.tail_expr.as_deref() else {
+            panic!("expected struct literal tail expression");
+        };
+        assert_eq!(path.joined(), "Reservoir");
+        assert_eq!(fields.len(), 1);
     }
 }
