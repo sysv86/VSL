@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "VSL 2.0 Language Server Protocol implementation reusing vsl-syntax, vsl-hir, vsl-pack, and embedded vsl-mc definitions"
+description = "VSL 2.0 Language Server Protocol implementation reusing vsl-syntax, vsl-hir, vsl-pack, vsl-driver, and embedded vsl-mc definitions"
 
 [lints]
 workspace = true
@@ -19,6 +19,7 @@ path = "src/main.rs"
 tokio.workspace = true
 tower-lsp-server.workspace = true
 vsl-diagnostics.workspace = true
+vsl-driver.workspace = true
 vsl-hir.workspace = true
 vsl-mc.workspace = true
 vsl-pack.workspace = true
