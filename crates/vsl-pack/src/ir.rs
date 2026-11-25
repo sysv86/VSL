@@ -11,7 +11,7 @@ pub enum PipelineMode {
     Custom,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackMetadata {
     pub id: SmolStr,
     pub name: SmolStr,
@@ -22,6 +22,22 @@ pub struct PackMetadata {
     pub tier_min: u8,
     pub tier_max: u8,
     pub capabilities: Vec<SmolStr>,
+}
+
+impl Default for PackMetadata {
+    fn default() -> Self {
+        Self {
+            id: SmolStr::default(),
+            name: SmolStr::default(),
+            version: SmolStr::default(),
+            author: SmolStr::default(),
+            description: SmolStr::default(),
+            extends: None,
+            tier_min: 0,
+            tier_max: 3,
+            capabilities: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -89,6 +105,20 @@ pub struct TargetDecl {
     pub clear_color: Option<[f32; 4]>,
 }
 
+/// Pack-declared custom GPU storage buffer (`SSBO` / indirect dispatch arguments buffer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BufferDecl {
+    pub name: SmolStr,
+    #[serde(default)]
+    pub element_type: SmolStr,
+    #[serde(default)]
+    pub count: Option<u64>,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub indirect: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PassKind {
@@ -132,6 +162,11 @@ pub enum PassBindingRef {
         #[serde(default)]
         is_write: bool,
     },
+    CustomBuffer {
+        name: SmolStr,
+        #[serde(default)]
+        is_write: bool,
+    },
     BuiltinTarget {
         resource: BuiltinResourceId,
     },
@@ -167,11 +202,32 @@ pub struct PassNode {
     pub dispatch: Option<PassDispatch>,
 }
 
+/// Synchronization hazard kind represented by a [`PassBarrier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarrierKind {
+    Raw,
+    Waw,
+    War,
+    IndirectDispatch,
+}
+
+/// Synchronization barrier between two scheduled passes sharing a target or buffer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PassBarrier {
+    pub src_pass: SmolStr,
+    pub dst_pass: SmolStr,
+    pub resource: SmolStr,
+    pub kind: BarrierKind,
+}
+
 /// Deterministic topological pass execution schedule produced from a [`PipelineIr`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SchedulePlan {
     pub ordered_passes: Vec<SmolStr>,
     pub replaced_canonical: Vec<CanonicalPass>,
+    #[serde(default)]
+    pub barriers: Vec<PassBarrier>,
 }
 
 /// Validated render-graph IR emitted by `pack.vsl` evaluation or `pack.toml` desugaring.
@@ -184,5 +240,7 @@ pub struct PipelineIr {
     pub hooks: Vec<HookRegistration>,
     pub resource_textures: Vec<ResourceTextureDecl>,
     pub targets: IndexMap<SmolStr, TargetDecl>,
+    #[serde(default)]
+    pub buffers: IndexMap<SmolStr, BufferDecl>,
     pub passes: Vec<PassNode>,
 }

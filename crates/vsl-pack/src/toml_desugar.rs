@@ -1,7 +1,7 @@
 use crate::ir::{
-    HookRegistration, PackMetadata, PassBindingRef, PassDispatch, PassKind, PassMeta, PassNode,
-    PassRef, PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SettingIr, SettingValueIr,
-    TargetDecl,
+    BufferDecl, HookRegistration, PackMetadata, PassBindingRef, PassDispatch, PassKind, PassMeta,
+    PassNode, PassRef, PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SettingIr,
+    SettingValueIr, TargetDecl,
 };
 use crate::schedule::is_write_binding_key;
 use indexmap::IndexMap;
@@ -22,6 +22,8 @@ pub enum TomlDesugarError {
     UnknownImageFormat(String),
     #[error("invalid setting value for `{0}` in pack.toml")]
     InvalidSettingValue(String),
+    #[error("invalid range {min}..={max} for setting `{key}` in pack.toml: lower bound exceeds upper bound")]
+    InvalidSettingRange { key: String, min: f64, max: f64 },
     #[error(
         "setting `{key}` default value {value} is outside declared range {min}..={max} in pack.toml"
     )]
@@ -66,6 +68,8 @@ struct LegacyPackToml {
     hooks: IndexMap<String, String>,
     #[serde(default)]
     targets: IndexMap<String, LegacyTarget>,
+    #[serde(default)]
+    buffers: IndexMap<String, LegacyBuffer>,
     #[serde(default)]
     passes: Vec<LegacyPass>,
 }
@@ -197,6 +201,18 @@ struct LegacyTarget {
     clear_color: Option<[f32; 4]>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LegacyBuffer {
+    #[serde(default)]
+    element_type: String,
+    #[serde(default)]
+    count: Option<u64>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+    #[serde(default)]
+    indirect: bool,
+}
+
 fn default_fmt() -> String {
     "rgba16f".to_owned()
 }
@@ -317,6 +333,7 @@ fn parse_binding_ref(
     bind_key: &str,
     raw: &str,
     resources: &[ResourceTextureDecl],
+    buffers: &IndexMap<SmolStr, BufferDecl>,
 ) -> Result<PassBindingRef, TomlDesugarError> {
     if let Some(rest) = raw.strip_prefix("resource:") {
         if let Ok(slot) = rest.parse::<u32>() {
@@ -334,6 +351,13 @@ fn parse_binding_ref(
         return Err(TomlDesugarError::UnknownResource(raw.to_owned()));
     }
 
+    if let Some(buf_name) = raw.strip_prefix("buffer:") {
+        return Ok(PassBindingRef::CustomBuffer {
+            name: SmolStr::new(buf_name),
+            is_write: is_write_binding_key(bind_key),
+        });
+    }
+
     let builtin_candidate = raw.strip_prefix("mc::targets::").unwrap_or(raw);
     if let Some(resource) = BuiltinResourceId::from_name(builtin_candidate) {
         return Ok(PassBindingRef::BuiltinTarget { resource });
@@ -344,6 +368,13 @@ fn parse_binding_ref(
             name: SmolStr::new(target_name),
             history: true,
             is_write: false,
+        });
+    }
+
+    if buffers.contains_key(raw) {
+        return Ok(PassBindingRef::CustomBuffer {
+            name: SmolStr::new(raw),
+            is_write: is_write_binding_key(bind_key),
         });
     }
 
@@ -407,20 +438,37 @@ pub fn desugar_pack_toml(source: &str) -> Result<PipelineIr, TomlDesugarError> {
     };
 
     for (key, setting) in raw.settings {
-        // v1 manifests may declare only one side of a bound; the missing side uses the
-        // full-tier defaults so the declaration is not silently discarded.
-        let range = setting.range.or_else(|| {
-            if setting.min.is_none() && setting.max.is_none() {
-                return None;
-            }
-            Some([
-                setting.min.clone().unwrap_or(toml::Value::Integer(0)),
-                setting.max.clone().unwrap_or(toml::Value::Integer(3)),
-            ])
-        });
-        let (range, range_is_float) = if let Some([lo_v, hi_v]) = range {
+        // Handle explicit `[lo, hi]` ranges and one-sided `min`/`max` v1 bounds without clamping
+        // missing endpoints to hardcoded tier numbers.
+        let (range, range_is_float) = if let Some([lo_v, hi_v]) = setting.range {
             let (lo, lo_float) = toml_numeric_f64(&key, &lo_v)?;
             let (hi, hi_float) = toml_numeric_f64(&key, &hi_v)?;
+            if lo > hi {
+                return Err(TomlDesugarError::InvalidSettingRange {
+                    key,
+                    min: lo,
+                    max: hi,
+                });
+            }
+            (Some((lo, hi)), lo_float || hi_float)
+        } else if setting.min.is_some() || setting.max.is_some() {
+            let (lo, lo_float) = if let Some(ref min_v) = setting.min {
+                toml_numeric_f64(&key, min_v)?
+            } else {
+                (f64::MIN, false)
+            };
+            let (hi, hi_float) = if let Some(ref max_v) = setting.max {
+                toml_numeric_f64(&key, max_v)?
+            } else {
+                (f64::MAX, false)
+            };
+            if lo > hi {
+                return Err(TomlDesugarError::InvalidSettingRange {
+                    key,
+                    min: lo,
+                    max: hi,
+                });
+            }
             (Some((lo, hi)), lo_float || hi_float)
         } else {
             (None, false)
@@ -561,7 +609,7 @@ pub fn desugar_pack_toml(source: &str) -> Result<PipelineIr, TomlDesugarError> {
             SmolStr::new(
                 resource
                     .path
-                    .rsplit('/')
+                    .rsplit(['/', '\\'])
                     .next()
                     .unwrap_or(resource.path.as_str()),
             )
@@ -602,6 +650,20 @@ pub fn desugar_pack_toml(source: &str) -> Result<PipelineIr, TomlDesugarError> {
         );
     }
 
+    for (name, buf) in raw.buffers {
+        let key = SmolStr::new(name);
+        ir.buffers.insert(
+            key.clone(),
+            BufferDecl {
+                name: key,
+                element_type: SmolStr::new(buf.element_type),
+                count: buf.count,
+                size_bytes: buf.size_bytes,
+                indirect: buf.indirect,
+            },
+        );
+    }
+
     for pass in raw.passes {
         let replaces = match pass.replaces {
             Some(ref name) => Some(
@@ -614,16 +676,22 @@ pub fn desugar_pack_toml(source: &str) -> Result<PipelineIr, TomlDesugarError> {
         let before: Vec<PassRef> = pass.before.iter().map(|b| parse_pass_ref(b)).collect();
         let mut bindings = IndexMap::with_capacity(pass.bindings.len());
         for (bind_key, bind_val) in pass.bindings {
-            let binding_ref = parse_binding_ref(&bind_key, &bind_val, &ir.resource_textures)?;
+            let binding_ref =
+                parse_binding_ref(&bind_key, &bind_val, &ir.resource_textures, &ir.buffers)?;
             bindings.insert(SmolStr::new(bind_key), binding_ref);
         }
-        let dispatch_target = pass.dispatch.as_ref().map(SmolStr::new);
-        let dispatch = if let Some(xyz) = pass.dispatch_xyz {
-            Some(PassDispatch::Explicit(xyz))
+        let (dispatch_target, dispatch) = if let Some(xyz) = pass.dispatch_xyz {
+            (None, Some(PassDispatch::Explicit(xyz)))
         } else if let Some(indirect) = pass.dispatch_indirect {
-            Some(PassDispatch::Indirect(SmolStr::new(indirect)))
+            (None, Some(PassDispatch::Indirect(SmolStr::new(indirect))))
+        } else if let Some(target) = pass.dispatch {
+            let target_smol = SmolStr::new(target);
+            (
+                Some(target_smol.clone()),
+                Some(PassDispatch::ForTarget(target_smol)),
+            )
         } else {
-            pass.dispatch.map(|t| PassDispatch::ForTarget(t.into()))
+            (None, None)
         };
         ir.passes.push(PassNode {
             name: SmolStr::new(pass.name),

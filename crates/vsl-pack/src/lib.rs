@@ -7,11 +7,13 @@ pub mod toml_desugar;
 
 pub use eval::{EvalConfig, MAX_EVAL_STEPS, MAX_LOOP_ITERS, evaluate_pack_vsl};
 pub use ir::{
-    HookRegistration, PackMetadata, PassBindingRef, PassDispatch, PassKind, PassMeta, PassNode,
-    PassRef, PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SchedulePlan, SettingIr,
-    SettingValueIr, TargetDecl,
+    BarrierKind, BufferDecl, HookRegistration, PackMetadata, PassBarrier, PassBindingRef,
+    PassDispatch, PassKind, PassMeta, PassNode, PassRef, PipelineIr, PipelineMode, PresetIr,
+    ResourceTextureDecl, SchedulePlan, SettingIr, SettingValueIr, TargetDecl,
 };
-pub use schedule::{validate_and_schedule, validate_pass_bindings_against_shader};
+pub use schedule::{
+    resolve_pack_inheritance, validate_and_schedule, validate_pass_bindings_against_shader,
+};
 pub use toml_desugar::{TomlDesugarError, desugar_pack_toml};
 
 #[cfg(test)]
@@ -1115,7 +1117,7 @@ gamma = 2.25
             min_tier = 1
         "#;
         let ir = desugar_pack_toml(src).expect("v1 manifest must deserialize");
-        assert_eq!(ir.settings["gated"].range, Some((1.0, 3.0)));
+        assert_eq!(ir.settings["gated"].range, Some((1.0, f64::MAX)));
         assert_eq!(ir.passes[0].meta.tiers, Some((1, 3)));
     }
 
@@ -1126,7 +1128,8 @@ gamma = 2.25
             pipeline custom(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
                 let src_tex = g.target::<rgba16f>("src_tex", mip_levels = 4);
                 let dst_tex = g.target::<rgba16f>("dst_tex");
-                let indirect_buf = g.target::<r32ui>("indirect_buf");
+                let indirect_buf = g.buffer::<u32>("indirect_buf", count = 4, indirect = true);
+                let _args_ssbo = g.buffer::<u32>("args_ssbo", count = 4, indirect = true);
 
                 let p_explicit = g.compute_pass("fill_src", pack::fill::run)
                     .bind(out_src = src_tex.write())
@@ -1406,6 +1409,14 @@ kind = "transfer"
                 clear_color: None,
             },
         );
+        ir.resource_textures.push(ResourceTextureDecl {
+            slot: 2,
+            name: SmolStr::new_static("blue_noise"),
+            path: SmolStr::new_static("resources/blue_noise.png"),
+            format: ImageFormat::Rgba8,
+            filter: SmolStr::new_static("nearest"),
+            wrap: SmolStr::new_static("repeat"),
+        });
 
         let mut bindings = IndexMap::new();
         bindings.insert(
@@ -1725,5 +1736,455 @@ kind = "transfer"
                 .any(|e| e.contains("slot 1") && e.contains("binding 3")),
             "expected ResourceTexture slot mismatch error, got: {errs:?}"
         );
+    }
+
+    #[test]
+    fn evaluates_buffers_indirect_dispatch_and_emits_indirect_barrier() {
+        let src = r#"
+            pack "buf-indirect" { name: "Buffer Indirect", version: "1.0.0" }
+            pipeline custom(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+                let args = g.buffer::<u32>("draw_args", count = 4, indirect = true);
+                let out_tex = g.target::<rgba16f>("out_tex");
+
+                g.compute_pass("consume_indirect", pack::consume::run)
+                    .bind(out_color = out_tex.write())
+                    .dispatch_indirect(args);
+
+                g.compute_pass("build_indirect", pack::build::run)
+                    .bind(args_buf = args.write())
+                    .dispatch(1, 1, 1);
+            }
+        "#;
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (ir, diags) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
+        assert!(!diags.has_errors(), "{:?}", diags.as_slice());
+        assert!(ir.buffers.contains_key("draw_args"));
+        assert_eq!(ir.buffers["draw_args"].count, Some(4));
+        assert!(ir.buffers["draw_args"].indirect);
+
+        let plan = validate_and_schedule(&ir).expect("valid indirect dispatch schedule");
+        assert_eq!(
+            plan.ordered_passes,
+            vec![
+                SmolStr::new_static("build_indirect"),
+                SmolStr::new_static("consume_indirect"),
+            ]
+        );
+        assert!(plan.barriers.iter().any(|b| {
+            b.src_pass == "build_indirect"
+                && b.dst_pass == "consume_indirect"
+                && b.resource == "draw_args"
+                && b.kind == BarrierKind::IndirectDispatch
+        }));
+    }
+
+    #[test]
+    fn mip_pass_marks_target_as_write_and_orders_downstream_readers() {
+        let src = r#"
+            pack "mip-order" { name: "Mip Order", version: "1.0.0" }
+            pipeline custom(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+                let pyramid = g.target::<rgba16f>("pyramid", mip_levels = 4);
+                let out_tex = g.target::<rgba16f>("out_tex");
+
+                g.compute_pass("sample_mips", pack::sample::run)
+                    .bind(in_pyr = pyramid, out_color = out_tex.write())
+                    .dispatch_for(out_tex);
+
+                g.mip_pass("gen_mips")
+                    .bind(src = pyramid);
+            }
+        "#;
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (ir, diags) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
+        assert!(!diags.has_errors(), "{:?}", diags.as_slice());
+        assert!(matches!(
+            ir.passes[1].bindings.get("src"),
+            Some(PassBindingRef::CustomTarget { is_write: true, .. })
+        ));
+
+        let plan = validate_and_schedule(&ir).expect("valid mip pass schedule");
+        assert_eq!(
+            plan.ordered_passes,
+            vec![
+                SmolStr::new_static("gen_mips"),
+                SmolStr::new_static("sample_mips"),
+            ]
+        );
+        assert!(plan.barriers.iter().any(|b| {
+            b.src_pass == "gen_mips"
+                && b.dst_pass == "sample_mips"
+                && b.resource == "pyramid"
+                && b.kind == BarrierKind::Raw
+        }));
+    }
+
+    #[test]
+    fn rejects_unordered_waw_hazard_and_emits_waw_war_barriers_when_ordered() {
+        let unordered_src = r#"
+            pack "waw-err" { name: "WAW Error", version: "1.0.0" }
+            pipeline custom(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+                let t = g.target::<rgba16f>("shared");
+                g.compute_pass("writer_a", pack::a::run).bind(out_t = t.write());
+                g.compute_pass("writer_b", pack::b::run).bind(out_t = t.write());
+            }
+        "#;
+        let parsed = parse_source(FileId(0), unordered_src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (ir, diags) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
+        assert!(!diags.has_errors(), "{:?}", diags.as_slice());
+        let errs = validate_and_schedule(&ir).expect_err("expected WAW hazard error");
+        assert!(
+            errs.iter().any(|e| e.contains("WAW")),
+            "expected WAW error, got: {errs:?}"
+        );
+
+        let ordered_src = r#"
+            pack "waw-ok" { name: "WAW OK", version: "1.0.0" }
+            pipeline custom(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+                let t = g.target::<rgba16f>("shared");
+                let w1 = g.compute_pass("writer_a", pack::a::run).bind(out_t = t.write());
+                let r1 = g.compute_pass("reader", pack::r::run).after(w1).bind(in_t = t);
+                let _w2 = g.compute_pass("writer_b", pack::b::run).after(r1).bind(out_t = t.write());
+            }
+        "#;
+        let parsed_ok = parse_source(FileId(0), ordered_src);
+        assert!(!parsed_ok.has_errors(), "{:?}", parsed_ok.diagnostics);
+        let (ir_ok, diags_ok) = evaluate_pack_vsl(&parsed_ok.unit, &EvalConfig::default());
+        assert!(!diags_ok.has_errors(), "{:?}", diags_ok.as_slice());
+        let plan = validate_and_schedule(&ir_ok).expect("ordered WAW/WAR should schedule");
+        assert!(plan.barriers.iter().any(|b| b.kind == BarrierKind::Raw));
+        assert!(plan.barriers.iter().any(|b| b.kind == BarrierKind::War));
+        assert!(plan.barriers.iter().any(|b| b.kind == BarrierKind::Waw));
+    }
+
+    #[test]
+    fn resolves_pack_inheritance_and_detects_cycles() {
+        let base_src = r#"
+            pack "base-pack" {
+                name: "Base",
+                version: "1.0.0",
+                capabilities: [hdr_output],
+            }
+            settings {
+                category "Lighting" {
+                    param exposure: f32 = 1.0 { label: "Exposure", range: 0.1..=4.0 }
+                }
+            }
+            pipeline extend(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+                let noise = g.resource_texture("base_noise.png", rgba8, nearest, repeat);
+                let t = g.target::<rgba16f>("base_t");
+                g.compute_pass("base_pass", pack::base::run)
+                    .bind(noise = noise, out_t = t.write())
+                    .dispatch_for(t);
+            }
+        "#;
+        let child_src = r#"
+            pack "child-pack" {
+                name: "Child",
+                version: "1.0.0",
+                extends: "base-pack",
+                capabilities: [volumetric_fog],
+            }
+            settings {
+                category "Lighting" {
+                    param exposure: f32 = 2.0 { label: "Exposure", range: 0.1..=4.0 }
+                    param fog_density: f32 = 0.5 { label: "Fog Density" }
+                }
+            }
+            pipeline extend(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+                let lut = g.resource_texture("child_lut.png", rgba8, linear, clamp);
+                let c = g.target::<rgba16f>("child_t");
+                g.compute_pass("child_pass", pack::child::run)
+                    .bind(lut = lut, out_c = c.write())
+                    .dispatch_for(c);
+            }
+        "#;
+        let (base_ir, base_diags) =
+            evaluate_pack_vsl(&parse_source(FileId(0), base_src).unit, &EvalConfig::default());
+        assert!(!base_diags.has_errors(), "{:?}", base_diags.as_slice());
+        let (child_ir, child_diags) =
+            evaluate_pack_vsl(&parse_source(FileId(1), child_src).unit, &EvalConfig::default());
+        assert!(!child_diags.has_errors(), "{:?}", child_diags.as_slice());
+
+        let merged = resolve_pack_inheritance(&child_ir, |id| {
+            if id == "base-pack" {
+                Ok(base_ir.clone())
+            } else {
+                Err(format!("not found: {id}"))
+            }
+        })
+        .expect("inheritance resolution should succeed");
+
+        assert_eq!(merged.metadata.id, "child-pack");
+        assert_eq!(merged.metadata.extends, None);
+        assert_eq!(merged.metadata.capabilities.len(), 2);
+        assert_eq!(
+            merged.settings["exposure"].default_value,
+            SettingValueIr::Float(2.0)
+        );
+        assert!(merged.settings.contains_key("fog_density"));
+        assert_eq!(merged.resource_textures.len(), 2);
+        assert_eq!(merged.resource_textures[1].slot, 1);
+        assert_eq!(merged.passes.len(), 2);
+        assert_eq!(
+            merged.passes[1].bindings.get("lut"),
+            Some(&PassBindingRef::ResourceTexture { slot: 1 })
+        );
+
+        // Cycle detection (A extends B, B extends A).
+        let mut cyc_a = PipelineIr::default();
+        cyc_a.metadata.id = SmolStr::new_static("pack-a");
+        cyc_a.metadata.extends = Some(SmolStr::new_static("pack-b"));
+        let mut cyc_b = PipelineIr::default();
+        cyc_b.metadata.id = SmolStr::new_static("pack-b");
+        cyc_b.metadata.extends = Some(SmolStr::new_static("pack-a"));
+
+        let cyc_errs = resolve_pack_inheritance(&cyc_a, |id| match id {
+            "pack-b" => Ok(cyc_b.clone()),
+            "pack-a" => Ok(cyc_a.clone()),
+            _ => Err("missing".to_owned()),
+        })
+        .expect_err("expected inheritance cycle error");
+        assert!(
+            cyc_errs.iter().any(|e| e.contains("cycle")),
+            "expected cycle diagnostic, got: {cyc_errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_set3_binding_overflow_history_write_readonly_builtin_and_custom_buffer() {
+        use vsl_mc::{
+            DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS, DescriptorAccess,
+            DescriptorKind, TextureDim,
+        };
+
+        let mut ir = PipelineIr {
+            mode: PipelineMode::Custom,
+            ..PipelineIr::default()
+        };
+        ir.targets.insert(
+            SmolStr::new_static("hist_t"),
+            TargetDecl {
+                name: SmolStr::new_static("hist_t"),
+                format: ImageFormat::Rgba16f,
+                scale: 1.0,
+                layers: 1,
+                mip_levels: 1,
+                temporal: true,
+                clear_color: None,
+            },
+        );
+        ir.buffers.insert(
+            SmolStr::new_static("args_buf"),
+            BufferDecl {
+                name: SmolStr::new_static("args_buf"),
+                element_type: SmolStr::new_static("u32"),
+                count: Some(4),
+                size_bytes: None,
+                indirect: true,
+            },
+        );
+
+        let mut bindings = IndexMap::new();
+        bindings.insert(
+            SmolStr::new_static("hist_write"),
+            PassBindingRef::CustomTarget {
+                name: SmolStr::new_static("hist_t"),
+                history: true,
+                is_write: false,
+            },
+        );
+        bindings.insert(
+            SmolStr::new_static("depth_write"),
+            PassBindingRef::BuiltinTarget {
+                resource: BuiltinResourceId::ResMcMainDepth,
+            },
+        );
+        bindings.insert(
+            SmolStr::new_static("args"),
+            PassBindingRef::CustomBuffer {
+                name: SmolStr::new_static("args_buf"),
+                is_write: true,
+            },
+        );
+        bindings.insert(
+            SmolStr::new_static("undeclared_res"),
+            PassBindingRef::ResourceTexture { slot: 5 },
+        );
+
+        let pass = PassNode {
+            name: SmolStr::new_static("abi_check"),
+            kind: PassKind::Compute,
+            entry_fn: SmolStr::new_static("pack::abi::run"),
+            replaces: None,
+            after: Vec::new(),
+            before: Vec::new(),
+            bindings,
+            meta: PassMeta::default(),
+            dispatch_target: None,
+            dispatch: None,
+        };
+
+        let unit = make_test_shader_unit(
+            "pack::abi::run",
+            vec![
+                make_desc(
+                    "hist_write",
+                    DESCRIPTOR_SET_PER_PASS,
+                    1,
+                    DescriptorKind::StorageImage,
+                    Some(TextureDim::Dim2D),
+                    Some(ImageFormat::Rgba16f),
+                    DescriptorAccess::ReadWrite,
+                ),
+                make_desc(
+                    "depth_write",
+                    DESCRIPTOR_SET_PER_PASS,
+                    2,
+                    DescriptorKind::StorageImage,
+                    Some(TextureDim::Dim2D),
+                    Some(ImageFormat::R32f),
+                    DescriptorAccess::WriteOnly,
+                ),
+                make_desc(
+                    "args",
+                    DESCRIPTOR_SET_PER_PASS,
+                    3,
+                    DescriptorKind::StorageBuffer,
+                    None,
+                    None,
+                    DescriptorAccess::ReadWrite,
+                ),
+                make_desc(
+                    "overflow_binding",
+                    DESCRIPTOR_SET_PER_PASS,
+                    15,
+                    DescriptorKind::SampledImage,
+                    Some(TextureDim::Dim2D),
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "undeclared_res",
+                    DESCRIPTOR_SET_PACK_RESOURCES,
+                    5,
+                    DescriptorKind::SampledImage,
+                    Some(TextureDim::Dim2D),
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+                make_desc(
+                    "missing_set3_tex",
+                    DESCRIPTOR_SET_PACK_RESOURCES,
+                    0,
+                    DescriptorKind::CombinedImageSampler,
+                    Some(TextureDim::Dim2D),
+                    None,
+                    DescriptorAccess::ReadOnly,
+                ),
+            ],
+        );
+
+        let errs = validate_pass_bindings_against_shader(&pass, &unit, &ir);
+        assert!(
+            errs.iter().any(|e| e.contains("overflow_binding") && e.contains("15")),
+            "expected Set 0 binding > 14 overflow error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("missing_set3_tex")),
+            "expected missing Set 3 binding error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("undeclared Set 3 slot 5")),
+            "expected undeclared Set 3 slot error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("history target")),
+            "expected read-only history target error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("read-only builtin target")),
+            "expected read-only builtin target write error, got: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("`args`")),
+            "valid CustomBuffer binding `args` must not error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_one_sided_and_reversed_pack_toml_ranges() {
+        let one_sided_min = r#"
+            [pack]
+            id = "min-only"
+            name = "Min Only"
+
+            [settings.exposure]
+            default = 6.0
+            min = 5.0
+        "#;
+        let ir = desugar_pack_toml(one_sided_min).expect("min-only > 3 must succeed");
+        assert_eq!(ir.settings["exposure"].range, Some((5.0, f64::MAX)));
+
+        let one_sided_max = r#"
+            [pack]
+            id = "max-only"
+            name = "Max Only"
+
+            [settings.bias]
+            default = -2.0
+            max = -1.0
+        "#;
+        let ir_max = desugar_pack_toml(one_sided_max).expect("max-only < 0 must succeed");
+        assert_eq!(ir_max.settings["bias"].range, Some((f64::MIN, -1.0)));
+
+        let reversed = r#"
+            [pack]
+            id = "rev-range"
+            name = "Reversed"
+
+            [settings.bad]
+            default = 2.0
+            range = [8.0, 1.0]
+        "#;
+        let err = desugar_pack_toml(reversed).expect_err("reversed range must fail");
+        assert!(matches!(
+            err,
+            TomlDesugarError::InvalidSettingRange { ref key, .. } if key == "bad"
+        ));
+    }
+
+    #[test]
+    fn enforces_eval_diagnostics_for_receiver_args_range_and_for_bounds() {
+        let src = r#"
+            settings {
+                category "General" {
+                    param bad_range: f32 = 2.0 { range: 8.0..=1.0 }
+                }
+            }
+            pipeline custom(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+                let _u = unknown_helper(1);
+                let t = g.target::<rgba16f>("t", bogus_arg = 1);
+                let _bad_recv = cfg.target::<rgba16f>("bad");
+                g.compute_pass("p", pack::a::run).bind(t);
+                for i in true..4 {
+                    let _x = i;
+                }
+            }
+        "#;
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let (ir, diags) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
+        assert_eq!(ir.metadata.tier_max, 3);
+        let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0420"), "expected E0420 for reversed range, got {codes:?}");
+        assert!(codes.contains(&"E0426"), "expected E0426 for unknown fn / wrong receiver, got {codes:?}");
+        assert!(codes.contains(&"E0429"), "expected E0429 for unknown named arg / positional bind, got {codes:?}");
+        assert!(codes.contains(&"E0492"), "expected E0492 for non-int for bound, got {codes:?}");
     }
 }

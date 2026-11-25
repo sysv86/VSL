@@ -1,7 +1,7 @@
 use crate::ir::{
-    HookRegistration, PackMetadata, PassBindingRef, PassDispatch, PassKind, PassMeta, PassNode,
-    PassRef, PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SettingIr, SettingValueIr,
-    TargetDecl,
+    BufferDecl, HookRegistration, PackMetadata, PassBindingRef, PassDispatch, PassKind, PassMeta,
+    PassNode, PassRef, PipelineIr, PipelineMode, PresetIr, ResourceTextureDecl, SettingIr,
+    SettingValueIr, TargetDecl,
 };
 use crate::schedule::is_write_binding_key;
 use indexmap::IndexMap;
@@ -44,9 +44,11 @@ enum HandleValue {
     Target { name: SmolStr, temporal: bool },
     TargetWrite { name: SmolStr },
     TargetHistory { name: SmolStr },
+    Buffer { name: SmolStr },
+    BufferWrite { name: SmolStr },
     BuiltinTarget(BuiltinResourceId),
     ResourceTexture { slot: u32 },
-    PassIndex(usize),
+    PassIndex { idx: usize, is_mip: bool },
     Bool(bool),
     Int(i64),
     Float(f32),
@@ -210,7 +212,7 @@ fn eval_settings_decl(
                         }
                     }
                     "range" => {
-                        range = eval_numeric_range(&field.value);
+                        range = eval_numeric_range(&field.value, diags);
                     }
                     "step" => {
                         step = eval_const_f64(&field.value);
@@ -632,59 +634,75 @@ impl Sandbox<'_> {
                     } = iter
                     {
                         let start = match self.eval_expr(lhs) {
-                            ControlFlow::Normal(HandleValue::Int(v)) => v,
-                            ControlFlow::Normal(_) => 0,
+                            ControlFlow::Normal(HandleValue::Int(v)) => Some(v),
+                            ControlFlow::Normal(_) => {
+                                self.diags.push(Diagnostic::error(
+                                    "E0492",
+                                    "`pack.vsl` `for` range start bound must evaluate to an integer",
+                                    lhs.span(),
+                                ));
+                                None
+                            }
                             other => return other,
                         };
                         let end = match self.eval_expr(rhs) {
-                            ControlFlow::Normal(HandleValue::Int(v)) => v,
-                            ControlFlow::Normal(_) => 0,
+                            ControlFlow::Normal(HandleValue::Int(v)) => Some(v),
+                            ControlFlow::Normal(_) => {
+                                self.diags.push(Diagnostic::error(
+                                    "E0492",
+                                    "`pack.vsl` `for` range end bound must evaluate to an integer",
+                                    rhs.span(),
+                                ));
+                                None
+                            }
                             other => return other,
                         };
-                        let raw_count = if matches!(op, BinaryOp::RangeInclusive) {
-                            end.saturating_sub(start).saturating_add(1).max(0)
-                        } else {
-                            end.saturating_sub(start).max(0)
-                        };
-                        let count = usize::try_from(raw_count).unwrap_or(usize::MAX);
-                        if count > MAX_LOOP_ITERS {
-                            self.diags.push(Diagnostic::error(
-                                "E0491",
-                                format!(
-                                    "`pack.vsl` loop exceeds maximum {MAX_LOOP_ITERS} iterations"
-                                ),
-                                *span,
-                            ));
-                            return ControlFlow::Normal(HandleValue::Unit);
-                        }
-                        let prev_binding = self.env.get(&binding.name).cloned();
-                        let mut early_return: Option<ControlFlow> = None;
-                        for idx in 0..count {
-                            if !self.tick(*span) {
-                                early_return = Some(ControlFlow::Return);
-                                break;
-                            }
-                            let offset = i64::try_from(idx).unwrap_or(0);
-                            self.env.insert(
-                                binding.name.clone(),
-                                HandleValue::Int(start.saturating_add(offset)),
-                            );
-                            match self.eval_block(body) {
-                                ControlFlow::Normal(_) | ControlFlow::Continue => {}
-                                ControlFlow::Break => break,
-                                ret @ ControlFlow::Return => {
-                                    early_return = Some(ret);
-                                    break;
+                        if let (Some(start), Some(end)) = (start, end) {
+                            let raw_count = if matches!(op, BinaryOp::RangeInclusive) {
+                                end.saturating_sub(start).saturating_add(1).max(0)
+                            } else {
+                                end.saturating_sub(start).max(0)
+                            };
+                            let count = usize::try_from(raw_count).unwrap_or(usize::MAX);
+                            if count > MAX_LOOP_ITERS {
+                                self.diags.push(Diagnostic::error(
+                                    "E0491",
+                                    format!(
+                                        "`pack.vsl` loop exceeds maximum {MAX_LOOP_ITERS} iterations"
+                                    ),
+                                    *span,
+                                ));
+                            } else {
+                                let prev_binding = self.env.get(&binding.name).cloned();
+                                let mut early_return: Option<ControlFlow> = None;
+                                for idx in 0..count {
+                                    if !self.tick(*span) {
+                                        early_return = Some(ControlFlow::Return);
+                                        break;
+                                    }
+                                    let offset = i64::try_from(idx).unwrap_or(0);
+                                    self.env.insert(
+                                        binding.name.clone(),
+                                        HandleValue::Int(start.saturating_add(offset)),
+                                    );
+                                    match self.eval_block(body) {
+                                        ControlFlow::Normal(_) | ControlFlow::Continue => {}
+                                        ControlFlow::Break => break,
+                                        ret @ ControlFlow::Return => {
+                                            early_return = Some(ret);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(prev) = prev_binding {
+                                    self.env.insert(binding.name.clone(), prev);
+                                } else {
+                                    self.env.shift_remove(&binding.name);
+                                }
+                                if let Some(cf) = early_return {
+                                    return cf;
                                 }
                             }
-                        }
-                        if let Some(prev) = prev_binding {
-                            self.env.insert(binding.name.clone(), prev);
-                        } else {
-                            self.env.shift_remove(&binding.name);
-                        }
-                        if let Some(cf) = early_return {
-                            return cf;
                         }
                     } else {
                         self.diags.push(Diagnostic::error(
@@ -1124,15 +1142,38 @@ impl Sandbox<'_> {
                         ControlFlow::Normal(v) => v,
                         other => return other,
                     };
-                    if let HandleValue::Target { name, .. } | HandleValue::TargetWrite { name } =
-                        inner
-                    {
-                        return ControlFlow::Normal(HandleValue::TargetWrite { name });
+                    match inner {
+                        HandleValue::Target { name, .. } | HandleValue::TargetWrite { name } => {
+                            return ControlFlow::Normal(HandleValue::TargetWrite { name });
+                        }
+                        HandleValue::Buffer { name } | HandleValue::BufferWrite { name } => {
+                            return ControlFlow::Normal(HandleValue::BufferWrite { name });
+                        }
+                        _ => {
+                            self.diags.push(Diagnostic::error(
+                                "E0426",
+                                "`write(...)` requires a custom target or buffer handle",
+                                arg.span,
+                            ));
+                        }
                     }
+                } else {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "`write(...)` requires a custom target or buffer handle",
+                        callee.span(),
+                    ));
                 }
                 ControlFlow::Normal(HandleValue::Unit)
             }
-            _ => ControlFlow::Normal(HandleValue::Unit),
+            other => {
+                self.diags.push(Diagnostic::error(
+                    "E0426",
+                    format!("unknown function `{other}` in `pack.vsl`"),
+                    callee.span(),
+                ));
+                ControlFlow::Normal(HandleValue::Unit)
+            }
         }
     }
 
@@ -1157,9 +1198,11 @@ impl Sandbox<'_> {
                 | HandleValue::Target { .. }
                 | HandleValue::TargetWrite { .. }
                 | HandleValue::TargetHistory { .. }
+                | HandleValue::Buffer { .. }
+                | HandleValue::BufferWrite { .. }
                 | HandleValue::BuiltinTarget(_)
                 | HandleValue::ResourceTexture { .. }
-                | HandleValue::PassIndex(_)
+                | HandleValue::PassIndex { .. }
         );
         let result = match method {
             "param" | "spec" => {
@@ -1186,6 +1229,14 @@ impl Sandbox<'_> {
                 }
             }
             "hook" => {
+                if !matches!(recv_val, HandleValue::GraphBuilder) {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `hook` is only valid on a `GraphBuilder` receiver",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                }
                 let stage_name = args
                     .first()
                     .and_then(|a| match &a.value {
@@ -1215,6 +1266,14 @@ impl Sandbox<'_> {
                 HandleValue::Unit
             }
             "resource_texture" => {
+                if !matches!(recv_val, HandleValue::GraphBuilder) {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `resource_texture` is only valid on a `GraphBuilder` receiver",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                }
                 let slot = self.ir.resource_textures.len() as u32;
                 if slot >= PACK_RESOURCE_SLOTS {
                     self.diags.push(Diagnostic::error(
@@ -1268,7 +1327,7 @@ impl Sandbox<'_> {
                 let filter = arg_ident_or(args.get(2), "linear");
                 let wrap = arg_ident_or(args.get(3), "clamp");
                 let name = SmolStr::new(
-                    path.rsplit('/')
+                    path.rsplit(['/', '\\'])
                         .next()
                         .unwrap_or(path.as_str())
                         .split_once('.')
@@ -1285,6 +1344,14 @@ impl Sandbox<'_> {
                 HandleValue::ResourceTexture { slot }
             }
             "target" | "target_array" => {
+                if !matches!(recv_val, HandleValue::GraphBuilder) {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        format!("method `{method}` is only valid on a `GraphBuilder` receiver"),
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                }
                 let format = match turbofish.first() {
                     Some(TypeArg::Type(TypeExpr::Named {
                         path: fmt_path,
@@ -1367,8 +1434,20 @@ impl Sandbox<'_> {
                                     clear_color = Some(c);
                                 }
                             }
-                            _ => {}
+                            other => {
+                                self.diags.push(Diagnostic::error(
+                                    "E0429",
+                                    format!("unknown named argument `{other}` in `g.{method}(...)`"),
+                                    arg.span,
+                                ));
+                            }
                         }
+                    } else {
+                        self.diags.push(Diagnostic::error(
+                            "E0429",
+                            format!("unexpected positional argument in `g.{method}(...)`"),
+                            arg.span,
+                        ));
                     }
                 }
                 if let Some(existing) = self.ir.targets.get(&name) {
@@ -1396,11 +1475,137 @@ impl Sandbox<'_> {
                 );
                 HandleValue::Target { name, temporal }
             }
+            "buffer" => {
+                if !matches!(recv_val, HandleValue::GraphBuilder) {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `buffer` is only valid on a `GraphBuilder` receiver",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                }
+                let mut element_type = match turbofish.first() {
+                    Some(TypeArg::Type(TypeExpr::Named { path, .. })) => {
+                        SmolStr::new(path.joined())
+                    }
+                    _ => SmolStr::default(),
+                };
+                let Some(Expr::StringLit(name, _)) = args.first().map(|a| &a.value) else {
+                    self.diags.push(Diagnostic::error(
+                        "E0427",
+                        "`buffer` requires a string literal buffer name",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                };
+                let name = name.clone();
+                let mut count = None;
+                let mut size_bytes = None;
+                let mut indirect = false;
+                for arg in args.iter().skip(1) {
+                    if let Some(ref key) = arg.name {
+                        match key.name.as_str() {
+                            "count" => {
+                                let evaluated = match self.eval_expr(&arg.value) {
+                                    ControlFlow::Normal(v) => v,
+                                    other => return other,
+                                };
+                                if let HandleValue::Int(v) = evaluated
+                                    && v > 0
+                                {
+                                    count = u64::try_from(v).ok();
+                                } else {
+                                    self.diags.push(Diagnostic::error(
+                                        "E0428",
+                                        "`buffer` `count` argument must be a positive integer",
+                                        arg.span,
+                                    ));
+                                }
+                            }
+                            "size_bytes" | "size" => {
+                                let evaluated = match self.eval_expr(&arg.value) {
+                                    ControlFlow::Normal(v) => v,
+                                    other => return other,
+                                };
+                                if let HandleValue::Int(v) = evaluated
+                                    && v > 0
+                                {
+                                    size_bytes = u64::try_from(v).ok();
+                                } else {
+                                    self.diags.push(Diagnostic::error(
+                                        "E0428",
+                                        "`buffer` `size_bytes` argument must be a positive integer",
+                                        arg.span,
+                                    ));
+                                }
+                            }
+                            "indirect" => {
+                                let evaluated = match self.eval_expr(&arg.value) {
+                                    ControlFlow::Normal(v) => v,
+                                    other => return other,
+                                };
+                                if let HandleValue::Bool(b) = evaluated {
+                                    indirect = b;
+                                }
+                            }
+                            "element_type" => match &arg.value {
+                                Expr::StringLit(s, _) => element_type = s.clone(),
+                                Expr::Path { path, .. } => {
+                                    element_type = SmolStr::new(path.joined());
+                                }
+                                _ => {}
+                            },
+                            other => {
+                                self.diags.push(Diagnostic::error(
+                                    "E0429",
+                                    format!("unknown named argument `{other}` in `g.buffer(...)`"),
+                                    arg.span,
+                                ));
+                            }
+                        }
+                    } else {
+                        self.diags.push(Diagnostic::error(
+                            "E0429",
+                            "unexpected positional argument in `g.buffer(...)`",
+                            arg.span,
+                        ));
+                    }
+                }
+                if self.ir.buffers.contains_key(&name) {
+                    self.diags.push(Diagnostic::error(
+                        "E0421",
+                        format!("duplicate storage buffer `{name}` in `pack.vsl`"),
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Buffer { name });
+                }
+                self.ir.buffers.insert(
+                    name.clone(),
+                    BufferDecl {
+                        name: name.clone(),
+                        element_type,
+                        count,
+                        size_bytes,
+                        indirect,
+                    },
+                );
+                HandleValue::Buffer { name }
+            }
             "write" => match recv_val {
                 HandleValue::Target { name, .. } | HandleValue::TargetWrite { name } => {
                     HandleValue::TargetWrite { name }
                 }
-                _ => HandleValue::Unit,
+                HandleValue::Buffer { name } | HandleValue::BufferWrite { name } => {
+                    HandleValue::BufferWrite { name }
+                }
+                _ => {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `write` is only valid on a custom target or buffer handle",
+                        span,
+                    ));
+                    HandleValue::Unit
+                }
             },
             "history" => match recv_val {
                 HandleValue::Target {
@@ -1418,9 +1623,24 @@ impl Sandbox<'_> {
                     ));
                     HandleValue::Unit
                 }
-                _ => HandleValue::Unit,
+                _ => {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `history` is only valid on a temporal custom target handle",
+                        span,
+                    ));
+                    HandleValue::Unit
+                }
             },
             "builtin_target" => {
+                if !matches!(recv_val, HandleValue::GraphBuilder) {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `builtin_target` is only valid on a `GraphBuilder` receiver",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                }
                 if let Some(Expr::Path { path, .. }) = args.first().map(|a| &a.value) {
                     let tail = path.segments.last().map_or("", |seg| seg.name.as_str());
                     if let Some(res) = BuiltinResourceId::from_name(tail) {
@@ -1435,11 +1655,20 @@ impl Sandbox<'_> {
                 HandleValue::Unit
             }
             "compute_pass" | "raster_pass" | "transfer_pass" | "mip_pass" => {
+                if !matches!(recv_val, HandleValue::GraphBuilder) {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        format!("method `{method}` is only valid on a `GraphBuilder` receiver"),
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                }
                 let kind = match method {
                     "compute_pass" => PassKind::Compute,
                     "raster_pass" => PassKind::Raster,
                     _ => PassKind::Transfer,
                 };
+                let is_mip = method == "mip_pass";
                 let name = match args.first().map(|a| &a.value) {
                     Some(Expr::StringLit(s, _)) => s.clone(),
                     _ => SmolStr::new_static("unnamed_pass"),
@@ -1470,12 +1699,18 @@ impl Sandbox<'_> {
                     dispatch_target: None,
                     dispatch: None,
                 });
-                HandleValue::PassIndex(idx)
+                HandleValue::PassIndex { idx, is_mip }
             }
             "replaces" => {
-                if let HandleValue::PassIndex(idx) = recv_val
-                    && let Some(Expr::Path { path, .. }) = args.first().map(|a| &a.value)
-                {
+                let HandleValue::PassIndex { idx, is_mip } = recv_val else {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `replaces` is only valid on a pass handle",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                };
+                if let Some(Expr::Path { path, .. }) = args.first().map(|a| &a.value) {
                     let tail = path.segments.last().map_or("", |seg| seg.name.as_str());
                     if let Some(canonical) = CanonicalPass::from_name(tail) {
                         self.ir.passes[idx].replaces = Some(canonical);
@@ -1486,14 +1721,19 @@ impl Sandbox<'_> {
                             span,
                         ));
                     }
-                    return ControlFlow::Normal(HandleValue::PassIndex(idx));
                 }
-                recv_val
+                return ControlFlow::Normal(HandleValue::PassIndex { idx, is_mip });
             }
             "after" | "before" => {
-                if let HandleValue::PassIndex(idx) = recv_val
-                    && let Some(arg) = args.first()
-                {
+                let HandleValue::PassIndex { idx, is_mip } = recv_val else {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        format!("method `{method}` is only valid on a pass handle"),
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                };
+                if let Some(arg) = args.first() {
                     let pass_ref = match &arg.value {
                         Expr::StringLit(s, _) => CanonicalPass::from_name(s).map_or_else(
                             || Some(PassRef::Custom(s.clone())),
@@ -1515,7 +1755,7 @@ impl Sandbox<'_> {
                                     ));
                                     None
                                 }
-                            } else if let Some(HandleValue::PassIndex(other_idx)) =
+                            } else if let Some(HandleValue::PassIndex { idx: other_idx, .. }) =
                                 self.env.get(tail)
                             {
                                 Some(PassRef::Custom(self.ir.passes[*other_idx].name.clone()))
@@ -1535,187 +1775,213 @@ impl Sandbox<'_> {
                             pass.before.push(pref);
                         }
                     }
-                    return ControlFlow::Normal(HandleValue::PassIndex(idx));
                 }
-                recv_val
+                return ControlFlow::Normal(HandleValue::PassIndex { idx, is_mip });
             }
             "bind" => {
-                if let HandleValue::PassIndex(idx) = recv_val {
-                    for arg in args {
-                        let Some(ref key) = arg.name else {
-                            continue;
-                        };
-                        let val = match self.eval_expr(&arg.value) {
-                            ControlFlow::Normal(v) => v,
-                            other => return other,
-                        };
-                        let binding = match val {
-                            HandleValue::Target { name, .. } => {
-                                Some(PassBindingRef::CustomTarget {
-                                    name,
-                                    history: false,
-                                    is_write: is_write_binding_key(key.name.as_str()),
-                                })
-                            }
-                            HandleValue::TargetWrite { name } => {
-                                Some(PassBindingRef::CustomTarget {
-                                    name,
-                                    history: false,
-                                    is_write: true,
-                                })
-                            }
-                            HandleValue::TargetHistory { name } => {
-                                Some(PassBindingRef::CustomTarget {
-                                    name,
-                                    history: true,
-                                    is_write: false,
-                                })
-                            }
-                            HandleValue::BuiltinTarget(resource) => {
-                                Some(PassBindingRef::BuiltinTarget { resource })
-                            }
-                            HandleValue::ResourceTexture { slot } => {
-                                Some(PassBindingRef::ResourceTexture { slot })
-                            }
-                            _ => {
-                                self.diags.push(Diagnostic::error(
-                                    "E0415",
-                                    format!(
-                                        "unresolved resource handle for binding `{}`",
-                                        key.name
-                                    ),
-                                    arg.span,
-                                ));
-                                None
-                            }
-                        };
-                        if let Some(b) = binding {
-                            self.ir.passes[idx].bindings.insert(key.name.clone(), b);
+                let HandleValue::PassIndex { idx, is_mip } = recv_val else {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `bind` is only valid on a pass handle",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                };
+                for arg in args {
+                    let Some(ref key) = arg.name else {
+                        self.diags.push(Diagnostic::error(
+                            "E0429",
+                            "`bind(...)` requires named `key = resource` arguments",
+                            arg.span,
+                        ));
+                        continue;
+                    };
+                    let val = match self.eval_expr(&arg.value) {
+                        ControlFlow::Normal(v) => v,
+                        other => return other,
+                    };
+                    let binding = match val {
+                        HandleValue::Target { name, .. } => Some(PassBindingRef::CustomTarget {
+                            name,
+                            history: false,
+                            is_write: is_mip || is_write_binding_key(key.name.as_str()),
+                        }),
+                        HandleValue::TargetWrite { name } => Some(PassBindingRef::CustomTarget {
+                            name,
+                            history: false,
+                            is_write: true,
+                        }),
+                        HandleValue::TargetHistory { name } => Some(PassBindingRef::CustomTarget {
+                            name,
+                            history: true,
+                            is_write: false,
+                        }),
+                        HandleValue::Buffer { name } => Some(PassBindingRef::CustomBuffer {
+                            name,
+                            is_write: is_write_binding_key(key.name.as_str()),
+                        }),
+                        HandleValue::BufferWrite { name } => Some(PassBindingRef::CustomBuffer {
+                            name,
+                            is_write: true,
+                        }),
+                        HandleValue::BuiltinTarget(resource) => {
+                            Some(PassBindingRef::BuiltinTarget { resource })
                         }
-                    }
-                    return ControlFlow::Normal(HandleValue::PassIndex(idx));
-                }
-                recv_val
-            }
-            "dispatch_for" => {
-                if let HandleValue::PassIndex(idx) = recv_val {
-                    if let Some(arg) = args.first() {
-                        let val = match self.eval_expr(&arg.value) {
-                            ControlFlow::Normal(v) => v,
-                            other => return other,
-                        };
-                        if let HandleValue::Target { name, .. }
-                        | HandleValue::TargetWrite { name } = val
-                        {
-                            self.ir.passes[idx].dispatch_target = Some(name.clone());
-                            self.ir.passes[idx].dispatch = Some(PassDispatch::ForTarget(name));
-                        } else {
+                        HandleValue::ResourceTexture { slot } => {
+                            Some(PassBindingRef::ResourceTexture { slot })
+                        }
+                        _ => {
                             self.diags.push(Diagnostic::error(
                                 "E0415",
-                                "unresolved custom target handle passed to `dispatch_for(...)`",
+                                format!(
+                                    "unresolved resource handle for binding `{}`",
+                                    key.name
+                                ),
                                 arg.span,
                             ));
+                            None
                         }
+                    };
+                    if let Some(b) = binding {
+                        self.ir.passes[idx].bindings.insert(key.name.clone(), b);
                     }
-                    return ControlFlow::Normal(HandleValue::PassIndex(idx));
                 }
-                recv_val
+                return ControlFlow::Normal(HandleValue::PassIndex { idx, is_mip });
+            }
+            "dispatch_for" => {
+                let HandleValue::PassIndex { idx, is_mip } = recv_val else {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `dispatch_for` is only valid on a pass handle",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                };
+                if let Some(arg) = args.first() {
+                    let val = match self.eval_expr(&arg.value) {
+                        ControlFlow::Normal(v) => v,
+                        other => return other,
+                    };
+                    if let HandleValue::Target { name, .. } | HandleValue::TargetWrite { name } =
+                        val
+                    {
+                        self.ir.passes[idx].dispatch_target = Some(name.clone());
+                        self.ir.passes[idx].dispatch = Some(PassDispatch::ForTarget(name));
+                    } else {
+                        self.diags.push(Diagnostic::error(
+                            "E0415",
+                            "unresolved custom target handle passed to `dispatch_for(...)`",
+                            arg.span,
+                        ));
+                    }
+                }
+                return ControlFlow::Normal(HandleValue::PassIndex { idx, is_mip });
             }
             "dispatch" => {
-                if let HandleValue::PassIndex(idx) = recv_val {
-                    if args.len() != 3 {
-                        self.diags.push(Diagnostic::error(
-                            "E0428",
-                            "`dispatch(x, y, z)` requires exactly 3 positive integer arguments",
-                            span,
-                        ));
-                        return ControlFlow::Normal(HandleValue::PassIndex(idx));
-                    }
-                    let mut dims = [0u32; 3];
-                    let mut valid = true;
-                    for (dim_idx, arg) in args.iter().enumerate() {
-                        let val = match self.eval_expr(&arg.value) {
-                            ControlFlow::Normal(v) => v,
-                            other => return other,
-                        };
-                        match val {
-                            HandleValue::Int(v) if v > 0 => {
-                                if let Ok(d) = u32::try_from(v) {
-                                    dims[dim_idx] = d;
-                                } else {
-                                    valid = false;
-                                    self.diags.push(Diagnostic::error(
-                                        "E0428",
-                                        format!(
-                                            "`dispatch(x, y, z)` argument {} exceeds `u32::MAX`",
-                                            dim_idx + 1
-                                        ),
-                                        arg.span,
-                                    ));
-                                }
-                            }
-                            _ => {
+                let HandleValue::PassIndex { idx, is_mip } = recv_val else {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `dispatch` is only valid on a pass handle",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                };
+                if args.len() != 3 {
+                    self.diags.push(Diagnostic::error(
+                        "E0428",
+                        "`dispatch(x, y, z)` requires exactly 3 positive integer arguments",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::PassIndex { idx, is_mip });
+                }
+                let mut dims = [0u32; 3];
+                let mut valid = true;
+                for (dim_idx, arg) in args.iter().enumerate() {
+                    let val = match self.eval_expr(&arg.value) {
+                        ControlFlow::Normal(v) => v,
+                        other => return other,
+                    };
+                    match val {
+                        HandleValue::Int(v) if v > 0 => {
+                            if let Ok(d) = u32::try_from(v) {
+                                dims[dim_idx] = d;
+                            } else {
                                 valid = false;
                                 self.diags.push(Diagnostic::error(
                                     "E0428",
                                     format!(
-                                        "`dispatch(x, y, z)` argument {} must be a positive integer",
+                                        "`dispatch(x, y, z)` argument {} exceeds `u32::MAX`",
                                         dim_idx + 1
                                     ),
                                     arg.span,
                                 ));
                             }
                         }
+                        _ => {
+                            valid = false;
+                            self.diags.push(Diagnostic::error(
+                                "E0428",
+                                format!(
+                                    "`dispatch(x, y, z)` argument {} must be a positive integer",
+                                    dim_idx + 1
+                                ),
+                                arg.span,
+                            ));
+                        }
                     }
-                    if valid {
-                        self.ir.passes[idx].dispatch_target = None;
-                        self.ir.passes[idx].dispatch = Some(PassDispatch::Explicit(dims));
-                    }
-                    return ControlFlow::Normal(HandleValue::PassIndex(idx));
                 }
-                recv_val
+                if valid {
+                    self.ir.passes[idx].dispatch_target = None;
+                    self.ir.passes[idx].dispatch = Some(PassDispatch::Explicit(dims));
+                }
+                return ControlFlow::Normal(HandleValue::PassIndex { idx, is_mip });
             }
             "dispatch_indirect" => {
-                if let HandleValue::PassIndex(idx) = recv_val {
-                    let Some(arg) = args.first() else {
-                        self.diags.push(Diagnostic::error(
-                            "E0428",
-                            "`dispatch_indirect(...)` requires a target or buffer handle or name",
-                            span,
-                        ));
-                        return ControlFlow::Normal(HandleValue::PassIndex(idx));
-                    };
-                    let resolved = if let Expr::StringLit(s, _) = &arg.value {
-                        if s.trim().is_empty() {
-                            None
-                        } else {
-                            Some(s.clone())
-                        }
+                let HandleValue::PassIndex { idx, is_mip } = recv_val else {
+                    self.diags.push(Diagnostic::error(
+                        "E0426",
+                        "method `dispatch_indirect` is only valid on a pass handle",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::Unit);
+                };
+                let Some(arg) = args.first() else {
+                    self.diags.push(Diagnostic::error(
+                        "E0428",
+                        "`dispatch_indirect(...)` requires a declared buffer handle or buffer name",
+                        span,
+                    ));
+                    return ControlFlow::Normal(HandleValue::PassIndex { idx, is_mip });
+                };
+                let resolved = if let Expr::StringLit(s, _) = &arg.value {
+                    if s.trim().is_empty() || !self.ir.buffers.contains_key(s.as_str()) {
+                        None
                     } else {
-                        let val = match self.eval_expr(&arg.value) {
-                            ControlFlow::Normal(v) => v,
-                            other => return other,
-                        };
-                        match val {
-                            HandleValue::Target { name, .. }
-                            | HandleValue::TargetWrite { name }
-                            | HandleValue::TargetHistory { name } => Some(name),
-                            _ => None,
-                        }
-                    };
-                    if let Some(name) = resolved {
-                        self.ir.passes[idx].dispatch_target = None;
-                        self.ir.passes[idx].dispatch = Some(PassDispatch::Indirect(name));
-                    } else {
-                        self.diags.push(Diagnostic::error(
-                            "E0415",
-                            "unresolved target or buffer handle passed to `dispatch_indirect(...)`",
-                            arg.span,
-                        ));
+                        Some(s.clone())
                     }
-                    return ControlFlow::Normal(HandleValue::PassIndex(idx));
+                } else {
+                    let val = match self.eval_expr(&arg.value) {
+                        ControlFlow::Normal(v) => v,
+                        other => return other,
+                    };
+                    match val {
+                        HandleValue::Buffer { name } | HandleValue::BufferWrite { name } => {
+                            Some(name)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(name) = resolved {
+                    self.ir.passes[idx].dispatch_target = None;
+                    self.ir.passes[idx].dispatch = Some(PassDispatch::Indirect(name));
+                } else {
+                    self.diags.push(Diagnostic::error(
+                        "E0415",
+                        "unresolved or undeclared buffer passed to `dispatch_indirect(...)`",
+                        arg.span,
+                    ));
                 }
-                recv_val
+                return ControlFlow::Normal(HandleValue::PassIndex { idx, is_mip });
             }
             _ => {
                 if handle_like {
@@ -1835,7 +2101,7 @@ fn eval_tier_range(expr: &Expr, diags: &mut DiagnosticBag) -> Option<(u8, u8)> {
     Some((u8::try_from(lo).unwrap_or(0), u8::try_from(hi).unwrap_or(3)))
 }
 
-fn eval_numeric_range(expr: &Expr) -> Option<(f64, f64)> {
+fn eval_numeric_range(expr: &Expr, diags: &mut DiagnosticBag) -> Option<(f64, f64)> {
     let Expr::Binary {
         op: BinaryOp::RangeInclusive | BinaryOp::Range,
         lhs,
@@ -1845,7 +2111,17 @@ fn eval_numeric_range(expr: &Expr) -> Option<(f64, f64)> {
     else {
         return None;
     };
-    Some((eval_const_f64(lhs)?, eval_const_f64(rhs)?))
+    let lo = eval_const_f64(lhs)?;
+    let hi = eval_const_f64(rhs)?;
+    if lo > hi {
+        diags.push(Diagnostic::error(
+            "E0420",
+            format!("invalid numeric range `{lo}..={hi}`: lower bound exceeds upper bound"),
+            expr.span(),
+        ));
+        return None;
+    }
+    Some((lo, hi))
 }
 
 fn strip_int_suffix(raw: &str) -> &str {
