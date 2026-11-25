@@ -2414,6 +2414,12 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         self.load_world_field("thunder", span)
     }
 
+    /// CPU-integrated wind phase (`sum(dt * windSpeed)`) at `WorldUBO` offset 536. Unlike
+    /// `game_time_sec * wind_speed`, this stays continuous when weather changes the wind speed.
+    fn world_wind_phase(&mut self, span: Span) -> InstId {
+        self.load_world_field("wind_phase", span)
+    }
+
     fn world_eye_in_fluid(&mut self, span: Span) -> InstId {
         self.load_world_field("eye_in_fluid", span)
     }
@@ -2802,6 +2808,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         "game_time_sec" => self.world_game_time_sec(span),
                         "rain" => self.world_rain(span),
                         "thunder" => self.world_thunder(span),
+                        "wind_phase" => self.world_wind_phase(span),
                         "eye_in_fluid" => self.world_eye_in_fluid(span),
                         "sun_dir" => self.world_sun_dir(span),
                         _ => self.emit_builtin_struct_field_load(
@@ -5457,6 +5464,7 @@ mod tests {
                 let rain_now: f32 = mc::world.rain;
                 let legacy_rain: f32 = mc::world.rain_strength;
                 let storm: f32 = mc::world.thunder;
+                let wind_phase: f32 = mc::world.wind_phase;
                 let fluid: i32 = mc::world.eye_in_fluid;
                 let sun: vec3 = mc::world.sun_dir;
                 let cam: vec3 = mc::world.camera_pos;
@@ -5469,7 +5477,7 @@ mod tests {
                 let clouds: f32 = mc::biome_cloud_scale();
                 let valid: bool = mc::has_biome_telemetry();
                 let validity: f32 = if valid { 1.0 } else { 0.0 };
-                let value = t + legacy_time + rain_now + legacy_rain + storm + f32(fluid)
+                let value = t + legacy_time + rain_now + legacy_rain + storm + wind_phase + f32(fluid)
                     + sun.x + cam.x + legacy_vp[0u].x + legacy_inv_vp[0u].x + prev_vp[0u].x
                     + slot0.x + telemetry.z + f32(dim) + clouds + validity;
                 out_img.store(ivec2(gid.xy), vec4(value, 0.0, 0.0, 1.0));

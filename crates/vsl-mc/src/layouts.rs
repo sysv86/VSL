@@ -97,7 +97,8 @@ const fn world_pack_param_field(slot: usize) -> BuiltinFieldDesc {
 ///
 /// Field names and offsets mirror `WorldUboData` in `vulkanshaders-core` and the GLSL
 /// `WorldUBO` block in the engine's `common.vsl`. The first 528 bytes are the v1 `WorldUBO` ABI;
-/// the remaining 16 bytes carry the VSL pack-parameter BDA plus `std140` padding.
+/// the remaining 16 bytes carry the VSL pack-parameter BDA (528..535), the CPU-integrated wind
+/// phase (536..539), and `std140` padding (540..543).
 pub const WORLD_UBO_FIELDS: &[BuiltinFieldDesc] = &[
     BuiltinFieldDesc {
         name: "cur_view_proj",
@@ -208,10 +209,16 @@ pub const WORLD_UBO_FIELDS: &[BuiltinFieldDesc] = &[
         ty: BuiltinFieldType::U64,
     },
     BuiltinFieldDesc {
-        name: "pack_params_bda_pad",
+        name: "wind_phase",
         byte_offset: 536,
-        byte_size: 8,
-        ty: BuiltinFieldType::UVec2,
+        byte_size: 4,
+        ty: BuiltinFieldType::F32,
+    },
+    BuiltinFieldDesc {
+        name: "pack_params_bda_pad",
+        byte_offset: 540,
+        byte_size: 4,
+        ty: BuiltinFieldType::U32,
     },
 ];
 
@@ -674,7 +681,8 @@ mod tests {
             ("pack_params", 320),
             ("held_light_position", 512),
             ("pack_params_bda", 528),
-            ("pack_params_bda_pad", 536),
+            ("wind_phase", 536),
+            ("pack_params_bda_pad", 540),
         ] {
             assert_eq!(
                 WORLD_UBO_LAYOUT.field(name).unwrap().byte_offset,
