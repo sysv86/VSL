@@ -97,11 +97,8 @@ where
                 "pack inheritance cycle detected involving `{parent_id}`"
             )]);
         }
-        let parent_ir = load_parent(parent_id.as_str()).map_err(|err| {
-            vec![format!(
-                "failed to load parent pack `{parent_id}`: {err}"
-            )]
-        })?;
+        let parent_ir = load_parent(parent_id.as_str())
+            .map_err(|err| vec![format!("failed to load parent pack `{parent_id}`: {err}")])?;
         if !parent_ir.metadata.id.is_empty()
             && parent_ir.metadata.id != parent_id
             && !visited.insert(parent_ir.metadata.id.clone())
@@ -135,9 +132,9 @@ where
 
 fn merge_pack_ir(mut base: PipelineIr, child: PipelineIr) -> PipelineIr {
     let mut merged_caps = base.metadata.capabilities;
-    for cap in child.metadata.capabilities {
-        if !merged_caps.contains(&cap) {
-            merged_caps.push(cap);
+    for cap in &child.metadata.capabilities {
+        if !merged_caps.contains(cap) {
+            merged_caps.push(cap.clone());
         }
     }
     base.metadata = child.metadata;
@@ -706,9 +703,7 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
             };
 
             for &r in &sorted_readers {
-                if r != w
-                    && node_pos[r] < node_pos[w]
-                    && prev_w_pos.is_none_or(|p| node_pos[r] > p)
+                if r != w && node_pos[r] < node_pos[w] && prev_w_pos.is_none_or(|p| node_pos[r] > p)
                 {
                     barrier_set.insert(PassBarrier {
                         src_pass: node_names[r].clone(),

@@ -671,12 +671,7 @@ impl SpirvEmitter {
         self.emit_member_decorate(struct_ty, 0, spirv::Decoration::Offset, &[0]);
         if let Some(col_stride) = matrix_stride {
             self.emit_member_decorate(struct_ty, 0, spirv::Decoration::ColMajor, &[]);
-            self.emit_member_decorate(
-                struct_ty,
-                0,
-                spirv::Decoration::MatrixStride,
-                &[col_stride],
-            );
+            self.emit_member_decorate(struct_ty, 0, spirv::Decoration::MatrixStride, &[col_stride]);
         }
         self.bda_block_tys.insert(key, struct_ty);
         struct_ty
@@ -1035,11 +1030,7 @@ fn ir_type_align(ty: &IrType) -> u32 {
         IrType::Scalar(s) => s.byte_size().max(1).next_power_of_two(),
         IrType::Vector { scalar, len } => {
             let elem = scalar.byte_size().max(1);
-            let comps = if *len == 3 {
-                4
-            } else {
-                u32::from(*len).max(1)
-            };
+            let comps = if *len == 3 { 4 } else { u32::from(*len).max(1) };
             elem.saturating_mul(comps).next_power_of_two()
         }
         IrType::Matrix { scalar, rows, .. } => {
@@ -1313,8 +1304,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                             uses_non_uniform = true;
                         }
                         match desc.kind {
-                            DescriptorKind::SampledImage
-                            | DescriptorKind::CombinedImageSampler => {
+                            DescriptorKind::SampledImage | DescriptorKind::CombinedImageSampler => {
                                 if is_dynamic {
                                     emitter.emit_capability(
                                         spirv::Capability::SampledImageArrayDynamicIndexing,
@@ -2435,12 +2425,7 @@ impl FnLowerCtx<'_> {
         }
     }
 
-    fn bda_ptr_ty_for(
-        &mut self,
-        elem_ty: u32,
-        stride: u32,
-        matrix_stride: Option<u32>,
-    ) -> u32 {
+    fn bda_ptr_ty_for(&mut self, elem_ty: u32, stride: u32, matrix_stride: Option<u32>) -> u32 {
         let block_ty = self
             .emitter
             .emit_bda_block_struct_for(elem_ty, stride, matrix_stride);
@@ -3399,8 +3384,7 @@ impl FnLowerCtx<'_> {
                 let ir_ty = self.func.insts[id].ir_ty.clone();
                 let ty = if ir_ty.is_64bit() {
                     self.emitter.emit_ir_type(&ir_ty)
-                } else if self.is_signed_int_spv_ty(src_ty) || self.is_unsigned_int_spv_ty(src_ty)
-                {
+                } else if self.is_signed_int_spv_ty(src_ty) || self.is_unsigned_int_spv_ty(src_ty) {
                     src_ty
                 } else {
                     u32_ty
@@ -3920,8 +3904,7 @@ impl FnLowerCtx<'_> {
                             if rhs_comp_ty == comp_ty {
                                 (rhs_id, rhs_len)
                             } else {
-                                let target_rhs_ty =
-                                    self.emitter.emit_type_vector(comp_ty, rhs_len);
+                                let target_rhs_ty = self.emitter.emit_type_vector(comp_ty, rhs_len);
                                 (self.coerce_to_ty(rhs_id, rhs_ty, target_rhs_ty), rhs_len)
                             }
                         } else {
@@ -4317,8 +4300,7 @@ impl FnLowerCtx<'_> {
             }
             InstData::BdaLoad { ptr, access } => {
                 let (elem_ty, stride, elem_align, mat_col_stride) = self.bda_load_elem_ty(id, ptr);
-                let block_ptr_id =
-                    self.ensure_bda_block_ptr(ptr, elem_ty, stride, mat_col_stride);
+                let block_ptr_id = self.ensure_bda_block_ptr(ptr, elem_ty, stride, mat_col_stride);
                 let elem_ptr = self.bda_elem_ptr_for(block_ptr_id, elem_ty);
                 let res = self.emitter.alloc_id();
                 let align = access.align.max(elem_align).next_power_of_two();
@@ -4365,8 +4347,7 @@ impl FnLowerCtx<'_> {
                 let (elem_ty, stride, elem_align, mat_col_stride) =
                     self.bda_store_elem_ty(value, val_ty);
                 let val_id = self.coerce_to_ty(raw_val_id, val_ty, elem_ty);
-                let block_ptr_id =
-                    self.ensure_bda_block_ptr(ptr, elem_ty, stride, mat_col_stride);
+                let block_ptr_id = self.ensure_bda_block_ptr(ptr, elem_ty, stride, mat_col_stride);
                 let elem_ptr = self.bda_elem_ptr_for(block_ptr_id, elem_ty);
                 let align = access.align.max(elem_align).next_power_of_two();
                 if self.uses_bda {
@@ -5407,8 +5388,7 @@ impl FnLowerCtx<'_> {
                                         cur_ir_ty = *element;
                                     }
                                     IrType::Matrix { scalar, cols, rows } => {
-                                        let col_elems =
-                                            if rows == 3 { 4 } else { u32::from(rows) };
+                                        let col_elems = if rows == 3 { 4 } else { u32::from(rows) };
                                         let col_stride =
                                             scalar.byte_size().saturating_mul(col_elems).max(1);
                                         let col_idx = (rel_off / col_stride)
@@ -5431,17 +5411,15 @@ impl FnLowerCtx<'_> {
                                 }
                             }
                             let leaf_ty = self.emitter.emit_ir_type_with_layout(&cur_ir_ty, true);
-                            let ptr_ty = self
-                                .emitter
-                                .emit_type_pointer(desc.storage_class, leaf_ty);
+                            let ptr_ty =
+                                self.emitter.emit_type_pointer(desc.storage_class, leaf_ty);
                             let ptr_id = self.emitter.alloc_id();
                             let mut ac_ops = Vec::with_capacity(3 + chain_indices.len());
                             ac_ops.push(ptr_ty);
                             ac_ops.push(ptr_id);
                             ac_ops.push(desc.var_id);
                             ac_ops.extend_from_slice(&chain_indices);
-                            self.emitter
-                                .emit_fn_inst(spirv::Op::AccessChain, &ac_ops);
+                            self.emitter.emit_fn_inst(spirv::Op::AccessChain, &ac_ops);
                             let loaded = self.emitter.alloc_id();
                             self.emitter
                                 .emit_fn_inst(spirv::Op::Load, &[leaf_ty, loaded, ptr_id]);
@@ -5581,7 +5559,11 @@ impl FnLowerCtx<'_> {
                     {
                         let p_clone = pointee.as_ref().clone();
                         let spv_ty = self.emitter.emit_ir_type_with_layout(&p_clone, true);
-                        (spv_ty, ir_type_stride(&p_clone), matrix_col_stride(&p_clone))
+                        (
+                            spv_ty,
+                            ir_type_stride(&p_clone),
+                            matrix_col_stride(&p_clone),
+                        )
                     } else {
                         (self.u32_ty(), 4, None)
                     };
@@ -6149,8 +6131,7 @@ impl FnLowerCtx<'_> {
         };
         let coerced = self.coerce_to_ty(raw, src_ty, target_ty);
         let res = self.emitter.alloc_id();
-        self.emitter
-            .emit_fn_inst(op, &[target_ty, res, coerced]);
+        self.emitter.emit_fn_inst(op, &[target_ty, res, coerced]);
         (res, target_ty)
     }
 
@@ -6200,13 +6181,12 @@ impl FnLowerCtx<'_> {
             } else {
                 u32_ty
             };
-            let stride = if self.cached_u64_ty() == Some(elem_ty)
-                || self.cached_i64_ty() == Some(elem_ty)
-            {
-                8
-            } else {
-                4
-            };
+            let stride =
+                if self.cached_u64_ty() == Some(elem_ty) || self.cached_i64_ty() == Some(elem_ty) {
+                    8
+                } else {
+                    4
+                };
             let block_ptr = self.ensure_bda_block_ptr(ptr, elem_ty, stride, None);
             let elem_ptr = self.bda_elem_ptr_for(block_ptr, elem_ty);
             return Some((elem_ptr, elem_ty, self.bda_storage_class()));
@@ -6900,8 +6880,12 @@ impl FnLowerCtx<'_> {
         let lhs_ty = self.inst_types.get(&a).copied().unwrap_or(u32_ty);
         let rhs_ty = self.inst_types.get(&b).copied().unwrap_or(u32_ty);
         let ir_ty = inst_id.map(|iid| self.func.insts[iid].ir_ty.clone());
-        let lhs_scalar = self.vector_component_info(lhs_ty).map_or(lhs_ty, |(c, _)| c);
-        let rhs_scalar = self.vector_component_info(rhs_ty).map_or(rhs_ty, |(c, _)| c);
+        let lhs_scalar = self
+            .vector_component_info(lhs_ty)
+            .map_or(lhs_ty, |(c, _)| c);
+        let rhs_scalar = self
+            .vector_component_info(rhs_ty)
+            .map_or(rhs_ty, |(c, _)| c);
         let is_64bit = ir_ty.as_ref().is_some_and(IrType::is_64bit)
             || i64_cached == Some(lhs_scalar)
             || u64_cached == Some(lhs_scalar)
@@ -10908,13 +10892,17 @@ mod tests {
         assert!(
             insts
                 .iter()
-                .any(|&(op, ops)| op == spirv::Op::ExtInst as u32 && ops.len() >= 4 && ops[3] == 62),
+                .any(|&(op, ops)| op == spirv::Op::ExtInst as u32
+                    && ops.len() >= 4
+                    && ops[3] == 62),
             "expected GLSL.std.450 UnpackHalf2x16 opcode 62"
         );
         assert!(
             !insts
                 .iter()
-                .any(|&(op, ops)| op == spirv::Op::ExtInst as u32 && ops.len() >= 4 && ops[3] == 60),
+                .any(|&(op, ops)| op == spirv::Op::ExtInst as u32
+                    && ops.len() >= 4
+                    && ops[3] == 60),
             "must not emit UnpackSnorm2x16 opcode 60 for UnpackHalf2x16"
         );
         validate_with_spirv_val_if_available(&words, "unpack_half_2x16_opcode_62");
@@ -11055,18 +11043,9 @@ mod tests {
         let lhs = func64.emit_typed(IrType::Scalar(ScalarIrTy::I64), InstData::ConstI64(100));
         let rhs = func64.emit_typed(IrType::Scalar(ScalarIrTy::I64), InstData::ConstI64(7));
         let shift = func64.emit_typed(IrType::Scalar(ScalarIrTy::I64), InstData::ConstI64(1));
-        let sub = func64.emit_typed(
-            IrType::Scalar(ScalarIrTy::I64),
-            InstData::ISub32(lhs, rhs),
-        );
-        let div = func64.emit_typed(
-            IrType::Scalar(ScalarIrTy::I64),
-            InstData::IDiv32(sub, rhs),
-        );
-        let shr = func64.emit_typed(
-            IrType::Scalar(ScalarIrTy::I64),
-            InstData::Shr32(div, shift),
-        );
+        let sub = func64.emit_typed(IrType::Scalar(ScalarIrTy::I64), InstData::ISub32(lhs, rhs));
+        let div = func64.emit_typed(IrType::Scalar(ScalarIrTy::I64), InstData::IDiv32(sub, rhs));
+        let shr = func64.emit_typed(IrType::Scalar(ScalarIrTy::I64), InstData::Shr32(div, shift));
         let store64 = func64.emit(
             None,
             InstData::WorkgroupStore {

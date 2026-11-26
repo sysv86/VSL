@@ -1418,9 +1418,8 @@ fn collect_param_substitution_expr(
 /// Returns the span of the first non-trailing `HirStmt::Return` inside `block`, if any.
 fn find_non_trailing_return_block(block: &HirBlock, allow_trailing: bool) -> Option<Span> {
     for (idx, stmt) in block.stmts.iter().enumerate() {
-        let is_trailing = allow_trailing
-            && block.tail_expr.is_none()
-            && idx + 1 == block.stmts.len();
+        let is_trailing =
+            allow_trailing && block.tail_expr.is_none() && idx + 1 == block.stmts.len();
         if let Some(span) = find_non_trailing_return_stmt(stmt, is_trailing) {
             return Some(span);
         }
@@ -1472,20 +1471,29 @@ fn find_non_trailing_return_stmt(stmt: &HirStmt, is_trailing: bool) -> Option<Sp
 
 fn find_non_trailing_return_expr(expr: &HirExpr) -> Option<Span> {
     match &expr.kind {
-        HirExprKind::ArrayLit { elements } => elements.iter().find_map(find_non_trailing_return_expr),
-        HirExprKind::StructLit { fields, .. } => {
-            fields.iter().find_map(|(_, e)| find_non_trailing_return_expr(e))
+        HirExprKind::ArrayLit { elements } => {
+            elements.iter().find_map(find_non_trailing_return_expr)
         }
+        HirExprKind::StructLit { fields, .. } => fields
+            .iter()
+            .find_map(|(_, e)| find_non_trailing_return_expr(e)),
         HirExprKind::Unary { operand, .. } | HirExprKind::Swizzle { base: operand, .. } => {
             find_non_trailing_return_expr(operand)
         }
         HirExprKind::Binary { lhs, rhs, .. } => {
             find_non_trailing_return_expr(lhs).or_else(|| find_non_trailing_return_expr(rhs))
         }
-        HirExprKind::Call { callee, args, .. } => find_non_trailing_return_expr(callee)
-            .or_else(|| args.iter().find_map(|a| find_non_trailing_return_expr(&a.value))),
+        HirExprKind::Call { callee, args, .. } => {
+            find_non_trailing_return_expr(callee).or_else(|| {
+                args.iter()
+                    .find_map(|a| find_non_trailing_return_expr(&a.value))
+            })
+        }
         HirExprKind::MethodCall { receiver, args, .. } => find_non_trailing_return_expr(receiver)
-            .or_else(|| args.iter().find_map(|a| find_non_trailing_return_expr(&a.value))),
+            .or_else(|| {
+                args.iter()
+                    .find_map(|a| find_non_trailing_return_expr(&a.value))
+            }),
         HirExprKind::Field { receiver, .. } => find_non_trailing_return_expr(receiver),
         HirExprKind::Index { receiver, index } => {
             find_non_trailing_return_expr(receiver).or_else(|| find_non_trailing_return_expr(index))
@@ -1496,7 +1504,11 @@ fn find_non_trailing_return_expr(expr: &HirExpr) -> Option<Span> {
             else_branch,
         } => find_non_trailing_return_expr(cond)
             .or_else(|| find_non_trailing_return_block(then_branch, false))
-            .or_else(|| else_branch.as_deref().and_then(find_non_trailing_return_expr)),
+            .or_else(|| {
+                else_branch
+                    .as_deref()
+                    .and_then(find_non_trailing_return_expr)
+            }),
         HirExprKind::Block(block) => find_non_trailing_return_block(block, false),
         HirExprKind::IntLit(_)
         | HirExprKind::FloatLit(_)
@@ -2639,7 +2651,10 @@ fn expand_image_helper(
         substituted.stmts.pop();
         substituted.tail_expr = Some(Box::new(value));
     } else if callee_return_ty.is_none()
-        && matches!(substituted.stmts.last(), Some(HirStmt::Return { value: None, .. }))
+        && matches!(
+            substituted.stmts.last(),
+            Some(HirStmt::Return { value: None, .. })
+        )
     {
         substituted.stmts.pop();
     }
@@ -3403,7 +3418,9 @@ impl LowerCtx<'_> {
                                 ),
                                 param.span,
                             )
-                            .with_note("Vulkan allows at most one push-constant block per entry point"),
+                            .with_note(
+                                "Vulkan allows at most one push-constant block per entry point",
+                            ),
                         );
                     } else {
                         seen_push_constant_param = true;
@@ -3581,10 +3598,7 @@ impl LowerCtx<'_> {
             };
             let (hir_block, tail_ty) = scanner.lower_block(body);
             if let Some(actual_ty) = tail_ty {
-                let tail_span = hir_block
-                    .tail_expr
-                    .as_ref()
-                    .map_or(body.span, |e| e.span);
+                let tail_span = hir_block.tail_expr.as_ref().map_or(body.span, |e| e.span);
                 match return_ty {
                     Some(exp_ty)
                         if scanner.is_concrete_value_ty(exp_ty)
@@ -4139,10 +4153,7 @@ impl LowerCtx<'_> {
 
             let mut visited: IndexSet<HirFnId> = IndexSet::new();
             visited.insert(entry_id);
-            let mut queue: Vec<HirFnId> = call_graph
-                .get(&entry_id)
-                .cloned()
-                .unwrap_or_default();
+            let mut queue: Vec<HirFnId> = call_graph.get(&entry_id).cloned().unwrap_or_default();
 
             while let Some(callee_id) = queue.pop() {
                 if !visited.insert(callee_id) {
@@ -5765,11 +5776,12 @@ impl BodyScanner<'_, '_> {
         }
 
         let mut bound_params = vec![false; sig_params.len()];
-        for (idx, (hir_arg, actual_ty_opt)) in
-            hir_args.iter().zip(arg_types.iter()).enumerate()
-        {
+        for (idx, (hir_arg, actual_ty_opt)) in hir_args.iter().zip(arg_types.iter()).enumerate() {
             let param_idx = if let Some(ref arg_name) = hir_arg.name {
-                if let Some(pos) = sig_params.iter().position(|(pname, _, _)| pname == arg_name) {
+                if let Some(pos) = sig_params
+                    .iter()
+                    .position(|(pname, _, _)| pname == arg_name)
+                {
                     if bound_params[pos] {
                         self.ctx.diags.push(Diagnostic::error(
                             "E0274",
@@ -7960,9 +7972,7 @@ fn validate_monomorphized_struct(
         .explicit_block_layout_structs
         .is_some_and(|set| set.contains(base_name));
     let is_interface_block = is_push_constant || has_explicit_block_layout;
-    if is_interface_block
-        && let Some(bool_checked) = ctx.bool_checked_structs.as_deref_mut()
-    {
+    if is_interface_block && let Some(bool_checked) = ctx.bool_checked_structs.as_deref_mut() {
         bool_checked.insert(mono_name.clone());
     }
 
@@ -10007,7 +10017,11 @@ mod tests {
             .iter()
             .filter(|d| d.code == "E0270")
             .collect();
-        assert_eq!(e0270.len(), 2, "expected 2 E0270 errors in bad_ops: {diags:?}");
+        assert_eq!(
+            e0270.len(),
+            2,
+            "expected 2 E0270 errors in bad_ops: {diags:?}"
+        );
     }
 
     #[test]
@@ -10049,7 +10063,10 @@ mod tests {
 
         let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
         let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
-        assert!(codes.contains(&"E0275"), "expected E0275 for bad_tail: {diags:?}");
+        assert!(
+            codes.contains(&"E0275"),
+            "expected E0275 for bad_tail: {diags:?}"
+        );
         assert!(
             codes.iter().filter(|&&c| c == "E0274").count() >= 2,
             "expected E0274 for duplicate/unknown named args: {diags:?}"
@@ -10103,41 +10120,55 @@ mod tests {
         assert!(entry.required_caps.contains(HardwareCaps::RAY_QUERY));
         assert!(entry.reflection.uses_bda);
         assert!(entry.reflection.uses_subgroups);
-        assert!(entry
-            .reflection
-            .descriptors
-            .iter()
-            .any(|d| d.name == "tlas" && d.set == DESCRIPTOR_SET_SCENE_GLOBALS));
-        assert!(entry
-            .reflection
-            .descriptors
-            .iter()
-            .any(|d| d.name == "lights" && d.set == DESCRIPTOR_SET_SCENE_GLOBALS));
-        assert!(entry
-            .reflection
-            .descriptors
-            .iter()
-            .any(|d| d.name == "bindless" && d.set == DESCRIPTOR_SET_BINDLESS));
-        assert!(entry
-            .reflection
-            .descriptors
-            .iter()
-            .any(|d| d.name == "noise" && d.set == DESCRIPTOR_SET_PACK_RESOURCES));
-        assert!(entry
-            .reflection
-            .used_params
-            .iter()
-            .any(|p| p.name == "exposure"));
-        assert!(entry
-            .reflection
-            .used_specs
-            .iter()
-            .any(|s| s.name == "enable_gi"));
-        assert!(entry
-            .reflection
-            .debug_channels
-            .iter()
-            .any(|c| c.channel_name == "transitive_dbg"));
+        assert!(
+            entry
+                .reflection
+                .descriptors
+                .iter()
+                .any(|d| d.name == "tlas" && d.set == DESCRIPTOR_SET_SCENE_GLOBALS)
+        );
+        assert!(
+            entry
+                .reflection
+                .descriptors
+                .iter()
+                .any(|d| d.name == "lights" && d.set == DESCRIPTOR_SET_SCENE_GLOBALS)
+        );
+        assert!(
+            entry
+                .reflection
+                .descriptors
+                .iter()
+                .any(|d| d.name == "bindless" && d.set == DESCRIPTOR_SET_BINDLESS)
+        );
+        assert!(
+            entry
+                .reflection
+                .descriptors
+                .iter()
+                .any(|d| d.name == "noise" && d.set == DESCRIPTOR_SET_PACK_RESOURCES)
+        );
+        assert!(
+            entry
+                .reflection
+                .used_params
+                .iter()
+                .any(|p| p.name == "exposure")
+        );
+        assert!(
+            entry
+                .reflection
+                .used_specs
+                .iter()
+                .any(|s| s.name == "enable_gi")
+        );
+        assert!(
+            entry
+                .reflection
+                .debug_channels
+                .iter()
+                .any(|c| c.channel_name == "transitive_dbg")
+        );
     }
 
     #[test]
@@ -10179,10 +10210,11 @@ mod tests {
         // 2. Both expansions have distinct alpha-renamed `SymbolId`s for `uv` and `doubled`.
         let mut let_syms_a = Vec::new();
         if let HirStmt::Let {
-            init: Some(HirExpr {
-                kind: HirExprKind::Block(blk),
-                ..
-            }),
+            init:
+                Some(HirExpr {
+                    kind: HirExprKind::Block(blk),
+                    ..
+                }),
             ..
         } = &body.stmts[0]
         {
@@ -10194,10 +10226,11 @@ mod tests {
         }
         let mut let_syms_b = Vec::new();
         if let HirStmt::Let {
-            init: Some(HirExpr {
-                kind: HirExprKind::Block(blk),
-                ..
-            }),
+            init:
+                Some(HirExpr {
+                    kind: HirExprKind::Block(blk),
+                    ..
+                }),
             ..
         } = &body.stmts[1]
         {
@@ -10248,9 +10281,21 @@ mod tests {
         assert!(hir.find_struct("Outer<f32>").is_some());
 
         let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
-        assert!(codes.contains(&"E0210"), "expected E0210 for Outer<RayQuery>: {diags:?}");
-        assert!(codes.contains(&"E0232"), "expected E0232 for Inner<f16>: {diags:?}");
-        assert!(codes.contains(&"E0220"), "expected E0220 for oversized GenericPc: {diags:?}");
-        assert!(codes.contains(&"E0274"), "expected E0274 for wrong generic arity: {diags:?}");
+        assert!(
+            codes.contains(&"E0210"),
+            "expected E0210 for Outer<RayQuery>: {diags:?}"
+        );
+        assert!(
+            codes.contains(&"E0232"),
+            "expected E0232 for Inner<f16>: {diags:?}"
+        );
+        assert!(
+            codes.contains(&"E0220"),
+            "expected E0220 for oversized GenericPc: {diags:?}"
+        );
+        assert!(
+            codes.contains(&"E0274"),
+            "expected E0274 for wrong generic arity: {diags:?}"
+        );
     }
 }

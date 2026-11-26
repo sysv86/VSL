@@ -41,7 +41,8 @@ impl<'a> Cache<FileId> for DbCache<'a> {
 }
 
 fn clamped_span_range(db: &SourceDatabase, span: Span) -> Range<usize> {
-    db.get(span.file).map_or(0..0, |file| file.clamp_range(span))
+    db.get(span.file)
+        .map_or(0..0, |file| file.clamp_range(span))
 }
 
 /// Renders a slice of diagnostics into `writer` using `ariadne` 0.6 multi-file reports

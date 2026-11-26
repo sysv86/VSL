@@ -205,7 +205,8 @@ impl VslLanguageServer {
         // When `pack.vsl` changes, re-validate all open sibling `.vsl` files in the same directory
         // so updated `PackSchema` parameters, spec constants, and resource slots take effect live.
         if is_pack_vsl_uri(uri.as_str())
-            && let Some(pack_dir) = uri_to_path(uri.as_str()).and_then(|p| p.parent().map(Path::to_path_buf))
+            && let Some(pack_dir) =
+                uri_to_path(uri.as_str()).and_then(|p| p.parent().map(Path::to_path_buf))
         {
             let siblings: Vec<(String, OpenDocument)> = open_snapshot
                 .iter()
@@ -239,10 +240,7 @@ impl VslLanguageServer {
         let open_snapshot = self.documents.read().await.clone();
         let doc = open_snapshot.get(&norm_key)?;
         let (analysis, _) = analyze_document(&doc.uri, &doc.text, &open_snapshot);
-        self.cache
-            .write()
-            .await
-            .insert(norm_key, analysis.clone());
+        self.cache.write().await.insert(norm_key, analysis.clone());
         Some(analysis)
     }
 }
@@ -542,7 +540,10 @@ fn format_hir_type(types: &TypeArena, ty_id: TypeId) -> String {
             align,
         } => {
             let kw = if *mutable { "ptr_mut" } else { "ptr" };
-            format!("{kw}<{}, align = {align}>", format_hir_type(types, *pointee))
+            format!(
+                "{kw}<{}, align = {align}>",
+                format_hir_type(types, *pointee)
+            )
         }
         Type::Struct { name, .. } => name.to_string(),
         Type::Texture2D {
@@ -616,9 +617,10 @@ fn format_function_signature(hir: &HirModule, func: &HirFunction) -> String {
                 ParamMode::Out => "out ",
                 ParamMode::Mut => "mut ",
             };
-            let ty_str = p
-                .ty
-                .map_or_else(|| "unknown".to_owned(), |id| format_hir_type(&hir.types, id));
+            let ty_str = p.ty.map_or_else(
+                || "unknown".to_owned(),
+                |id| format_hir_type(&hir.types, id),
+            );
             format!("{mode}{}: {ty_str}", p.name)
         })
         .collect();
@@ -789,9 +791,10 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
         let mut local_defs = defs.clone();
         for param in &func.params {
             let p_span = find_ident_span_within(source, param.span, param.name.as_str());
-            let p_ty = param
-                .ty
-                .map_or_else(|| "unknown".to_owned(), |id| format_hir_type(&hir.types, id));
+            let p_ty = param.ty.map_or_else(
+                || "unknown".to_owned(),
+                |id| format_hir_type(&hir.types, id),
+            );
             local_defs.insert(
                 param.name.to_string(),
                 (IndexedSymbolKind::Param, p_span, p_ty.clone()),
@@ -1052,10 +1055,7 @@ fn index_hir_expr(
     }
 }
 
-fn build_semantic_tokens(
-    symbols: &[IndexedSymbol],
-    source: &SourceFile,
-) -> Vec<RawSemanticToken> {
+fn build_semantic_tokens(symbols: &[IndexedSymbol], source: &SourceFile) -> Vec<RawSemanticToken> {
     let mut seen: HashSet<(u32, u32)> = HashSet::new();
     let mut raw = Vec::with_capacity(symbols.len());
 
@@ -1146,7 +1146,9 @@ fn symbol_at_offset(symbols: &[IndexedSymbol], byte_offset: u32) -> Option<&Inde
     // Prefer the narrowest span containing `byte_offset`.
     symbols
         .iter()
-        .filter(|s| s.span.start <= byte_offset && byte_offset <= s.span.end && s.span.start < s.span.end)
+        .filter(|s| {
+            s.span.start <= byte_offset && byte_offset <= s.span.end && s.span.start < s.span.end
+        })
         .min_by_key(|s| s.span.end - s.span.start)
 }
 
@@ -1449,7 +1451,10 @@ impl LanguageServer for VslLanguageServer {
                         format!("```vsl\nconst {}: {}\n```", sym.name, sym.type_display)
                     }
                     IndexedSymbolKind::WorkgroupVar => {
-                        format!("```vsl\nworkgroup var {}: {}\n```", sym.name, sym.type_display)
+                        format!(
+                            "```vsl\nworkgroup var {}: {}\n```",
+                            sym.name, sym.type_display
+                        )
                     }
                     IndexedSymbolKind::Trait => {
                         format!("```vsl\ntrait {}\n```", sym.name)
@@ -1479,21 +1484,17 @@ impl LanguageServer for VslLanguageServer {
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let analysis = self.ensure_cached(&uri).await;
-        let text = analysis
-            .as_ref()
-            .map_or("", |a| a.source.text.as_str());
+        let text = analysis.as_ref().map_or("", |a| a.source.text.as_str());
 
         let (before_cursor, path_range, ident_range) = completion_prefix_context(text, pos);
         let trimmed = before_cursor.trim_end();
         let mut items = Vec::new();
 
         // 1. `@hook(...)` or `.hook(...)` stage completion.
-        let in_hook_ctx = trimmed
-            .rsplit_once('(')
-            .is_some_and(|(lhs, rhs)| {
-                let lhs = lhs.trim_end();
-                (lhs.ends_with("@hook") || lhs.ends_with(".hook")) && !rhs.contains(')')
-            });
+        let in_hook_ctx = trimmed.rsplit_once('(').is_some_and(|(lhs, rhs)| {
+            let lhs = lhs.trim_end();
+            (lhs.ends_with("@hook") || lhs.ends_with(".hook")) && !rhs.contains(')')
+        });
         if in_hook_ctx {
             for hook in HookStage::ALL {
                 items.push(make_completion_item(
@@ -1578,16 +1579,12 @@ impl LanguageServer for VslLanguageServer {
             {
                 let mut seen_fields = HashSet::new();
                 for (_, func) in hir.functions.iter() {
-                    let ty_id = func
-                        .local_types
-                        .get(receiver)
-                        .copied()
-                        .or_else(|| {
-                            func.params
-                                .iter()
-                                .find(|p| p.name == receiver)
-                                .and_then(|p| p.ty)
-                        });
+                    let ty_id = func.local_types.get(receiver).copied().or_else(|| {
+                        func.params
+                            .iter()
+                            .find(|p| p.name == receiver)
+                            .and_then(|p| p.ty)
+                    });
                     if let Some(tid) = ty_id
                         && let Type::Struct { name: st_name, .. } = hir.types.get(tid)
                         && let Some(st) = hir.find_struct(st_name.as_str())
@@ -1635,21 +1632,81 @@ impl LanguageServer for VslLanguageServer {
                 .is_some_and(|tail| tail.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
         {
             let mc_entries = [
-                ("mc::world", CompletionItemKind::VARIABLE, "WorldUBO (Set 0, binding 0, 544 B)"),
-                ("mc::tlas", CompletionItemKind::VARIABLE, "Scene TLAS (Set 1, binding 0)"),
-                ("mc::bindless", CompletionItemKind::VARIABLE, "COMBINED_IMAGE_SAMPLER[4096] (Set 2, binding 0)"),
-                ("mc::instances", CompletionItemKind::VARIABLE, "InstanceMetaSSBO (Set 1, binding 1)"),
-                ("mc::sharc", CompletionItemKind::VARIABLE, "SharcConfigUBO (Set 1, binding 2)"),
-                ("mc::lights", CompletionItemKind::VARIABLE, "EmissiveLightSSBO (Set 1, binding 3)"),
-                ("mc::reservoirs", CompletionItemKind::VARIABLE, "RestirReservoirSSBO (Set 1, binding 4)"),
-                ("mc::param", CompletionItemKind::FUNCTION, "Load typed pack parameter via BDA"),
-                ("mc::spec", CompletionItemKind::FUNCTION, "Load Vulkan specialization constant"),
-                ("mc::reconstruct_world_pos", CompletionItemKind::FUNCTION, "Reconstruct world position from UV/depth"),
-                ("mc::view_dir", CompletionItemKind::FUNCTION, "Compute normalized camera view direction"),
-                ("mc::sample_sky", CompletionItemKind::FUNCTION, "Evaluate procedural gradient sky"),
-                ("mc::debug_write", CompletionItemKind::FUNCTION, "Write RGB/RGBA value to debug storage image"),
-                ("mc::passes::", CompletionItemKind::MODULE, "Hyaloclast canonical RenderGraph passes"),
-                ("mc::targets::", CompletionItemKind::MODULE, "Hyaloclast built-in RenderGraph resources"),
+                (
+                    "mc::world",
+                    CompletionItemKind::VARIABLE,
+                    "WorldUBO (Set 0, binding 0, 544 B)",
+                ),
+                (
+                    "mc::tlas",
+                    CompletionItemKind::VARIABLE,
+                    "Scene TLAS (Set 1, binding 0)",
+                ),
+                (
+                    "mc::bindless",
+                    CompletionItemKind::VARIABLE,
+                    "COMBINED_IMAGE_SAMPLER[4096] (Set 2, binding 0)",
+                ),
+                (
+                    "mc::instances",
+                    CompletionItemKind::VARIABLE,
+                    "InstanceMetaSSBO (Set 1, binding 1)",
+                ),
+                (
+                    "mc::sharc",
+                    CompletionItemKind::VARIABLE,
+                    "SharcConfigUBO (Set 1, binding 2)",
+                ),
+                (
+                    "mc::lights",
+                    CompletionItemKind::VARIABLE,
+                    "EmissiveLightSSBO (Set 1, binding 3)",
+                ),
+                (
+                    "mc::reservoirs",
+                    CompletionItemKind::VARIABLE,
+                    "RestirReservoirSSBO (Set 1, binding 4)",
+                ),
+                (
+                    "mc::param",
+                    CompletionItemKind::FUNCTION,
+                    "Load typed pack parameter via BDA",
+                ),
+                (
+                    "mc::spec",
+                    CompletionItemKind::FUNCTION,
+                    "Load Vulkan specialization constant",
+                ),
+                (
+                    "mc::reconstruct_world_pos",
+                    CompletionItemKind::FUNCTION,
+                    "Reconstruct world position from UV/depth",
+                ),
+                (
+                    "mc::view_dir",
+                    CompletionItemKind::FUNCTION,
+                    "Compute normalized camera view direction",
+                ),
+                (
+                    "mc::sample_sky",
+                    CompletionItemKind::FUNCTION,
+                    "Evaluate procedural gradient sky",
+                ),
+                (
+                    "mc::debug_write",
+                    CompletionItemKind::FUNCTION,
+                    "Write RGB/RGBA value to debug storage image",
+                ),
+                (
+                    "mc::passes::",
+                    CompletionItemKind::MODULE,
+                    "Hyaloclast canonical RenderGraph passes",
+                ),
+                (
+                    "mc::targets::",
+                    CompletionItemKind::MODULE,
+                    "Hyaloclast built-in RenderGraph resources",
+                ),
             ];
             for (name, kind, detail) in mc_entries {
                 items.push(make_completion_item(
@@ -1773,7 +1830,10 @@ impl LanguageServer for VslLanguageServer {
             return Ok(None);
         }
         let range = span_to_lsp_range(&analysis.source, sym.def_span);
-        Ok(Some(GotoDefinitionResponse::Scalar(Location { uri, range })))
+        Ok(Some(GotoDefinitionResponse::Scalar(Location {
+            uri,
+            range,
+        })))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {

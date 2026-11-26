@@ -136,9 +136,7 @@ pub(crate) fn save_l2_to_disk(dir: &Path, key: &[u8; 32], unit: &CompiledShaderU
     }
     if fs::rename(&tmp_path, &final_path).is_err() {
         // Another thread/process may have already published the identical content-addressed file.
-        if final_path.exists() {
-            let _ = fs::remove_file(&tmp_path);
-        } else if fs::rename(&tmp_path, &final_path).is_err() {
+        if final_path.exists() || fs::rename(&tmp_path, &final_path).is_err() {
             let _ = fs::remove_file(&tmp_path);
         }
     }

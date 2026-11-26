@@ -180,7 +180,7 @@ pub(crate) fn build_hook_chain_unit(
         uses_subgroups |= hook_fn.reflection.uses_subgroups;
         if hook_fn.reflection.push_constant_size > merged_push_constant_size {
             merged_push_constant_size = hook_fn.reflection.push_constant_size;
-            merged_push_constants = hook_fn.reflection.push_constants.clone();
+            merged_push_constants.clone_from(&hook_fn.reflection.push_constants);
         }
         for mut desc in build_unified_descriptors(hook_fn) {
             if desc.set == DESCRIPTOR_SET_PER_PASS && (1..=14).contains(&desc.binding) {
@@ -238,8 +238,8 @@ pub(crate) fn build_hook_chain_unit(
 
     // Reserve a free Set 0 output storage image binding (`1..=14`) for writing the final
     // composited hook chain result; never silently overwrite binding 14.
-    let Some(out_binding) = (1u32..=14)
-        .find(|&b| !merged_descriptors.contains_key(&(DESCRIPTOR_SET_PER_PASS, b)))
+    let Some(out_binding) =
+        (1u32..=14).find(|&b| !merged_descriptors.contains_key(&(DESCRIPTOR_SET_PER_PASS, b)))
     else {
         diagnostics.push(Diagnostic::error(
             "E0511",
@@ -398,7 +398,8 @@ pub(crate) fn build_hook_chain_unit(
         })
         .collect();
 
-    let mut stage_inputs = StageDispatchInputs::new(&mut dispatch_fn, world_desc_index, out_desc_index);
+    let mut stage_inputs =
+        StageDispatchInputs::new(&mut dispatch_fn, world_desc_index, out_desc_index);
     let coord = stage_inputs.coord_ivec2;
 
     let f32_ty = IrType::Scalar(ScalarIrTy::F32);
@@ -525,12 +526,8 @@ pub(crate) fn build_hook_chain_unit(
         // Sequential state-threading chain for non-clouds native hooks.
         let mut threaded_state: Option<InstId> = None;
         for callee in &callee_fns {
-            let call_args = build_stage_hook_args(
-                &mut dispatch_fn,
-                callee,
-                threaded_state,
-                &mut stage_inputs,
-            );
+            let call_args =
+                build_stage_hook_args(&mut dispatch_fn, callee, threaded_state, &mut stage_inputs);
             let ret_ty = callee.return_ty.clone();
             let res = dispatch_fn.emit_typed(
                 ret_ty.clone(),
@@ -1127,7 +1124,10 @@ fn ensure_vec4_f32(ir_fn: &mut IrFunction, val: InstId) -> InstId {
                     }
                 })
                 .collect();
-            ir_fn.emit_typed(vec4_ty, InstData::MakeVec4(comps[0], comps[1], comps[2], one))
+            ir_fn.emit_typed(
+                vec4_ty,
+                InstData::MakeVec4(comps[0], comps[1], comps[2], one),
+            )
         }
         IrType::Vector { scalar, len: 2 } => {
             let zero = ir_fn.emit_typed(f32_ty.clone(), InstData::const_f32(0.0));

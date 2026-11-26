@@ -36,7 +36,9 @@ mod tests {
 
         let glsl = emit_glsl_460(&parsed.unit);
         assert!(glsl.contains("#version 460 core"));
-        assert!(glsl.contains("#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require"));
+        assert!(
+            glsl.contains("#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require")
+        );
         assert!(glsl.contains("layout(set = 0, binding = 0, std140) uniform WorldUBO"));
         assert!(glsl.contains("mc_world.cur_view_proj"));
         assert!(glsl.contains("shared uint s_tile_lights[64];"));
@@ -76,7 +78,7 @@ mod tests {
             "layout(buffer_reference, scalar, buffer_reference_align = 8) buffer VslPtrRw_uint64_t_a8"
         ));
         assert!(glsl.contains(
-            "layout(buffer_reference, scalar, buffer_reference_align = 16) buffer VslPtrRw_CacheCell_a16"
+            "layout(buffer_reference, std430, buffer_reference_align = 16) buffer VslPtrRw_CacheCell_a16"
         ));
         assert!(glsl.contains(
             "VslPtrRw_uint64_t_a8 key_ptr = VslPtrRw_uint64_t_a8(uint64_t(keys) + uint64_t(int64_t(slot)) * 8ul);"
@@ -129,9 +131,7 @@ mod tests {
         );
         assert!(!glsl.contains("\"custom_reflections\""));
 
-        assert!(
-            glsl.contains("textureLod(bindless[nonuniformEXT(inst.texture_id)], uv, 0.0).rgb")
-        );
+        assert!(glsl.contains("textureLod(bindless[nonuniformEXT(inst.texture_id)], uv, 0.0).rgb"));
         assert!(glsl.contains("vec3 color;"));
         assert!(glsl.contains("InstanceMeta inst = mc_instances["));
         assert!(glsl.contains("vec2 uv = rayQueryGetIntersectionBarycentricsEXT(rq, true);"));

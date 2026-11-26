@@ -22,7 +22,9 @@ pub enum TomlDesugarError {
     UnknownImageFormat(String),
     #[error("invalid setting value for `{0}` in pack.toml")]
     InvalidSettingValue(String),
-    #[error("invalid range {min}..={max} for setting `{key}` in pack.toml: lower bound exceeds upper bound")]
+    #[error(
+        "invalid range {min}..={max} for setting `{key}` in pack.toml: lower bound exceeds upper bound"
+    )]
     InvalidSettingRange { key: String, min: f64, max: f64 },
     #[error(
         "setting `{key}` default value {value} is outside declared range {min}..={max} in pack.toml"

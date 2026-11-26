@@ -3142,9 +3142,9 @@ fn simplify_inst(func: &IrFunction, id: InstId) -> Option<InstId> {
             let res_ty = &func.insts[id].ir_ty;
             if is_one_32(func, *a) {
                 Some(*b)
-            } else if is_one_32(func, *b) {
-                Some(*a)
-            } else if is_zero_32(func, *a) && &func.insts[*a].ir_ty == res_ty {
+            } else if is_one_32(func, *b)
+                || (is_zero_32(func, *a) && &func.insts[*a].ir_ty == res_ty)
+            {
                 Some(*a)
             } else if is_zero_32(func, *b) && &func.insts[*b].ir_ty == res_ty {
                 Some(*b)
@@ -3155,9 +3155,7 @@ fn simplify_inst(func: &IrFunction, id: InstId) -> Option<InstId> {
         InstData::IDiv32(a, b) if is_one_32(func, *b) => Some(*a),
         InstData::BitAnd32(a, b) => {
             let res_ty = &func.insts[id].ir_ty;
-            if a == b {
-                Some(*a)
-            } else if is_zero_32(func, *a) && &func.insts[*a].ir_ty == res_ty {
+            if a == b || (is_zero_32(func, *a) && &func.insts[*a].ir_ty == res_ty) {
                 Some(*a)
             } else if is_zero_32(func, *b) && &func.insts[*b].ir_ty == res_ty {
                 Some(*b)
@@ -3199,9 +3197,9 @@ fn simplify_inst(func: &IrFunction, id: InstId) -> Option<InstId> {
             let res_ty = &func.insts[id].ir_ty;
             if is_one_64(func, *a) {
                 Some(*b)
-            } else if is_one_64(func, *b) {
-                Some(*a)
-            } else if is_zero_64(func, *a) && &func.insts[*a].ir_ty == res_ty {
+            } else if is_one_64(func, *b)
+                || (is_zero_64(func, *a) && &func.insts[*a].ir_ty == res_ty)
+            {
                 Some(*a)
             } else if is_zero_64(func, *b) && &func.insts[*b].ir_ty == res_ty {
                 Some(*b)
@@ -4434,8 +4432,7 @@ fn mem2reg_stmts(
                     continue_envs: Some(&mut inner_loop.continue_envs),
                     break_envs: Some(&mut inner_loop.break_envs),
                 };
-                let (mut new_body, body_term) =
-                    mem2reg_stmts(func, body, env, state, &mut body_cf);
+                let (mut new_body, body_term) = mem2reg_stmts(func, body, env, state, &mut body_cf);
 
                 // Collect all edges reaching the loop `continuing` block: normal body fallthrough
                 // plus every `Continue` statement targeting this loop.
@@ -5438,8 +5435,7 @@ fn remap_inlined_resource_indices(data: &mut InstData, res: &InlineResourceRemap
                 *var_index = mapped;
             }
         }
-        InstData::LoadStageInput { var_index }
-        | InstData::StoreStageOutput { var_index, .. } => {
+        InstData::LoadStageInput { var_index } | InstData::StoreStageOutput { var_index, .. } => {
             if let Some(&mapped) = res.stage_io_remap.get(*var_index as usize) {
                 *var_index = mapped;
             }
@@ -5498,6 +5494,11 @@ fn inline_call_site(
     caller.required_caps |= callee.required_caps;
 
     let mut inst_remap: IndexMap<InstId, InstId> = IndexMap::new();
+    // Keep fresh IDs strictly above every callee ID: `remap_inst_data` uses transitive
+    // `remap_id`, which would otherwise cascade through overlapping source/target IDs.
+    for _ in caller.insts.len()..callee.insts.len() {
+        caller.emit_typed(IrType::Void, InstData::Nop);
+    }
     // Pass 1: allocate placeholder slots for every non-Param callee instruction so forward
     // references (e.g. loop Phis) resolve cleanly.
     for (cid, cinst) in callee.insts.iter() {
@@ -5563,14 +5564,7 @@ fn inline_stmts(
                 {
                     let remapped_args: Vec<InstId> =
                         args.iter().map(|&a| remap_id(a, call_remap)).collect();
-                    inline_call_site(
-                        caller,
-                        id,
-                        callee_fn,
-                        &remapped_args,
-                        call_remap,
-                        &mut out,
-                    );
+                    inline_call_site(caller, id, callee_fn, &remapped_args, call_remap, &mut out);
                     *inlined_any = true;
                 } else {
                     out.push(StructuredStmt::Eval(id));
@@ -7173,7 +7167,10 @@ mod tests {
             panic!("expected WorkgroupStore");
         };
         let InstData::Phi { incoming } = &func.insts[value].data else {
-            panic!("expected Switch merge Phi, got {:?}", func.insts[value].data);
+            panic!(
+                "expected Switch merge Phi, got {:?}",
+                func.insts[value].data
+            );
         };
         assert_eq!(incoming.len(), 2);
         assert!(incoming.iter().any(|&(v, _)| v == c1));
@@ -7217,6 +7214,9 @@ mod tests {
         let StructuredStmt::Loop { body, .. } = &func.body[0] else {
             panic!("expected Loop to remain at index 0 with no hoisted statements");
         };
-        assert_eq!(body, &vec![StructuredStmt::Eval(add), StructuredStmt::Eval(st)]);
+        assert_eq!(
+            body,
+            &vec![StructuredStmt::Eval(add), StructuredStmt::Eval(st)]
+        );
     }
 }

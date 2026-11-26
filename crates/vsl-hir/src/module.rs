@@ -52,10 +52,10 @@ impl ModuleGraph {
         imports: Vec<SmolStr>,
     ) -> ModuleId {
         let name = name.into();
-        let id = self
-            .modules
-            .get(&name)
-            .map_or_else(|| ModuleId(self.modules.len() as u32), |existing| existing.id);
+        let id = self.modules.get(&name).map_or_else(
+            || ModuleId(self.modules.len() as u32),
+            |existing| existing.id,
+        );
         let source_hash = *blake3::hash(source.as_bytes()).as_bytes();
         self.modules.insert(
             name.clone(),
@@ -128,7 +128,11 @@ impl ModuleGraph {
             let node = &self.modules[&name];
             let mut l1_hasher = blake3::Hasher::new();
             l1_hasher.update(b"vsl2-l1-hir-v2:");
-            l1_hasher.update(&u64::try_from(node.name.len()).unwrap_or(u64::MAX).to_le_bytes());
+            l1_hasher.update(
+                &u64::try_from(node.name.len())
+                    .unwrap_or(u64::MAX)
+                    .to_le_bytes(),
+            );
             l1_hasher.update(node.name.as_bytes());
             l1_hasher.update(&node.source_hash);
             l1_hasher.update(
@@ -226,7 +230,8 @@ mod tests {
         let mut g = ModuleGraph::new();
         let id_a = g.register_module("pack::a", "module pack::a;", vec![]);
         let id_b = g.register_module("pack::b", "module pack::b;", vec![]);
-        let id_a_updated = g.register_module("pack::a", "module pack::a; const X: i32 = 1;", vec![]);
+        let id_a_updated =
+            g.register_module("pack::a", "module pack::a; const X: i32 = 1;", vec![]);
         let id_c = g.register_module("pack::c", "module pack::c;", vec![]);
 
         assert_eq!(id_a, id_a_updated);

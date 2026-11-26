@@ -1437,7 +1437,9 @@ impl Sandbox<'_> {
                             other => {
                                 self.diags.push(Diagnostic::error(
                                     "E0429",
-                                    format!("unknown named argument `{other}` in `g.{method}(...)`"),
+                                    format!(
+                                        "unknown named argument `{other}` in `g.{method}(...)`"
+                                    ),
                                     arg.span,
                                 ));
                             }
@@ -1833,10 +1835,7 @@ impl Sandbox<'_> {
                         _ => {
                             self.diags.push(Diagnostic::error(
                                 "E0415",
-                                format!(
-                                    "unresolved resource handle for binding `{}`",
-                                    key.name
-                                ),
+                                format!("unresolved resource handle for binding `{}`", key.name),
                                 arg.span,
                             ));
                             None

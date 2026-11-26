@@ -857,7 +857,7 @@ fn compile_single_entry_unit(
         }
         if push_constant_size == 0 && helper.reflection.push_constant_size > 0 {
             push_constant_size = helper.reflection.push_constant_size;
-            push_constants = helper.reflection.push_constants.clone();
+            push_constants.clone_from(&helper.reflection.push_constants);
         }
     }
 
@@ -1242,8 +1242,11 @@ mod tests {
         let out = compiler.compile_shader_to_glsl("tiled_lighting.vsl", TILED_LIGHTING_VSL);
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
         assert!(out.glsl.contains("#version 460 core"));
-        assert!(out.glsl.contains("layout(set = 0, binding = 0, std140) uniform WorldUBO"));
-        assert!(out.glsl.contains("shared uint tile_light_count;"));
+        assert!(
+            out.glsl
+                .contains("layout(set = 0, binding = 0, std140) uniform WorldUBO")
+        );
+        assert!(out.glsl.contains("shared uint s_tile_count;"));
     }
 
     #[test]
@@ -1751,7 +1754,10 @@ mod tests {
             "expected structured `If` guards for short-circuit `&&`/`||`, got {if_count}"
         );
         let has_eager_logical = ir_fn.insts.iter().any(|(_, inst)| {
-            matches!(inst.data, InstData::LogicalAnd(_, _) | InstData::LogicalOr(_, _))
+            matches!(
+                inst.data,
+                InstData::LogicalAnd(_, _) | InstData::LogicalOr(_, _)
+            )
         });
         assert!(
             !has_eager_logical,
@@ -1759,7 +1765,8 @@ mod tests {
         );
 
         let mut compiler = VslCompiler::new();
-        let out = compiler.compile_shader_source("short_circuit.vsl", src, &CompileOptions::default());
+        let out =
+            compiler.compile_shader_source("short_circuit.vsl", src, &CompileOptions::default());
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
         assert_eq!(out.units.len(), 1);
         validate_spirv_with_spirv_val("short_circuit", &out.units[0].spirv);

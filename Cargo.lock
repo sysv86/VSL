@@ -1082,6 +1082,7 @@ dependencies = [
  "tokio",
  "tower-lsp-server",
  "vsl-diagnostics",
+ "vsl-driver",
  "vsl-hir",
  "vsl-mc",
  "vsl-pack",

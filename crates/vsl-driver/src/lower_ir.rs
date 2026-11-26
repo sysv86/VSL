@@ -1163,7 +1163,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             HirExprKind::Unary {
                 op: UnaryOp::Neg,
                 operand,
-            } => self.eval_const_i64(operand, depth + 1).map(i64::saturating_neg),
+            } => self
+                .eval_const_i64(operand, depth + 1)
+                .map(i64::saturating_neg),
             HirExprKind::Path { path, .. } if !path.contains("::") => self
                 .module_consts
                 .get(path)
@@ -1373,8 +1375,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         let step_const = step_expr.and_then(parse_const_i64_hir).unwrap_or(1).max(1);
 
         let bind_ir_ty = self.ir_ty_of(binding_ty);
-        let (trip_count, induction_init) =
-            extract_const_range_bounds_hir(range_expr, step_const, &bind_ir_ty, self.hir, self.ir_fn);
+        let (trip_count, induction_init) = extract_const_range_bounds_hir(
+            range_expr,
+            step_const,
+            &bind_ir_ty,
+            self.hir,
+            self.ir_fn,
+        );
 
         let saved_ssa = self.ssa_locals.clone();
         let saved_slots = self.local_var_slots.clone();
@@ -2383,9 +2390,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     let final_val = if op == BinaryOp::Assign {
                         rhs_val
                     } else {
-                        let cur = self
-                            .ir_fn
-                            .emit_typed(ty, InstData::LocalLoad { ptr: addr });
+                        let cur = self.ir_fn.emit_typed(ty, InstData::LocalLoad { ptr: addr });
                         self.lower_binary_op(op, cur, rhs_val, &lhs_ir_ty)
                     };
                     let store = self.ir_fn.emit_typed(
@@ -2528,13 +2533,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     && matches!(self.ir_ty_of(receiver.ty), IrType::Vector { .. })
                 {
                     return self.lower_swizzle_write(
-                        receiver,
-                        &comps,
-                        op,
-                        rhs_val,
-                        &lhs_ir_ty,
-                        lhs.span,
-                        out,
+                        receiver, &comps, op, rhs_val, &lhs_ir_ty, lhs.span, out,
                     );
                 }
 
@@ -2602,10 +2601,10 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     let canonical =
                         canonicalize_builtin_field_name(elem_binding.elem_desc, field.as_str());
                     if let Some(f_idx) = elem_binding.elem_desc.field_index(canonical) {
-                        let field_ty = elem_binding
-                            .elem_desc
-                            .field(canonical)
-                            .map_or_else(|| lhs_ir_ty.clone(), |f| IrType::from_builtin_field_type(f.ty));
+                        let field_ty = elem_binding.elem_desc.field(canonical).map_or_else(
+                            || lhs_ir_ty.clone(),
+                            |f| IrType::from_builtin_field_type(f.ty),
+                        );
                         let items_idx = self.ir_fn.emit_typed(
                             IrType::Scalar(ScalarIrTy::U32),
                             InstData::ConstU32(elem_binding.items_field_index),
@@ -4458,7 +4457,10 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             rows,
         };
 
-        let lowered: Vec<InstId> = args.iter().map(|a| self.lower_expr(&a.value, out)).collect();
+        let lowered: Vec<InstId> = args
+            .iter()
+            .map(|a| self.lower_expr(&a.value, out))
+            .collect();
 
         // Single scalar diagonal matrix (e.g. `mat4(1.0)`).
         if lowered.len() == 1
@@ -4831,20 +4833,15 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     IrType::Vector { scalar, len } => Some((scalar, len)),
                     _ => None,
                 })
-                .or_else(|| match *expr_ir_ty {
+                .or(match *expr_ir_ty {
                     IrType::Vector { scalar, len } => Some((scalar, len)),
                     _ => None,
                 });
             if let Some((vec_scalar, vec_len)) = target_vec {
                 for arg_id in &mut lowered_args {
                     if let IrType::Scalar(arg_s) = *self.inst_ty(*arg_id) {
-                        *arg_id = splat_scalar_to_vector(
-                            self.ir_fn,
-                            *arg_id,
-                            arg_s,
-                            vec_scalar,
-                            vec_len,
-                        );
+                        *arg_id =
+                            splat_scalar_to_vector(self.ir_fn, *arg_id, arg_s, vec_scalar, vec_len);
                     }
                 }
             }
@@ -6455,10 +6452,9 @@ fn extract_const_range_bounds_hir(
             IrType::Scalar(ScalarIrTy::U64),
             InstData::ConstU64(start.cast_unsigned()),
         ),
-        (true, false) => ir_fn.emit_typed(
-            IrType::Scalar(ScalarIrTy::I64),
-            InstData::ConstI64(start),
-        ),
+        (true, false) => {
+            ir_fn.emit_typed(IrType::Scalar(ScalarIrTy::I64), InstData::ConstI64(start))
+        }
         (false, true) => ir_fn.emit_typed(
             IrType::Scalar(ScalarIrTy::U32),
             InstData::ConstU32(start.cast_unsigned() as u32),

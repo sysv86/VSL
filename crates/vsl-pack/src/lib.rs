@@ -1903,11 +1903,15 @@ kind = "transfer"
                     .dispatch_for(c);
             }
         "#;
-        let (base_ir, base_diags) =
-            evaluate_pack_vsl(&parse_source(FileId(0), base_src).unit, &EvalConfig::default());
+        let (base_ir, base_diags) = evaluate_pack_vsl(
+            &parse_source(FileId(0), base_src).unit,
+            &EvalConfig::default(),
+        );
         assert!(!base_diags.has_errors(), "{:?}", base_diags.as_slice());
-        let (child_ir, child_diags) =
-            evaluate_pack_vsl(&parse_source(FileId(1), child_src).unit, &EvalConfig::default());
+        let (child_ir, child_diags) = evaluate_pack_vsl(
+            &parse_source(FileId(1), child_src).unit,
+            &EvalConfig::default(),
+        );
         assert!(!child_diags.has_errors(), "{:?}", child_diags.as_slice());
 
         let merged = resolve_pack_inheritance(&child_ir, |id| {
@@ -2091,7 +2095,8 @@ kind = "transfer"
 
         let errs = validate_pass_bindings_against_shader(&pass, &unit, &ir);
         assert!(
-            errs.iter().any(|e| e.contains("overflow_binding") && e.contains("15")),
+            errs.iter()
+                .any(|e| e.contains("overflow_binding") && e.contains("15")),
             "expected Set 0 binding > 14 overflow error, got: {errs:?}"
         );
         assert!(
@@ -2182,9 +2187,21 @@ kind = "transfer"
         let (ir, diags) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
         assert_eq!(ir.metadata.tier_max, 3);
         let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
-        assert!(codes.contains(&"E0420"), "expected E0420 for reversed range, got {codes:?}");
-        assert!(codes.contains(&"E0426"), "expected E0426 for unknown fn / wrong receiver, got {codes:?}");
-        assert!(codes.contains(&"E0429"), "expected E0429 for unknown named arg / positional bind, got {codes:?}");
-        assert!(codes.contains(&"E0492"), "expected E0492 for non-int for bound, got {codes:?}");
+        assert!(
+            codes.contains(&"E0420"),
+            "expected E0420 for reversed range, got {codes:?}"
+        );
+        assert!(
+            codes.contains(&"E0426"),
+            "expected E0426 for unknown fn / wrong receiver, got {codes:?}"
+        );
+        assert!(
+            codes.contains(&"E0429"),
+            "expected E0429 for unknown named arg / positional bind, got {codes:?}"
+        );
+        assert!(
+            codes.contains(&"E0492"),
+            "expected E0492 for non-int for bound, got {codes:?}"
+        );
     }
 }
