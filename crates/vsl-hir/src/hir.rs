@@ -7,7 +7,7 @@ use la_arena::{Arena, Idx};
 use smol_str::SmolStr;
 use vsl_diagnostics::Span;
 use vsl_mc::{
-    DebugChannelBinding, DescriptorBinding, HardwareCaps, HookStage, PackParamBinding,
+    AbiProfile, DebugChannelBinding, DescriptorBinding, HardwareCaps, HookStage, PackParamBinding,
     PushConstantField, ShaderStage, SpecConstantUsage,
 };
 use vsl_syntax::ast::{BinaryOp, Block, ParamMode, UnaryOp};
@@ -240,6 +240,8 @@ pub struct HirModule {
     pub types: TypeArena,
     /// Number of functions pruned during early tier filtering (Spec §3.4).
     pub pruned_functions: usize,
+    /// Target ABI profile used during lowering.
+    pub abi: AbiProfile,
 }
 
 impl HirModule {
@@ -257,6 +259,7 @@ impl HirModule {
             symbols: Vec::new(),
             types: TypeArena::new(),
             pruned_functions: 0,
+            abi: AbiProfile::Hyaloclast,
         }
     }
 
@@ -344,6 +347,7 @@ pub struct HirParam {
     pub builtin: Option<SmolStr>,
     pub is_push_constant: bool,
     pub pack_resource_slot: Option<u32>,
+    pub explicit_binding: Option<(u32, u32)>,
     pub span: Span,
 }
 
@@ -374,6 +378,8 @@ pub struct HirFunction {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EntryReflection {
     pub descriptors: Vec<DescriptorBinding>,
+    /// Resolved HIR [`TypeId`] for user-declared descriptor parameters keyed by `(set, binding)`.
+    pub descriptor_types: IndexMap<(u32, u32), TypeId>,
     pub push_constants: Vec<PushConstantField>,
     pub push_constant_size: u32,
     pub used_specs: Vec<SpecConstantUsage>,

@@ -1163,4 +1163,44 @@ mod tests {
             "got:\n{glsl}"
         );
     }
+
+    #[test]
+    fn standalone_abi_omits_world_ubo_and_uses_explicit_bindings() {
+        let src = r"
+            module standalone::glsl;
+
+            #[stage(compute(8, 8, 1))]
+            pub fn main_cs(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                #[binding(set = 1, binding = 3)] in_tex: Texture2D<f32>,
+                #[binding(set = 1, binding = 4)] samp: Sampler,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let c = in_tex.sample_lod(samp, vec2(gid.xy), 0.0);
+                out_img.store(ivec2(gid.xy), c);
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+
+        let opts = EmitOptions {
+            abi: vsl_mc::AbiProfile::Standalone,
+            bindless_abi: BindlessAbi::UpstreamUnsized,
+            ..EmitOptions::default()
+        };
+        let glsl = emit_glsl_460_with_options(&parsed.unit, opts);
+        assert!(!glsl.contains("WorldUBO"), "got:\n{glsl}");
+        assert!(
+            glsl.contains("layout(set = 1, binding = 3) uniform texture2D in_tex;"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("layout(set = 1, binding = 4) uniform sampler samp;"),
+            "got:\n{glsl}"
+        );
+        assert!(
+            glsl.contains("layout(set = 0, binding = 0, rgba16f) uniform image2D out_img;"),
+            "got:\n{glsl}"
+        );
+    }
 }

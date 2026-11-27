@@ -143,6 +143,7 @@ fn emit_raster_gbuffer_hook_slot_inner(
     let opts = EmitOptions {
         route_params_to_vs_motion: true,
         bindless_abi: BindlessAbi::Hyaloclast4096,
+        ..EmitOptions::default()
     };
 
     let mut out = String::with_capacity(1024);

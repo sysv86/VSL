@@ -559,12 +559,19 @@ impl SpirvEmitter {
                         | IrStorageClass::StorageBuffer
                         | IrStorageClass::PhysicalStorageBuffer
                 );
-                let pointee_ty = if is_block_sc {
+                let pointee_ty = if *storage == IrStorageClass::PhysicalStorageBuffer {
+                    match pointee.as_ref() {
+                        IrType::Void => self.emit_bda_block_struct(),
+                        other => {
+                            let elem_ty = self.emit_ir_type_with_layout(other, true);
+                            let stride = ir_type_stride(other);
+                            let mat_stride = matrix_col_stride(other);
+                            self.emit_bda_block_struct_for(elem_ty, stride, mat_stride)
+                        }
+                    }
+                } else if is_block_sc {
                     match pointee.as_ref() {
                         IrType::Struct(layout) => self.emit_struct_type(layout, true, true),
-                        IrType::Void if *storage == IrStorageClass::PhysicalStorageBuffer => {
-                            self.emit_bda_block_struct()
-                        }
                         IrType::Void => self.emit_type_int(32, 0),
                         other => self.emit_ir_type_with_layout(other, true),
                     }
@@ -631,7 +638,13 @@ impl SpirvEmitter {
                         spirv::Decoration::Offset,
                         &[field.byte_offset],
                     );
-                    if let Some(col_stride) = matrix_col_stride(&field.ty) {
+                    let mat_stride = matrix_col_stride(&field.ty).or_else(|| match &field.ty {
+                        IrType::Array { element, .. } | IrType::RuntimeArray(element) => {
+                            matrix_col_stride(element)
+                        }
+                        _ => None,
+                    });
+                    if let Some(col_stride) = mat_stride {
                         self.emit_member_decorate(
                             struct_ty,
                             member,
@@ -1014,7 +1027,11 @@ fn ir_type_stride(ty: &IrType) -> u32 {
             col_stride.saturating_mul(u32::from(*cols))
         }
         IrType::Array { element, len } => ir_type_stride(element).saturating_mul((*len).max(1)),
-        IrType::Struct(layout) => layout.size.max(layout.align).max(4),
+        IrType::Struct(layout) => {
+            let align = layout.align.max(1);
+            let aligned_size = layout.size.div_ceil(align).saturating_mul(align);
+            aligned_size.max(align).max(4)
+        }
         IrType::Pointer {
             storage: IrStorageClass::PhysicalStorageBuffer,
             ..
@@ -1590,6 +1607,46 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
         )
         .collect();
 
+    // Pre-scan all functions to determine OpTypeImage `Depth` operand (0 = color, 1 = depth-only,
+    // 2 = both dref and non-dref) per descriptor `(set, binding)`.
+    let mut descriptor_depth_flags: IndexMap<(u32, u32), (bool, bool)> = IndexMap::new();
+    for f in &module.functions {
+        for (_, inst) in f.insts.iter() {
+            match &inst.data {
+                InstData::ImageSampleDrefExplicitLod {
+                    descriptor_index, ..
+                } => {
+                    if let Some(d) = f.descriptors.get(*descriptor_index as usize) {
+                        let entry = descriptor_depth_flags
+                            .entry((d.set, d.binding))
+                            .or_insert((false, false));
+                        entry.0 = true;
+                    }
+                }
+                InstData::ImageSample {
+                    descriptor_index, ..
+                }
+                | InstData::ImageSampleImplicitLod {
+                    descriptor_index, ..
+                }
+                | InstData::ImageSampleGrad {
+                    descriptor_index, ..
+                }
+                | InstData::ImageGather {
+                    descriptor_index, ..
+                } => {
+                    if let Some(d) = f.descriptors.get(*descriptor_index as usize) {
+                        let entry = descriptor_depth_flags
+                            .entry((d.set, d.binding))
+                            .or_insert((false, false));
+                        entry.1 = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     for func_idx in ordered_indices {
         let func = &module.functions[func_idx];
         let fn_info = emitted_functions[func.name.as_str()].clone();
@@ -1606,7 +1663,12 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
             let desc_var = if let Some(existing) = descriptor_vars.get(&key) {
                 existing.clone()
             } else {
-                let created = emit_descriptor_var(&mut emitter, desc);
+                let depth_operand = match descriptor_depth_flags.get(&key).copied() {
+                    Some((true, true)) => 2,
+                    Some((true, false)) => 1,
+                    _ => 0,
+                };
+                let created = emit_descriptor_var(&mut emitter, desc, depth_operand);
                 descriptor_vars.insert(key, created.clone());
                 created
             };
@@ -1793,7 +1855,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                 let sampler_var = if let Some(existing) = descriptor_vars.get(&key) {
                     existing.clone()
                 } else {
-                    let created = emit_descriptor_var(&mut emitter, &sampler_desc);
+                    let created = emit_descriptor_var(&mut emitter, &sampler_desc, 0);
                     descriptor_vars.insert(key, created.clone());
                     created
                 };
@@ -1964,7 +2026,11 @@ fn resolve_descriptor_struct_layout(desc: &IrDescriptorVar) -> Option<IrStructLa
     }
 }
 
-fn emit_descriptor_var(emitter: &mut SpirvEmitter, desc: &IrDescriptorVar) -> EmittedDescriptor {
+fn emit_descriptor_var(
+    emitter: &mut SpirvEmitter,
+    desc: &IrDescriptorVar,
+    depth_operand: u32,
+) -> EmittedDescriptor {
     let u32_ty = emitter.emit_type_int(32, 0);
     let (spv_dim, arrayed, coord_components, grad_components, size_components) =
         map_texture_dim(desc.dim);
@@ -2000,7 +2066,7 @@ fn emit_descriptor_var(emitter: &mut SpirvEmitter, desc: &IrDescriptorVar) -> Em
             let img_ty = emitter.emit_type_image(
                 sampled_ty,
                 spv_dim,
-                0,
+                depth_operand,
                 arrayed,
                 0,
                 1,
@@ -2040,7 +2106,7 @@ fn emit_descriptor_var(emitter: &mut SpirvEmitter, desc: &IrDescriptorVar) -> Em
             let img_ty = emitter.emit_type_image(
                 sampled_ty,
                 spv_dim,
-                0,
+                depth_operand,
                 arrayed,
                 0,
                 1,
@@ -4244,7 +4310,21 @@ impl FnLowerCtx<'_> {
                     {
                         if let Some(&(expected_ty, is_ptr)) = callee_info.param_tys.get(idx) {
                             if is_ptr {
-                                call_ops.push(raw_arg);
+                                let src_ty = self
+                                    .inst_types
+                                    .get(&arg_inst)
+                                    .copied()
+                                    .unwrap_or(expected_ty);
+                                if src_ty != expected_ty && self.bda_ptr_insts.contains(&arg_inst) {
+                                    let casted = self.emitter.alloc_id();
+                                    self.emitter.emit_fn_inst(
+                                        spirv::Op::Bitcast,
+                                        &[expected_ty, casted, raw_arg],
+                                    );
+                                    call_ops.push(casted);
+                                } else {
+                                    call_ops.push(raw_arg);
+                                }
                             } else {
                                 let src_ty = self
                                     .inst_types
@@ -4290,7 +4370,19 @@ impl FnLowerCtx<'_> {
             }
             InstData::ConvertUToPtr { addr_u64, .. } => {
                 let addr_id = self.ensure_u64_addr(addr_u64);
-                let ty = self.bda_ptr_ty();
+                let ty = if let IrType::Pointer { pointee, .. } = &self.func.insts[id].ir_ty
+                    && **pointee != IrType::Void
+                {
+                    let p_clone = pointee.as_ref().clone();
+                    let spv_ty = self.emitter.emit_ir_type_with_layout(&p_clone, true);
+                    self.bda_ptr_ty_for(
+                        spv_ty,
+                        ir_type_stride(&p_clone),
+                        matrix_col_stride(&p_clone),
+                    )
+                } else {
+                    self.bda_ptr_ty()
+                };
                 let res = self.emitter.alloc_id();
                 self.emitter
                     .emit_fn_inst(spirv::Op::ConvertUToPtr, &[ty, res, addr_id]);
@@ -5672,10 +5764,65 @@ impl FnLowerCtx<'_> {
                     self.emitter
                         .emit_fn_inst(spirv::Op::Load, &[member_ty, loaded, member_ptr]);
                     let desired_ir_ty = self.func.insts[id].ir_ty.clone();
-                    if matches!(
-                        desired_ir_ty,
-                        IrType::Vector { .. } | IrType::Array { .. } | IrType::Matrix { .. }
-                    ) {
+                    if let IrType::Matrix { scalar, cols, rows } = desired_ir_ty {
+                        let desired_spv_ty = self.emitter.emit_ir_type(&desired_ir_ty);
+                        if member_ty == desired_spv_ty {
+                            (loaded, desired_spv_ty)
+                        } else {
+                            let col_ty = self
+                                .emitter
+                                .emit_ir_type(&IrType::Vector { scalar, len: rows });
+                            let target_scalar_ty =
+                                self.emitter.emit_ir_type(&IrType::Scalar(scalar));
+                            let cols_u32 = u32::from(cols.clamp(2, 4));
+                            let rows_u32 = u32::from(rows.clamp(2, 4));
+                            let pc_bytes = self
+                                .func
+                                .push_constants
+                                .as_ref()
+                                .and_then(|b| b.fields.get(clamped_idx))
+                                .map_or(cols_u32 * rows_u32 * scalar.byte_size().max(4), |f| {
+                                    f.byte_size
+                                });
+                            let total_elems =
+                                (pc_bytes / scalar.byte_size().max(1)).max(cols_u32 * rows_u32);
+                            let col_stride = (total_elems / cols_u32).max(rows_u32);
+                            let mut col_ids = Vec::with_capacity(cols_u32 as usize);
+                            for c in 0..cols_u32 {
+                                let mut row_ids = Vec::with_capacity(rows_u32 as usize);
+                                for r in 0..rows_u32 {
+                                    let flat_idx = c * col_stride + r;
+                                    let elem_id = self.emitter.alloc_id();
+                                    self.emitter.emit_fn_inst(
+                                        spirv::Op::CompositeExtract,
+                                        &[scalar_ty, elem_id, loaded, flat_idx],
+                                    );
+                                    row_ids.push(self.coerce_to_ty(
+                                        elem_id,
+                                        scalar_ty,
+                                        target_scalar_ty,
+                                    ));
+                                }
+                                let col_id = self.emitter.alloc_id();
+                                let mut ops = Vec::with_capacity(2 + row_ids.len());
+                                ops.push(col_ty);
+                                ops.push(col_id);
+                                ops.extend_from_slice(&row_ids);
+                                self.emitter
+                                    .emit_fn_inst(spirv::Op::CompositeConstruct, &ops);
+                                col_ids.push(col_id);
+                            }
+                            let mat_id = self.emitter.alloc_id();
+                            let mut ops = Vec::with_capacity(2 + col_ids.len());
+                            ops.push(desired_spv_ty);
+                            ops.push(mat_id);
+                            ops.extend_from_slice(&col_ids);
+                            self.emitter
+                                .emit_fn_inst(spirv::Op::CompositeConstruct, &ops);
+                            (mat_id, desired_spv_ty)
+                        }
+                    } else if matches!(desired_ir_ty, IrType::Vector { .. } | IrType::Array { .. })
+                    {
                         let desired_spv_ty = self.emitter.emit_ir_type(&desired_ir_ty);
                         let val = self.coerce_to_ty(loaded, member_ty, desired_spv_ty);
                         (val, desired_spv_ty)

@@ -49,6 +49,26 @@ impl RenderTier {
     }
 }
 
+/// Target descriptor/ABI profile for VSL 2.0 compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum AbiProfile {
+    /// Hyaloclast 4-set engine ABI (`WorldUBO` at 0:0, Set 1 scene globals, Set 2
+    /// `COMBINED_IMAGE_SAMPLER[4096]`, Set 3 pack resources).
+    #[default]
+    Hyaloclast = 0,
+    /// Standalone Vulkan 1.3+ shader ABI with explicit `#[binding(set = N, binding = M)]`
+    /// support, no implicit `WorldUBO` injection, and standard unsized bindless arrays.
+    Standalone = 1,
+}
+
+impl AbiProfile {
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 bitflags! {
     /// Optional Vulkan device capabilities gated via `#[cap(...)]` in VSL 2.0.
     ///

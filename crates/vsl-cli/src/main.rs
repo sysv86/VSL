@@ -1,17 +1,33 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use vsl_diagnostics::render_diagnostics;
 use vsl_driver::{
-    CompileOptions, VslCompiler, pack_schema_from_pipeline, validate_pack_shader_bindings,
+    AbiProfile, CompileOptions, VslCompiler, pack_schema_from_pipeline,
+    validate_pack_shader_bindings,
 };
 use vsl_mc::{HardwareCaps, RenderTier};
 use vsl_pack::{
     EvalConfig, PipelineIr, SchedulePlan, SettingIr, SettingValueIr, desugar_pack_toml,
     validate_and_schedule,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliAbiProfile {
+    Hyaloclast,
+    Standalone,
+}
+
+impl From<CliAbiProfile> for AbiProfile {
+    fn from(value: CliAbiProfile) -> Self {
+        match value {
+            CliAbiProfile::Hyaloclast => Self::Hyaloclast,
+            CliAbiProfile::Standalone => Self::Standalone,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -36,6 +52,9 @@ enum Command {
         /// Active Hyaloclast hardware tier (`0..=3`).
         #[arg(long, default_value_t = 2)]
         tier: u8,
+        /// Target descriptor ABI profile (`hyaloclast` or `standalone`).
+        #[arg(long, value_enum, default_value_t = CliAbiProfile::Hyaloclast)]
+        abi: CliAbiProfile,
         /// Enable additional optional Vulkan hardware capability (repeatable: `float16`,
         /// `int64_atomics`, `float_atomics`, `ray_query`, `maximal_reconvergence`, `quad_control`).
         #[arg(long = "cap")]
@@ -51,6 +70,9 @@ enum Command {
         /// Active Hyaloclast hardware tier (`0..=3`).
         #[arg(long, default_value_t = 2)]
         tier: u8,
+        /// Target descriptor ABI profile (`hyaloclast` or `standalone`).
+        #[arg(long, value_enum, default_value_t = CliAbiProfile::Hyaloclast)]
+        abi: CliAbiProfile,
         /// Enable additional optional Vulkan hardware capability (repeatable).
         #[arg(long = "cap")]
         caps: Vec<String>,
@@ -81,6 +103,9 @@ enum Command {
         /// Active Hyaloclast hardware tier (`0..=3`).
         #[arg(long, default_value_t = 2)]
         tier: u8,
+        /// Target descriptor ABI profile (`hyaloclast` or `standalone`).
+        #[arg(long, value_enum, default_value_t = CliAbiProfile::Hyaloclast)]
+        abi: CliAbiProfile,
         /// Optional preset name to apply before evaluating `pipeline`.
         #[arg(long)]
         preset: Option<String>,
@@ -113,6 +138,9 @@ enum Command {
         /// Active Hyaloclast hardware tier (`0..=3`).
         #[arg(long, default_value_t = 2)]
         tier: u8,
+        /// Target descriptor ABI profile (`hyaloclast` or `standalone`).
+        #[arg(long, value_enum, default_value_t = CliAbiProfile::Hyaloclast)]
+        abi: CliAbiProfile,
         /// Enable additional optional Vulkan hardware capability (repeatable).
         #[arg(long = "cap")]
         caps: Vec<String>,
@@ -124,6 +152,9 @@ enum Command {
         /// Optional output `.glsl` file path (prints to stdout when omitted).
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Target descriptor ABI profile (`hyaloclast` or `standalone`).
+        #[arg(long, value_enum, default_value_t = CliAbiProfile::Hyaloclast)]
+        abi: CliAbiProfile,
     },
 }
 
@@ -149,11 +180,13 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             file,
             pack,
             tier,
+            abi,
             caps,
         } => {
             let source = fs::read_to_string(&file)?;
             let render_tier = parse_tier(tier)?;
             let mut opts = CompileOptions::for_tier(render_tier);
+            opts.abi = abi.into();
             apply_cli_caps(&mut opts, &caps)?;
             let mut compiler = VslCompiler::new();
             if let Some(ref pack_path) = pack
@@ -180,11 +213,13 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             file,
             pack,
             tier,
+            abi,
             caps,
         } => {
             let source = fs::read_to_string(&file)?;
             let render_tier = parse_tier(tier)?;
             let mut opts = CompileOptions::for_tier(render_tier);
+            opts.abi = abi.into();
             apply_cli_caps(&mut opts, &caps)?;
             let mut compiler = VslCompiler::new();
             if let Some(ref pack_path) = pack
@@ -243,6 +278,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::BuildPack {
             path,
             tier,
+            abi,
             preset,
             params,
             caps,
@@ -276,6 +312,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
 
             let mut opts = CompileOptions::for_tier(render_tier);
+            opts.abi = abi.into();
             apply_cli_caps(&mut opts, &caps)?;
             opts.pack_schema = Some(pack_schema_from_pipeline(&pipeline));
 
@@ -371,11 +408,13 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             out,
             entry,
             tier,
+            abi,
             caps,
         } => {
             let source = fs::read_to_string(&file)?;
             let render_tier = parse_tier(tier)?;
             let mut opts = CompileOptions::for_tier(render_tier);
+            opts.abi = abi.into();
             apply_cli_caps(&mut opts, &caps)?;
             let mut compiler = VslCompiler::new();
             if let Some(ref pack_path) = pack
@@ -444,10 +483,14 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::EmitGlsl { file, out } => {
+        Command::EmitGlsl { file, out, abi } => {
             let source = fs::read_to_string(&file)?;
             let mut compiler = VslCompiler::new();
-            let output = compiler.compile_shader_to_glsl(file.display().to_string(), &source);
+            let output = compiler.compile_shader_to_glsl_with_abi(
+                file.display().to_string(),
+                &source,
+                abi.into(),
+            );
             render_diagnostics(&compiler.sources, &output.diagnostics, &mut io::stderr())?;
             if output.has_errors() {
                 return Ok(ExitCode::FAILURE);

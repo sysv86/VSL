@@ -38,6 +38,11 @@ Rust compiler workspace for the VSL 2.0 shader language, SPIR-V 1.6 backend, GLS
 | `2` (`DESCRIPTOR_SET_BINDLESS`) | `0` | `COMBINED_IMAGE_SAMPLER[4096]` (`BINDLESS_IMAGE_COUNT = 4096`, no Set 0 default sampler) |
 | `3` (`DESCRIPTOR_SET_PACK_RESOURCES`) | `0..=15` | Pack resource texture slots (`PACK_RESOURCE_SLOTS = 16`) |
 
+### ABI Profiles (`AbiProfile`)
+
+- `AbiProfile::Hyaloclast` (default, `--abi hyaloclast`): enforces the 4-set Hyaloclast engine ABI above (`WorldUBO` at 0:0, Set 0 bindings `1..=14`, Set 1 scene globals, Set 2 `COMBINED_IMAGE_SAMPLER[4096]`, Set 3 pack resources).
+- `AbiProfile::Standalone` (`--abi standalone`): targets generic Vulkan 1.3+ shaders without requiring `mc::*` or `pack.vsl`; omits `WorldUBO` unless explicitly referenced, supports `#[binding(set = N, binding = M)]` on entry-point resource parameters (with deterministic auto-assignment starting at `0:0` when omitted and no `1..=14` cap), and emits standard unsized `RuntimeDescriptorArray` bindings for `Texture2D<f32>[]`.
+
 ## Requirements
 
 - Rust `1.88+` (Edition `2024`, Cargo resolver `3`)

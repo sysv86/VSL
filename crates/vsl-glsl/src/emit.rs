@@ -3,7 +3,7 @@ use smol_str::SmolStr;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use vsl_mc::{
-    BINDLESS_IMAGE_COUNT, BuiltinFieldType, BuiltinStructDesc, DESCRIPTOR_SET_BINDLESS,
+    AbiProfile, BINDLESS_IMAGE_COUNT, BuiltinFieldType, BuiltinStructDesc, DESCRIPTOR_SET_BINDLESS,
     DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS, DESCRIPTOR_SET_SCENE_GLOBALS,
     EMISSIVE_LIGHT_LAYOUT, EMISSIVE_LIGHT_SSBO_LAYOUT, INSTANCE_META_LAYOUT, ImageFormat,
     RESTIR_RESERVOIR_LAYOUT, RESTIR_RESERVOIR_SSBO_LAYOUT, SHARC_CONFIG_UBO_LAYOUT,
@@ -37,6 +37,8 @@ pub struct EmitOptions {
     /// Controls whether Set 2 binding 0 emits Hyaloclast's `sampler2D bindless[4096]`
     /// or upstream VSL's unsized `texture2D bindless[]`.
     pub bindless_abi: BindlessAbi,
+    /// Target ABI profile (`Hyaloclast` by default, or `Standalone`).
+    pub abi: AbiProfile,
 }
 
 /// Memory layout mode declared on a struct or buffer block.
@@ -549,18 +551,27 @@ pub(crate) fn seed_mc_builtin_types(ctx: &mut EmitCtx) {
 
 fn emit_mc_global_decls(scan: &FeatureScan, opts: EmitOptions, out: &mut String) {
     // Set 0, binding 0: Canonical `WorldUBO` (`std140`, 544 bytes) from `vsl_mc::layouts`.
-    let mut emitted_any = true;
-    let world_set = WORLD_UBO_LAYOUT.set.unwrap_or(DESCRIPTOR_SET_PER_PASS);
-    let world_binding = WORLD_UBO_LAYOUT.binding.unwrap_or(0);
-    let _ = writeln!(
-        out,
-        "layout(set = {world_set}, binding = {world_binding}, std140) uniform {} {{",
-        WORLD_UBO_LAYOUT.name
-    );
-    emit_builtin_fields(&WORLD_UBO_LAYOUT, out);
-    out.push_str("} mc_world;\n\n");
+    let emit_world_ubo = opts.abi == AbiProfile::Hyaloclast
+        || scan.imported_mc_world
+        || !scan.pack_param_keys.is_empty();
+    let mut emitted_any = emit_world_ubo;
+    if emit_world_ubo {
+        let world_set = WORLD_UBO_LAYOUT.set.unwrap_or(DESCRIPTOR_SET_PER_PASS);
+        let world_binding = WORLD_UBO_LAYOUT.binding.unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "layout(set = {world_set}, binding = {world_binding}, std140) uniform {} {{",
+            WORLD_UBO_LAYOUT.name
+        );
+        emit_builtin_fields(&WORLD_UBO_LAYOUT, out);
+        out.push_str("} mc_world;\n\n");
+    }
     // Set 0, ascending bindings after pass resource parameters: debug output images from `mc::debug_write(...)`.
-    let mut next_free_binding = scan.next_per_pass_binding.max(1);
+    let mut next_free_binding = if emit_world_ubo {
+        scan.next_per_pass_binding.max(1)
+    } else {
+        scan.next_per_pass_binding
+    };
     for channel in &scan.debug_channels {
         let _ = writeln!(
             out,
@@ -1071,9 +1082,8 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
         let saved_locals = ctx.local_types.clone();
         let saved_shadowed_world = ctx.shadowed_world;
 
-        // Binding 0 is reserved for `WorldUBO`; pass targets start at binding 1.
-        // `#[pack_resource]` parameters are placed in Set 3 (`DESCRIPTOR_SET_PACK_RESOURCES`).
-        let mut binding_slot = 1u32;
+        let world_reserved = ctx.opts.abi == AbiProfile::Hyaloclast || ctx.imported_mc_world;
+        let mut binding_slot = u32::from(world_reserved);
         let mut pack_resource_slot = 0u32;
         let mut builtin_inits: Vec<(String, String, Option<&'static str>)> = Vec::new();
         let mut builtin_writebacks: Vec<(&'static str, String)> = Vec::new();
@@ -1121,6 +1131,13 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
                 if let Some(ref ty) = param.ty {
                     ctx.local_types
                         .insert(param.name.name.clone(), type_to_glsl(ty).0);
+                }
+            } else if let Some((set, binding)) = extract_binding_attr(&param.attrs) {
+                if let Some(ref ty) = param.ty {
+                    ctx.local_types
+                        .insert(param.name.name.clone(), type_to_glsl(ty).0);
+                    let escaped_name = escape_glsl_ident(&param.name.name);
+                    emit_entry_resource_binding(set, binding, &escaped_name, ty, ctx, out);
                 }
             } else if has_attr(&param.attrs, "pack_resource") {
                 if let Some(ref ty) = param.ty {
@@ -2913,6 +2930,51 @@ fn extract_location_attr(attrs: &[Attribute]) -> Option<u32> {
                 && let Some(first) = entry.args.first()
             {
                 return parse_u32_lit(first);
+            }
+        }
+    }
+    None
+}
+
+fn extract_binding_attr(attrs: &[Attribute]) -> Option<(u32, u32)> {
+    for attr in attrs {
+        for entry in &attr.entries {
+            if entry.name.name == "binding" && entry.args.len() == 2 {
+                let mut set: Option<u32> = None;
+                let mut binding: Option<u32> = None;
+                let mut all_named = true;
+                for arg in &entry.args {
+                    if let Expr::Binary {
+                        op: BinaryOp::Assign,
+                        lhs,
+                        rhs,
+                        ..
+                    } = arg
+                        && let Expr::Path { path, .. } = lhs.as_ref()
+                        && let Some(val) = parse_u32_lit(rhs.as_ref())
+                    {
+                        match path.joined().as_str() {
+                            "set" if set.is_none() => set = Some(val),
+                            "binding" if binding.is_none() => binding = Some(val),
+                            _ => {
+                                all_named = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        all_named = false;
+                        break;
+                    }
+                }
+                if all_named && let (Some(s), Some(b)) = (set, binding) {
+                    return Some((s, b));
+                }
+                if let (Some(s), Some(b)) = (
+                    entry.args.first().and_then(parse_u32_lit),
+                    entry.args.get(1).and_then(parse_u32_lit),
+                ) {
+                    return Some((s, b));
+                }
             }
         }
     }

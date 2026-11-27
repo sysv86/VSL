@@ -12,7 +12,8 @@ pub use hir::{
     HirImpl, HirModule, HirParam, HirStmt, HirStruct, HirStructField, HirStructId, HirSwitchCase,
     HirSymbol, HirTrait, HirTraitMethod, HirWorkgroupVar, SymbolId, SymbolKind,
 };
-pub use lower::{PackSchema, lower_unit, lower_unit_with_schema};
+pub use lower::{PackSchema, lower_unit, lower_unit_with_schema, lower_unit_with_schema_and_abi};
 pub use module::{L1ModuleHash, L2ArtifactHash, ModuleGraph, ModuleGraphError, ModuleId};
 pub use ty::{LayoutKind, ScalarKind, StructLayout, Type, TypeArena, TypeId};
 pub use validate::{ValidationSummary, validate_unit};
+pub use vsl_mc::AbiProfile;

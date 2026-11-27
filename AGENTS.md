@@ -34,6 +34,7 @@ GPL-3.0-only, matching Hyaloclast. Clean-room implementation: do not copy from S
      which the engine's rspirv reflection rejects. Bindless sampling uses the combined sampler
      directly, with no Set 0 default sampler.
    - Set 3 — pack assets: `bindings 0..=15` (`PACK_RESOURCE_SLOTS = 16`).
+   - `AbiProfile::Standalone` (`--abi standalone`) targets generic Vulkan 1.3+ shaders: omits `WorldUBO` unless used, supports `#[binding(set = N, binding = M)]` (with deterministic auto-assignment and no `1..=14` cap), and emits unsized `RuntimeDescriptorArray` for `Texture2D<f32>[]`. (`AbiProfile::Hyaloclast` remains the default.)
 3. Compile-time SPIR-V legality: forbid `RayQuery` in structs, arrays, or `OpPhi` merges; forbid logical-pointer locals; validate `#[push_constant]` size `<= 128 B` with no overlap; gate `f16`, 64-bit atomics, float atomics, and `RayQuery` behind their `#[cap(...)]` attributes.
 4. Structured IR: preserve `If`/`Switch`/`Loop { body, continuing }` through emission. Lower BDA `.offset(i)` with 64-bit integer arithmetic (`OpConvertPtrToU`, `OpIMul`, `OpIAdd`, `OpConvertUToPtr`), not `OpPtrAccessChain`. Propagate `NonUniform` onto index, `OpAccessChain`, and resource `OpLoad`. No runtime `spirv-opt`.
 5. Deterministic `pack.vsl` sandbox: `100_000` evaluation steps, `256` loop iterations, zero filesystem or network IO.

@@ -16,8 +16,8 @@ use vsl_hir::{
 use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, GlslStd450Op, InstData, InstId, IrDescriptorVar,
     IrFunction, IrInterpolation, IrLocalVar, IrModule, IrParam, IrPushConstantBlock,
-    IrPushConstantField, IrStageIoVar, IrStorageClass, IrType, IrWorkgroupVar, MemoryAccess,
-    ScalarIrTy, StructuredStmt,
+    IrPushConstantField, IrStageIoVar, IrStorageClass, IrStructFieldLayout, IrStructLayout, IrType,
+    IrWorkgroupVar, MemoryAccess, ScalarIrTy, StructuredStmt,
 };
 use vsl_mc::{
     BuiltinStructDesc, DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS,
@@ -57,6 +57,7 @@ pub(crate) fn lower_entry_module_to_ir(
         module_items,
         pack_schema,
         &unified_descriptors,
+        &entry_fn.reflection.descriptor_types,
         Some(stage),
         workgroup_size,
         stage == ShaderStage::Compute,
@@ -85,6 +86,7 @@ pub(crate) fn lower_entry_module_to_ir(
             module_items,
             pack_schema,
             &unified_descriptors,
+            &entry_fn.reflection.descriptor_types,
             None,
             None,
             stage == ShaderStage::Compute,
@@ -307,13 +309,81 @@ pub(crate) fn build_unified_descriptors_with_helpers(
     unified
 }
 
-fn descriptor_binding_to_ir(d: &DescriptorBinding) -> IrDescriptorVar {
-    let struct_layout = builtin_descriptor_layout(d.set, d.binding).and_then(|desc| {
-        match IrType::from_builtin_struct(desc) {
+fn ir_type_byte_stride(ty: &IrType) -> u32 {
+    match ty {
+        IrType::Scalar(s) => s.byte_size(),
+        IrType::Vector { scalar, len: 3 } => scalar.byte_size().saturating_mul(4),
+        IrType::Vector { scalar, len } => scalar.byte_size().saturating_mul(u32::from(*len)),
+        IrType::Matrix { scalar, cols, rows } => {
+            let col_stride = if *rows == 3 {
+                scalar.byte_size().saturating_mul(4)
+            } else {
+                scalar.byte_size().saturating_mul(u32::from(*rows))
+            };
+            col_stride.saturating_mul(u32::from(*cols))
+        }
+        IrType::Array { element, len } => {
+            ir_type_byte_stride(element).saturating_mul((*len).max(1))
+        }
+        IrType::Struct(layout) => {
+            let align = layout.align.max(1);
+            let aligned = layout.size.div_ceil(align).saturating_mul(align);
+            aligned.max(align).max(4)
+        }
+        IrType::Pointer {
+            storage: IrStorageClass::PhysicalStorageBuffer,
+            ..
+        } => 8,
+        IrType::Void | IrType::RuntimeArray(_) | IrType::Pointer { .. } => 4,
+    }
+}
+
+fn user_descriptor_struct_layout(
+    hir: &HirModule,
+    name: &str,
+    ty_id: TypeId,
+) -> Option<IrStructLayout> {
+    match hir.types.get(ty_id) {
+        Type::Buffer { element } | Type::RwBuffer { element } => {
+            let elem_ir = IrType::from_hir_type(&hir.types, *element);
+            let elem_stride = ir_type_byte_stride(&elem_ir);
+            Some(IrStructLayout {
+                name: SmolStr::new(format!("{name}Buffer")),
+                fields: vec![IrStructFieldLayout {
+                    name: SmolStr::new_static("items"),
+                    byte_offset: 0,
+                    byte_size: elem_stride,
+                    ty: IrType::RuntimeArray(Box::new(elem_ir)),
+                }],
+                size: 0,
+                align: 4,
+                layout: LayoutKind::Std430,
+            })
+        }
+        Type::Struct { .. } => match IrType::from_hir_type(&hir.types, ty_id) {
             IrType::Struct(layout) => Some(layout),
             _ => None,
-        }
-    });
+        },
+        _ => None,
+    }
+}
+
+fn descriptor_binding_to_ir(
+    d: &DescriptorBinding,
+    hir: &HirModule,
+    descriptor_types: &IndexMap<(u32, u32), TypeId>,
+) -> IrDescriptorVar {
+    let struct_layout = descriptor_types
+        .get(&(d.set, d.binding))
+        .and_then(|&ty_id| user_descriptor_struct_layout(hir, d.name.as_str(), ty_id))
+        .or_else(|| {
+            builtin_descriptor_layout(d.set, d.binding).and_then(|desc| {
+                match IrType::from_builtin_struct(desc) {
+                    IrType::Struct(layout) => Some(layout),
+                    _ => None,
+                }
+            })
+        });
     IrDescriptorVar {
         name: d.name.clone(),
         set: d.set,
@@ -345,6 +415,7 @@ pub(crate) fn lower_hook_callee_to_ir(
         module_items,
         pack_schema,
         unified_descriptors,
+        &func.reflection.descriptor_types,
         None,
         None,
         true,
@@ -368,6 +439,7 @@ pub(crate) fn lower_hook_callee_to_ir(
             module_items,
             pack_schema,
             unified_descriptors,
+            &func.reflection.descriptor_types,
             None,
             None,
             true,
@@ -385,6 +457,7 @@ fn lower_single_function(
     module_items: &[Item],
     pack_schema: Option<&PackSchema>,
     unified_descriptors: &[DescriptorBinding],
+    descriptor_types: &IndexMap<(u32, u32), TypeId>,
     stage: Option<ShaderStage>,
     workgroup_size: Option<[u32; 3]>,
     allow_workgroup_vars: bool,
@@ -403,7 +476,7 @@ fn lower_single_function(
 
     ir_fn.descriptors = unified_descriptors
         .iter()
-        .map(descriptor_binding_to_ir)
+        .map(|d| descriptor_binding_to_ir(d, hir, descriptor_types))
         .collect();
 
     if allow_workgroup_vars {
@@ -871,9 +944,6 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
 
             if param.is_push_constant {
                 push_constant_param = Some(param.name.clone());
-                let val = ir_fn.emit(param.ty, InstData::LoadPushConstant { field_index: 0 });
-                entry_preamble.push(StructuredStmt::Eval(val));
-                ssa_locals.insert(param.name.clone(), val);
                 continue;
             }
 
@@ -2205,6 +2275,57 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         );
                     }
                 }
+                HirExprKind::Field {
+                    receiver,
+                    field,
+                    field_index,
+                } => {
+                    if let Some((field_ptr, _, _, _)) =
+                        self.try_lower_bda_field_ptr(receiver, field, *field_index, out)
+                    {
+                        return field_ptr;
+                    }
+                    if let HirExprKind::Index {
+                        receiver: buf_recv,
+                        index: idx_expr,
+                    } = &receiver.kind
+                        && let HirExprKind::Path { path, .. } = &buf_recv.kind
+                        && let Some(desc_idx) = self.resolve_descriptor_path(path)
+                    {
+                        let elem_ty = self.ir_ty_of(receiver.ty);
+                        let f_idx = field_index.or_else(|| match &elem_ty {
+                            IrType::Struct(layout) => layout
+                                .fields
+                                .iter()
+                                .position(|f| f.name == *field)
+                                .map(|i| i as u32),
+                            _ => None,
+                        });
+                        if let Some(idx) = f_idx {
+                            let idx_val = self.lower_expr(idx_expr, out);
+                            let field_ty = self.ir_ty_of(operand.ty);
+                            let zero = self
+                                .ir_fn
+                                .emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(0));
+                            let f_const = self.ir_fn.emit_typed(
+                                IrType::Scalar(ScalarIrTy::U32),
+                                InstData::ConstU32(idx),
+                            );
+                            let ptr_ty = IrType::Pointer {
+                                pointee: Box::new(field_ty),
+                                align: 4,
+                                storage: IrStorageClass::StorageBuffer,
+                            };
+                            return self.ir_fn.emit_typed(
+                                ptr_ty,
+                                InstData::DescriptorAccessChain {
+                                    descriptor_index: desc_idx,
+                                    indices: vec![zero, idx_val, f_const],
+                                },
+                            );
+                        }
+                    }
+                }
                 HirExprKind::Path { path, .. }
                     if !path.contains("::") && self.ptr_param_locals.contains_key(path) =>
                 {
@@ -2695,6 +2816,40 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         out.push(StructuredStmt::Eval(store));
                         return final_val;
                     }
+                }
+                if let Some((field_ptr, field_ty, field_align, _)) =
+                    self.try_lower_bda_field_ptr(receiver, field, *field_index, out)
+                {
+                    let final_val = if op == BinaryOp::Assign {
+                        rhs_val
+                    } else {
+                        let cur = self.ir_fn.emit_typed(
+                            field_ty.clone(),
+                            InstData::BdaLoad {
+                                ptr: field_ptr,
+                                access: MemoryAccess {
+                                    align: field_align,
+                                    non_writable: false,
+                                    restrict: false,
+                                },
+                            },
+                        );
+                        self.lower_binary_op(op, cur, rhs_val, &field_ty)
+                    };
+                    let store = self.ir_fn.emit_typed(
+                        IrType::Void,
+                        InstData::BdaStore {
+                            ptr: field_ptr,
+                            value: final_val,
+                            access: MemoryAccess {
+                                align: field_align,
+                                non_writable: false,
+                                restrict: false,
+                            },
+                        },
+                    );
+                    out.push(StructuredStmt::Eval(store));
+                    return final_val;
                 }
                 self.emit_diag(
                     "E0523",
@@ -3392,6 +3547,93 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             .emit_typed(field_ir_ty, InstData::ResourceLoad { ptr: chain })
     }
 
+    /// Resolves a BDA pointer base expression (or nested BDA field chain) into
+    /// `(bda_ptr_inst, pointee_ir_ty, align, is_mut)`.
+    fn try_lower_bda_field_base(
+        &mut self,
+        expr: &HirExpr,
+        out: &mut Vec<StructuredStmt>,
+    ) -> Option<(InstId, IrType, u32, bool)> {
+        if let Type::Pointer {
+            pointee,
+            align,
+            mutable,
+        } = self.hir.types.get(expr.ty)
+        {
+            let (pointee_id, ptr_align, is_mut) = (*pointee, *align, *mutable);
+            let base_ptr = self.lower_expr(expr, out);
+            let pointee_ir_ty = self.ir_ty_of(pointee_id);
+            return Some((base_ptr, pointee_ir_ty, ptr_align, is_mut));
+        }
+        if let HirExprKind::Field {
+            receiver,
+            field,
+            field_index,
+        } = &expr.kind
+        {
+            return self.try_lower_bda_field_ptr(receiver, field, *field_index, out);
+        }
+        None
+    }
+
+    /// Computes a BDA field pointer using 64-bit integer offset math (`ConvertPtrToU` +
+    /// `IAdd64` + `ConvertUToPtr`) and returns `(field_ptr, field_ty, field_align, is_mut)`.
+    fn try_lower_bda_field_ptr(
+        &mut self,
+        receiver: &HirExpr,
+        field: &SmolStr,
+        field_index: Option<u32>,
+        out: &mut Vec<StructuredStmt>,
+    ) -> Option<(InstId, IrType, u32, bool)> {
+        let (base_ptr, base_ir_ty, ptr_align, is_mut) =
+            self.try_lower_bda_field_base(receiver, out)?;
+        let IrType::Struct(layout) = base_ir_ty else {
+            return None;
+        };
+        let f_idx = field_index
+            .and_then(|idx| {
+                usize::try_from(idx)
+                    .ok()
+                    .filter(|&i| i < layout.fields.len())
+            })
+            .or_else(|| layout.fields.iter().position(|f| f.name == *field))?;
+        let f_layout = &layout.fields[f_idx];
+        let byte_offset = f_layout.byte_offset;
+        let field_ty = f_layout.ty.clone();
+        let field_align = if byte_offset == 0 {
+            ptr_align.max(1)
+        } else {
+            ptr_align.max(1).min(1u32 << byte_offset.trailing_zeros())
+        };
+        self.ir_fn.uses_bda = true;
+        let u64_ty = IrType::Scalar(ScalarIrTy::U64);
+        let base_u64 = self
+            .ir_fn
+            .emit_typed(u64_ty.clone(), InstData::ConvertPtrToU(base_ptr));
+        let addr_u64 = if byte_offset == 0 {
+            base_u64
+        } else {
+            let off_const = self
+                .ir_fn
+                .emit_typed(u64_ty.clone(), InstData::ConstU64(u64::from(byte_offset)));
+            self.ir_fn
+                .emit_typed(u64_ty, InstData::IAdd64(base_u64, off_const))
+        };
+        let ptr_ty = IrType::Pointer {
+            pointee: Box::new(field_ty.clone()),
+            align: field_align,
+            storage: IrStorageClass::PhysicalStorageBuffer,
+        };
+        let field_ptr = self.ir_fn.emit_typed(
+            ptr_ty,
+            InstData::ConvertUToPtr {
+                addr_u64,
+                align: field_align,
+            },
+        );
+        Some((field_ptr, field_ty, field_align, is_mut))
+    }
+
     fn lower_field_expr(
         &mut self,
         receiver: &HirExpr,
@@ -3474,6 +3716,65 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         // `mc::lights.items[i].position`, `mc::reservoirs.items[i].weight_sum`).
         if let Some(elem_binding) = self.try_lower_descriptor_elem_index(receiver, out) {
             return self.emit_descriptor_elem_field_load(&elem_binding, field.as_str(), span);
+        }
+
+        // Direct user Buffer<T> / RWBuffer<T> element field load (`buf[i].field`).
+        if let HirExprKind::Index {
+            receiver: buf_recv,
+            index: idx_expr,
+        } = &receiver.kind
+            && let HirExprKind::Path { path, .. } = &buf_recv.kind
+            && let Some(desc_idx) = self.resolve_descriptor_path(path)
+        {
+            let elem_ty = self.ir_ty_of(receiver.ty);
+            let f_idx = field_index.or_else(|| match &elem_ty {
+                IrType::Struct(layout) => layout
+                    .fields
+                    .iter()
+                    .position(|f| f.name == *field)
+                    .map(|i| i as u32),
+                _ => None,
+            });
+            if let Some(idx) = f_idx {
+                let idx_val = self.lower_expr(idx_expr, out);
+                let zero = self
+                    .ir_fn
+                    .emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(0));
+                let f_const = self
+                    .ir_fn
+                    .emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(idx));
+                let ptr = self.ir_fn.emit_typed(
+                    IrType::Pointer {
+                        pointee: Box::new(expr_ir_ty.clone()),
+                        align: 4,
+                        storage: IrStorageClass::StorageBuffer,
+                    },
+                    InstData::DescriptorAccessChain {
+                        descriptor_index: desc_idx,
+                        indices: vec![zero, idx_val, f_const],
+                    },
+                );
+                return self
+                    .ir_fn
+                    .emit_typed(expr_ir_ty.clone(), InstData::ResourceLoad { ptr });
+            }
+        }
+
+        // BDA pointer struct field load (`bda_ptr.field`).
+        if let Some((field_ptr, field_ty, field_align, is_mut)) =
+            self.try_lower_bda_field_ptr(receiver, field, field_index, out)
+        {
+            return self.ir_fn.emit_typed(
+                field_ty,
+                InstData::BdaLoad {
+                    ptr: field_ptr,
+                    access: MemoryAccess {
+                        align: field_align,
+                        non_writable: !is_mut,
+                        restrict: false,
+                    },
+                },
+            );
         }
 
         // Direct built-in UBO/SSBO descriptor field access (`mc::world.*`, `mc::sharc.*`,
@@ -5783,6 +6084,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             vec4_f32.clone()
         };
 
+        let arg_offset = usize::from(args.first().is_some_and(|a| {
+            matches!(
+                self.hir.types.get(a.value.ty),
+                Type::Sampler | Type::SamplerShadow
+            )
+        }));
+
         let id = match method {
             "store" => {
                 if !self
@@ -5810,7 +6118,8 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 st
             }
             "sample" => {
-                let Ok(coord) = self.require_arg(args, 0, "texture::sample", span, out) else {
+                let Ok(coord) = self.require_arg(args, arg_offset, "texture::sample", span, out)
+                else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
                 if self.stage == Some(ShaderStage::Fragment) {
@@ -5839,10 +6148,14 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 }
             }
             "sample_lod" => {
-                let Ok(coord) = self.require_arg(args, 0, "texture::sample_lod", span, out) else {
+                let Ok(coord) =
+                    self.require_arg(args, arg_offset, "texture::sample_lod", span, out)
+                else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
-                let Ok(lod) = self.require_arg(args, 1, "texture::sample_lod", span, out) else {
+                let Ok(lod) =
+                    self.require_arg(args, arg_offset + 1, "texture::sample_lod", span, out)
+                else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
                 self.ir_fn.emit_typed(
@@ -5857,13 +6170,19 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 )
             }
             "sample_grad" => {
-                let Ok(coord) = self.require_arg(args, 0, "texture::sample_grad", span, out) else {
+                let Ok(coord) =
+                    self.require_arg(args, arg_offset, "texture::sample_grad", span, out)
+                else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
-                let Ok(ddx) = self.require_arg(args, 1, "texture::sample_grad", span, out) else {
+                let Ok(ddx) =
+                    self.require_arg(args, arg_offset + 1, "texture::sample_grad", span, out)
+                else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
-                let Ok(ddy) = self.require_arg(args, 2, "texture::sample_grad", span, out) else {
+                let Ok(ddy) =
+                    self.require_arg(args, arg_offset + 2, "texture::sample_grad", span, out)
+                else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
                 self.ir_fn.emit_typed(
@@ -5878,15 +6197,17 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 )
             }
             "sample_compare" | "sample_compare_lod" => {
-                let Ok(coord) = self.require_arg(args, 0, "texture::sample_compare", span, out)
+                let Ok(coord) =
+                    self.require_arg(args, arg_offset, "texture::sample_compare", span, out)
                 else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
-                let Ok(dref) = self.require_arg(args, 1, "texture::sample_compare", span, out)
+                let Ok(dref) =
+                    self.require_arg(args, arg_offset + 1, "texture::sample_compare", span, out)
                 else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
-                let lod = match args.get(2) {
+                let lod = match args.get(arg_offset + 2) {
                     Some(a) => self.lower_expr(&a.value, out),
                     None => self
                         .ir_fn

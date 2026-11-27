@@ -12,7 +12,7 @@ use la_arena::Arena;
 use smol_str::SmolStr;
 use vsl_diagnostics::{Diagnostic, DiagnosticBag, Span};
 use vsl_mc::{
-    BINDLESS_IMAGE_COUNT, BuiltinFieldType, BuiltinStructDesc, DESCRIPTOR_SET_BINDLESS,
+    AbiProfile, BINDLESS_IMAGE_COUNT, BuiltinFieldType, BuiltinStructDesc, DESCRIPTOR_SET_BINDLESS,
     DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS, DESCRIPTOR_SET_SCENE_GLOBALS,
     DebugChannelBinding, DescriptorAccess, DescriptorBinding, DescriptorKind,
     EMISSIVE_LIGHT_LAYOUT, EMISSIVE_LIGHT_SSBO_LAYOUT, HardwareCaps, HookStage,
@@ -184,14 +184,38 @@ pub fn lower_unit_with_schema(
     active_caps: HardwareCaps,
     schema: Option<&PackSchema>,
 ) -> (HirModule, DiagnosticBag) {
-    lower_unit_internal(unit, Some(active_tier), active_caps, schema)
+    lower_unit_with_schema_and_abi(
+        unit,
+        active_tier,
+        active_caps,
+        schema,
+        AbiProfile::Hyaloclast,
+    )
+}
+
+/// Lowers a parsed [`SourceUnit`] into an arena-backed [`HirModule`] for a target
+/// `(active_tier, active_caps)` configuration, optional [`PackSchema`], and [`AbiProfile`].
+pub fn lower_unit_with_schema_and_abi(
+    unit: &SourceUnit,
+    active_tier: RenderTier,
+    active_caps: HardwareCaps,
+    schema: Option<&PackSchema>,
+    abi: AbiProfile,
+) -> (HirModule, DiagnosticBag) {
+    lower_unit_internal(unit, Some(active_tier), active_caps, schema, abi)
 }
 
 /// Internal entry point used by [`crate::validate::validate_unit`] to run the exact same
 /// lowering and legality checks across all tiers without pruning functions or rejecting
 /// valid device-gated capabilities.
 pub(crate) fn lower_unit_for_validation(unit: &SourceUnit) -> (HirModule, DiagnosticBag) {
-    lower_unit_internal(unit, None, HardwareCaps::all(), None)
+    lower_unit_internal(
+        unit,
+        None,
+        HardwareCaps::all(),
+        None,
+        AbiProfile::Hyaloclast,
+    )
 }
 
 struct PendingStruct<'a> {
@@ -214,12 +238,14 @@ fn lower_unit_internal(
     active_tier: Option<RenderTier>,
     active_caps: HardwareCaps,
     schema: Option<&PackSchema>,
+    abi: AbiProfile,
 ) -> (HirModule, DiagnosticBag) {
     let module_name = unit.module_decl.as_ref().map_or_else(
         || SmolStr::new_static("unnamed"),
         |decl| SmolStr::new(decl.path.joined()),
     );
     let mut module = HirModule::new(module_name);
+    module.abi = abi;
     let mut diags = DiagnosticBag::new();
 
     let mc_imports = collect_mc_imports(unit);
@@ -1021,6 +1047,7 @@ fn lower_unit_internal(
         mc_imports: &mc_imports,
         active_tier,
         active_caps,
+        abi,
         schema,
         fallback_spec_ids: IndexMap::new(),
         next_fallback_spec_id,
@@ -1249,11 +1276,10 @@ fn is_image_param_type(types: &TypeArena, ty: TypeId) -> bool {
     )
 }
 
-/// A helper is inlineable when it is private, monomorphic, not an entry point or hook, has a
+/// A helper is inlineable when it is monomorphic, not an entry point or hook, has a
 /// lowered body, and declares at least one image/texture parameter.
 fn is_inlineable_image_helper(module: &HirModule, func: &HirFunction) -> bool {
-    !func.is_pub
-        && func.generic_params.is_empty()
+    func.generic_params.is_empty()
         && func.stage.is_none()
         && func.hook.is_none()
         && func.body_hir.is_some()
@@ -2912,6 +2938,7 @@ struct LowerCtx<'a> {
     mc_imports: &'a IndexSet<SmolStr>,
     active_tier: Option<RenderTier>,
     active_caps: HardwareCaps,
+    abi: AbiProfile,
     schema: Option<&'a PackSchema>,
     fallback_spec_ids: IndexMap<SmolStr, u32>,
     next_fallback_spec_id: u32,
@@ -3250,6 +3277,7 @@ impl LowerCtx<'_> {
                 builtin: None,
                 is_push_constant: false,
                 pack_resource_slot: None,
+                explicit_binding: None,
                 span: param.span,
             });
         }
@@ -3336,6 +3364,7 @@ impl LowerCtx<'_> {
             let mut builtin: Option<SmolStr> = None;
             let mut param_is_pc = false;
             let mut pack_resource_slot: Option<u32> = None;
+            let mut explicit_binding: Option<(u32, u32)> = None;
 
             for attr in &param.attrs {
                 for entry in &attr.entries {
@@ -3358,6 +3387,17 @@ impl LowerCtx<'_> {
                                         "`#[pack_resource(slot)]` requires an integer slot within `0..={}`",
                                         PACK_RESOURCE_SLOTS - 1
                                     ),
+                                    entry.span,
+                                ));
+                            }
+                        }
+                        "binding" => {
+                            if let Some(parsed) = parse_binding_attr(&entry.args) {
+                                explicit_binding = Some(parsed);
+                            } else {
+                                self.diags.push(Diagnostic::error(
+                                    "E0265",
+                                    "`#[binding(set = N, binding = M)]` requires non-negative integer `set` and `binding` indices",
                                     entry.span,
                                 ));
                             }
@@ -3511,6 +3551,7 @@ impl LowerCtx<'_> {
                 builtin,
                 is_push_constant: param_is_pc,
                 pack_resource_slot,
+                explicit_binding,
                 span: param.span,
             });
         }
@@ -3767,24 +3808,34 @@ impl LowerCtx<'_> {
         fn_span: Span,
     ) -> EntryReflection {
         let mut descriptors = Vec::new();
+        let mut descriptor_types: IndexMap<(u32, u32), TypeId> = IndexMap::new();
         let mut used_set3_slots: IndexSet<u32> = IndexSet::new();
+        let mut used_bindings: IndexSet<(u32, u32)> = IndexSet::new();
 
-        // Set 0, binding 0: WorldUBO is part of the engine ABI for every entry point.
-        descriptors.push(DescriptorBinding {
-            name: SmolStr::new_static("world"),
-            set: DESCRIPTOR_SET_PER_PASS,
-            binding: 0,
-            kind: DescriptorKind::UniformBuffer,
-            dim: None,
-            sample_scalar: None,
-            image_format: None,
-            access: DescriptorAccess::ReadOnly,
-            is_unsized: false,
-            count: None,
-        });
+        let inject_world_ubo = match self.abi {
+            AbiProfile::Hyaloclast => true,
+            AbiProfile::Standalone => scan.has(FLAG_WORLD) || !scan.used_params.is_empty(),
+        };
 
-        // Set 0, bindings 1..=14 (or Set 3 for `#[pack_resource(slot)]`): entry-point resource parameters.
-        let mut next_pass_binding = 1u32;
+        if inject_world_ubo {
+            // Set 0, binding 0: WorldUBO is part of the engine ABI (or used by `mc::world`/`mc::params`).
+            used_bindings.insert((DESCRIPTOR_SET_PER_PASS, 0));
+            descriptors.push(DescriptorBinding {
+                name: SmolStr::new_static("world"),
+                set: DESCRIPTOR_SET_PER_PASS,
+                binding: 0,
+                kind: DescriptorKind::UniformBuffer,
+                dim: None,
+                sample_scalar: None,
+                image_format: None,
+                access: DescriptorAccess::ReadOnly,
+                is_unsized: false,
+                count: None,
+            });
+        }
+
+        // First pass: register explicit `#[binding(set = N, binding = M)]` and `#[pack_resource(slot)]`
+        // parameters so deterministic auto-assignment never collides with explicit slots.
         for param in params {
             if param.builtin.is_some() || param.is_push_constant {
                 continue;
@@ -3792,58 +3843,55 @@ impl LowerCtx<'_> {
             let Some(ty_id) = param.ty else {
                 continue;
             };
-            if let Some(classified) =
-                classify_resource_type(self.module.types.get(ty_id), param.mode)
-            {
-                // `world` is reserved for the ABI WorldUBO at 0:0. Reflection names are the
-                // driver's lookup key, so a second descriptor with this name would shadow the
-                // UBO and redirect `mc::param` BDA loads to the wrong descriptor.
-                if param.name == "world" {
+            let Some(classified) = classify_resource_type(self.module.types.get(ty_id), param.mode)
+            else {
+                continue;
+            };
+            if inject_world_ubo && param.name == "world" {
+                self.diags.push(Diagnostic::error(
+                    "E0264",
+                    format!(
+                        "resource parameter `{}` uses the ABI-reserved descriptor name `world`",
+                        param.name
+                    ),
+                    param.span,
+                ));
+                continue;
+            }
+            if let Some((set, binding)) = param.explicit_binding {
+                if !used_bindings.insert((set, binding)) {
                     self.diags.push(Diagnostic::error(
-                        "E0264",
-                        format!(
-                            "resource parameter `{}` uses the ABI-reserved descriptor name `world`",
-                            param.name
-                        ),
+                        "E0263",
+                        format!("duplicate `#[binding(set = {set}, binding = {binding})]` slot"),
                         param.span,
                     ));
                     continue;
                 }
-                if let Some(slot) = param.pack_resource_slot {
-                    if used_set3_slots.insert(slot) {
-                        descriptors.push(DescriptorBinding {
-                            name: param.name.clone(),
-                            set: DESCRIPTOR_SET_PACK_RESOURCES,
-                            binding: slot,
-                            kind: classified.kind,
-                            dim: classified.dim,
-                            sample_scalar: classified.sample_scalar,
-                            image_format: classified.image_format,
-                            access: classified.access,
-                            is_unsized: classified.is_unsized,
-                            count: None,
-                        });
-                    } else {
-                        self.diags.push(Diagnostic::error(
-                            "E0263",
-                            format!("duplicate `#[pack_resource({slot})]` binding slot in Set 3"),
-                            param.span,
-                        ));
-                    }
-                } else if next_pass_binding > MAX_PER_PASS_BINDING {
-                    self.diags.push(Diagnostic::error(
-                        "E0260",
-                        format!(
-                            "per-pass resource parameter `{}` exceeds Set 0 binding limit (`1..={MAX_PER_PASS_BINDING}`)",
-                            param.name
-                        ),
-                        param.span,
-                    ));
-                } else {
+                if set == DESCRIPTOR_SET_PACK_RESOURCES {
+                    used_set3_slots.insert(binding);
+                }
+                descriptor_types.insert((set, binding), ty_id);
+                descriptors.push(DescriptorBinding {
+                    name: param.name.clone(),
+                    set,
+                    binding,
+                    kind: classified.kind,
+                    dim: classified.dim,
+                    sample_scalar: classified.sample_scalar,
+                    image_format: classified.image_format,
+                    access: classified.access,
+                    is_unsized: classified.is_unsized,
+                    count: None,
+                });
+            } else if let Some(slot) = param.pack_resource_slot {
+                if used_set3_slots.insert(slot)
+                    && used_bindings.insert((DESCRIPTOR_SET_PACK_RESOURCES, slot))
+                {
+                    descriptor_types.insert((DESCRIPTOR_SET_PACK_RESOURCES, slot), ty_id);
                     descriptors.push(DescriptorBinding {
                         name: param.name.clone(),
-                        set: DESCRIPTOR_SET_PER_PASS,
-                        binding: next_pass_binding,
+                        set: DESCRIPTOR_SET_PACK_RESOURCES,
+                        binding: slot,
                         kind: classified.kind,
                         dim: classified.dim,
                         sample_scalar: classified.sample_scalar,
@@ -3852,15 +3900,74 @@ impl LowerCtx<'_> {
                         is_unsized: classified.is_unsized,
                         count: None,
                     });
-                    next_pass_binding += 1;
+                } else {
+                    self.diags.push(Diagnostic::error(
+                        "E0263",
+                        format!("duplicate `#[pack_resource({slot})]` binding slot in Set 3"),
+                        param.span,
+                    ));
                 }
+            }
+        }
+
+        // Second pass: auto-assign remaining entry-point resource parameters in Set 0.
+        let mut next_pass_binding = u32::from(inject_world_ubo);
+        for param in params {
+            if param.builtin.is_some()
+                || param.is_push_constant
+                || param.explicit_binding.is_some()
+                || param.pack_resource_slot.is_some()
+            {
+                continue;
+            }
+            let Some(ty_id) = param.ty else {
+                continue;
+            };
+            let Some(classified) = classify_resource_type(self.module.types.get(ty_id), param.mode)
+            else {
+                continue;
+            };
+            if inject_world_ubo && param.name == "world" {
+                continue;
+            }
+            while used_bindings.contains(&(DESCRIPTOR_SET_PER_PASS, next_pass_binding)) {
+                next_pass_binding += 1;
+            }
+            if self.abi == AbiProfile::Hyaloclast && next_pass_binding > MAX_PER_PASS_BINDING {
+                self.diags.push(Diagnostic::error(
+                    "E0260",
+                    format!(
+                        "per-pass resource parameter `{}` exceeds Set 0 binding limit (`1..={MAX_PER_PASS_BINDING}`)",
+                        param.name
+                    ),
+                    param.span,
+                ));
+            } else {
+                used_bindings.insert((DESCRIPTOR_SET_PER_PASS, next_pass_binding));
+                descriptor_types.insert((DESCRIPTOR_SET_PER_PASS, next_pass_binding), ty_id);
+                descriptors.push(DescriptorBinding {
+                    name: param.name.clone(),
+                    set: DESCRIPTOR_SET_PER_PASS,
+                    binding: next_pass_binding,
+                    kind: classified.kind,
+                    dim: classified.dim,
+                    sample_scalar: classified.sample_scalar,
+                    image_format: classified.image_format,
+                    access: classified.access,
+                    is_unsized: classified.is_unsized,
+                    count: None,
+                });
+                next_pass_binding += 1;
             }
         }
 
         // Set 0 debug channels allocated immediately after pass resource bindings.
         let mut debug_channels = Vec::with_capacity(scan.debug_channels.len());
         for channel in &scan.debug_channels {
-            if next_pass_binding > MAX_PER_PASS_BINDING {
+            while used_bindings.contains(&(DESCRIPTOR_SET_PER_PASS, next_pass_binding)) {
+                next_pass_binding += 1;
+            }
+            if self.abi == AbiProfile::Hyaloclast && next_pass_binding > MAX_PER_PASS_BINDING {
                 self.diags.push(Diagnostic::error(
                     "E0261",
                     format!(
@@ -3950,22 +4057,39 @@ impl LowerCtx<'_> {
             });
         }
 
-        // Set 2: engine-compatible bindless array (binding 0, 4096 combined image samplers).
-        // Hyaloclast declares this slot as `COMBINED_IMAGE_SAMPLER[4096]`; emitting an unsized
-        // sampled-image array here would make the engine's rspirv reflection reject the layout.
+        // Set 2: engine-compatible bindless array (binding 0, 4096 combined image samplers) in
+        // Hyaloclast mode, or standard unsized SampledImage[] in Standalone mode.
         if scan.has(FLAG_BINDLESS) {
-            descriptors.push(DescriptorBinding {
-                name: SmolStr::new_static("bindless"),
-                set: DESCRIPTOR_SET_BINDLESS,
-                binding: 0,
-                kind: DescriptorKind::CombinedImageSampler,
-                dim: Some(TextureDim::Dim2D),
-                sample_scalar: Some(SampleScalar::F32),
-                image_format: None,
-                access: DescriptorAccess::ReadOnly,
-                is_unsized: false,
-                count: Some(BINDLESS_IMAGE_COUNT),
-            });
+            match self.abi {
+                AbiProfile::Hyaloclast => {
+                    descriptors.push(DescriptorBinding {
+                        name: SmolStr::new_static("bindless"),
+                        set: DESCRIPTOR_SET_BINDLESS,
+                        binding: 0,
+                        kind: DescriptorKind::CombinedImageSampler,
+                        dim: Some(TextureDim::Dim2D),
+                        sample_scalar: Some(SampleScalar::F32),
+                        image_format: None,
+                        access: DescriptorAccess::ReadOnly,
+                        is_unsized: false,
+                        count: Some(BINDLESS_IMAGE_COUNT),
+                    });
+                }
+                AbiProfile::Standalone => {
+                    descriptors.push(DescriptorBinding {
+                        name: SmolStr::new_static("bindless"),
+                        set: DESCRIPTOR_SET_BINDLESS,
+                        binding: 0,
+                        kind: DescriptorKind::SampledImage,
+                        dim: Some(TextureDim::Dim2D),
+                        sample_scalar: Some(SampleScalar::F32),
+                        image_format: None,
+                        access: DescriptorAccess::ReadOnly,
+                        is_unsized: true,
+                        count: None,
+                    });
+                }
+            }
         }
 
         // Set 3: Pack texture assets referenced via `mc::resources::*` (`bindings 0..=15`).
@@ -4103,6 +4227,7 @@ impl LowerCtx<'_> {
 
         EntryReflection {
             descriptors,
+            descriptor_types,
             push_constants,
             push_constant_size,
             used_specs,
@@ -8467,6 +8592,41 @@ fn first_type_arg_image_format(args: &[TypeArg]) -> Option<ImageFormat> {
     ImageFormat::from_name(&path.joined())
 }
 
+fn parse_binding_attr(args: &[Expr]) -> Option<(u32, u32)> {
+    if args.len() != 2 {
+        return None;
+    }
+    let mut set: Option<u32> = None;
+    let mut binding: Option<u32> = None;
+    let mut all_named = true;
+    for arg in args {
+        if let Expr::Binary {
+            op: BinaryOp::Assign,
+            lhs,
+            rhs,
+            ..
+        } = arg
+            && let Expr::Path { path, .. } = lhs.as_ref()
+            && let Some(val) = parse_u32_lit(Some(rhs.as_ref()))
+        {
+            match path.joined().as_str() {
+                "set" if set.is_none() => set = Some(val),
+                "binding" if binding.is_none() => binding = Some(val),
+                _ => return None,
+            }
+        } else {
+            all_named = false;
+            break;
+        }
+    }
+    if all_named {
+        return Some((set?, binding?));
+    }
+    let s = parse_u32_lit(args.first())?;
+    let b = parse_u32_lit(args.get(1))?;
+    Some((s, b))
+}
+
 fn parse_u32_lit(expr: Option<&Expr>) -> Option<u32> {
     let Expr::IntLit(raw, _) = expr? else {
         return None;
@@ -10296,6 +10456,122 @@ mod tests {
         assert!(
             codes.contains(&"E0274"),
             "expected E0274 for wrong generic arity: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_abi_allows_explicit_bindings_and_over_14_set0_bindings() {
+        let src = r"
+            module standalone::hir;
+
+            @stage(compute(8, 8, 1))
+            pub fn many_bindings(
+                #[binding(set = 2, binding = 5)] t_explicit: Texture2D<f32>,
+                t0: Texture2D<f32>,
+                t1: Texture2D<f32>,
+                t2: Texture2D<f32>,
+                t3: Texture2D<f32>,
+                t4: Texture2D<f32>,
+                t5: Texture2D<f32>,
+                t6: Texture2D<f32>,
+                t7: Texture2D<f32>,
+                t8: Texture2D<f32>,
+                t9: Texture2D<f32>,
+                t10: Texture2D<f32>,
+                t11: Texture2D<f32>,
+                t12: Texture2D<f32>,
+                t13: Texture2D<f32>,
+                t14: Texture2D<f32>,
+                t15: Texture2D<f32>,
+                samp: Sampler,
+            ) {
+                let _ = t_explicit.sample_lod(samp, vec2(0.0), 0.0)
+                    + t0.sample_lod(samp, vec2(0.0), 0.0)
+                    + t15.sample_lod(samp, vec2(0.0), 0.0);
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (hir, diags) = lower_unit_with_schema_and_abi(
+            &parsed.unit,
+            RenderTier::Tier0Raster,
+            HardwareCaps::empty(),
+            None,
+            AbiProfile::Standalone,
+        );
+        assert!(!diags.has_errors(), "{diags:?}");
+        let f = hir.find_function("many_bindings").expect("many_bindings");
+        assert!(!f.reflection.descriptors.iter().any(|d| d.name == "world"));
+        assert!(
+            f.reflection
+                .descriptors
+                .iter()
+                .any(|d| d.name == "t_explicit" && d.set == 2 && d.binding == 5)
+        );
+        assert!(
+            f.reflection
+                .descriptors
+                .iter()
+                .any(|d| d.name == "t15" && d.set == 0 && d.binding == 15)
+        );
+    }
+
+    #[test]
+    fn standalone_abi_rejects_duplicate_and_invalid_binding_attrs() {
+        let src = r"
+            module standalone::errs;
+
+            @stage(compute(8, 8, 1))
+            pub fn bad_bindings(
+                #[binding(set = 1, binding = 0)] a: Texture2D<f32>,
+                #[binding(set = 1, binding = 0)] b: Texture2D<f32>,
+                #[binding(foo = 1)] c: Sampler,
+            ) {
+                let _ = a.sample_lod(c, vec2(0.0), 0.0) + b.sample_lod(c, vec2(0.0), 0.0);
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (_, diags) = lower_unit_with_schema_and_abi(
+            &parsed.unit,
+            RenderTier::Tier0Raster,
+            HardwareCaps::empty(),
+            None,
+            AbiProfile::Standalone,
+        );
+        let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0263"), "expected E0263: {diags:?}");
+        assert!(codes.contains(&"E0265"), "expected E0265: {diags:?}");
+    }
+
+    #[test]
+    fn pub_image_param_helper_is_inlined_in_hir() {
+        let src = r"
+            module test::pub_helper;
+
+            pub fn sample_it(tex: Texture2D<f32>, samp: Sampler, uv: vec2) -> vec4 {
+                tex.sample_lod(samp, uv, 0.0)
+            }
+
+            @stage(compute(8, 8, 1))
+            pub fn run(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                tex: Texture2D<f32>,
+                samp: Sampler,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let c = sample_it(tex, samp, vec2(gid.xy));
+                out_img.store(ivec2(gid.xy), c);
+            }
+        ";
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier0Raster, HardwareCaps::empty());
+        assert!(!diags.has_errors(), "{diags:?}");
+        let helper = hir.find_function("sample_it").expect("sample_it");
+        assert!(
+            helper.body_hir.is_none(),
+            "inlined pub image helper body should be dropped when no longer referenced"
         );
     }
 }

@@ -17,12 +17,17 @@ use indexmap::{IndexMap, IndexSet};
 use smol_str::SmolStr;
 use std::path::PathBuf;
 use vsl_diagnostics::{Diagnostic, FileId, SourceDatabase, Span};
-use vsl_glsl::{emit_glsl_460, emit_raster_gbuffer_hook_slot_with_schema};
+use vsl_glsl::{
+    BindlessAbi, EmitOptions as GlslEmitOptions, emit_glsl_460_with_options,
+    emit_raster_gbuffer_hook_slot_with_schema,
+};
 use vsl_hir::module::{L1ModuleHash, ModuleGraph, compute_l2_artifact_hash};
 use vsl_hir::{
-    HirFunction, HirModule, PackSchema, ValidationSummary, lower_unit_with_schema, validate_unit,
+    HirFunction, HirModule, PackSchema, ValidationSummary, lower_unit_with_schema_and_abi,
+    validate_unit,
 };
 use vsl_ir::PassPipeline;
+pub use vsl_mc::AbiProfile;
 use vsl_mc::{
     CompiledShaderUnit, HardwareCaps, HookAbiRoute, HookStage, PackParamType, RenderTier,
     ShaderStage, SpecConstantDefault,
@@ -40,6 +45,8 @@ use vsl_syntax::{ParseResult, parse_source};
 pub struct CompileOptions {
     pub tier: RenderTier,
     pub active_caps: HardwareCaps,
+    /// Target descriptor/ABI profile (`Hyaloclast` by default, or `Standalone` for generic Vulkan 1.3+).
+    pub abi: AbiProfile,
     /// Active specialization-constant values keyed by setting name (encoded as raw `u32` bits).
     pub spec_values: IndexMap<SmolStr, u32>,
     /// Optional `pack.vsl` schema providing pack-global `spec_id`s, typed defaults, BDA parameter
@@ -67,6 +74,7 @@ impl CompileOptions {
         Self {
             tier,
             active_caps,
+            abi: AbiProfile::Hyaloclast,
             spec_values: IndexMap::new(),
             pack_schema: None,
             driver_uuid: [0u8; 16],
@@ -522,11 +530,13 @@ impl VslCompiler {
         let mut diagnostics = parsed.diagnostics;
         let has_parse_errors = diagnostics.iter().any(Diagnostic::is_error);
 
-        let pack_schema_hash = hash_pack_schema(options.pack_schema.as_ref());
+        let mut pack_schema_hash = hash_pack_schema(options.pack_schema.as_ref());
+        pack_schema_hash[31] ^= options.abi.as_u8();
         let l1_key = L1CacheKey {
             hash: l1_hash,
             tier: options.tier,
             active_caps: options.active_caps,
+            abi: options.abi,
             pack_schema_hash,
         };
 
@@ -536,11 +546,12 @@ impl VslCompiler {
         {
             cached_hir.clone()
         } else {
-            let (lowered_hir, hir_diags) = lower_unit_with_schema(
+            let (lowered_hir, hir_diags) = lower_unit_with_schema_and_abi(
                 &parsed.unit,
                 options.tier,
                 options.active_caps,
                 options.pack_schema.as_ref(),
+                options.abi,
             );
             diagnostics.extend(hir_diags.into_vec());
             if allow_l1_cache && !diagnostics.iter().any(Diagnostic::is_error) {
@@ -750,6 +761,16 @@ impl VslCompiler {
         file_name: impl Into<String>,
         source: &str,
     ) -> GlslCompileOutput {
+        self.compile_shader_to_glsl_with_abi(file_name, source, AbiProfile::Hyaloclast)
+    }
+
+    /// Parses, validates, and emits Stage A GLSL 460 oracle source for the requested [`AbiProfile`].
+    pub fn compile_shader_to_glsl_with_abi(
+        &mut self,
+        file_name: impl Into<String>,
+        source: &str,
+        abi: AbiProfile,
+    ) -> GlslCompileOutput {
         let file = self.sources.add_file(file_name, source);
         let parsed = parse_source(file, source);
         let mut diagnostics = parsed.diagnostics;
@@ -760,7 +781,18 @@ impl VslCompiler {
         let glsl = if diagnostics.iter().any(Diagnostic::is_error) {
             String::new()
         } else {
-            emit_glsl_460(&parsed.unit)
+            let bindless_abi = match abi {
+                AbiProfile::Hyaloclast => BindlessAbi::Hyaloclast4096,
+                AbiProfile::Standalone => BindlessAbi::UpstreamUnsized,
+            };
+            emit_glsl_460_with_options(
+                &parsed.unit,
+                GlslEmitOptions {
+                    route_params_to_vs_motion: false,
+                    bindless_abi,
+                    abi,
+                },
+            )
         };
 
         GlslCompileOutput {
@@ -935,6 +967,7 @@ fn find_ast_function<'a>(items: &'a [Item], name: &str) -> Option<&'a FnDecl> {
 mod tests {
     use super::*;
     use std::process::Command;
+    use vsl_hir::lower_unit_with_schema;
     use vsl_ir::{GlslStd450Op, InstData, IrType, ScalarIrTy};
     use vsl_mc::{BINDLESS_IMAGE_COUNT, DescriptorKind, ImageFormat};
     use vsl_pack::{PassBindingRef, PassKind, PassMeta, PassNode, TargetDecl};
@@ -1968,5 +2001,377 @@ mod tests {
             chain1.cache_key, chain2.cache_key,
             "hook chain L2 cache_key must change when any hook module source changes"
         );
+    }
+
+    #[test]
+    fn user_rwbuffer_struct_layout_and_field_mutation_pass_spirv_val() {
+        let src = r"
+            module test::ssbo_struct;
+            import std::sync::{Scope, Order, atomic_add};
+
+            #[layout(std430)]
+            struct Particle {
+                pos: vec4,
+                vel: vec3,
+                mass: f32,
+                count: u32,
+                xform: mat4,
+            }
+
+            @stage(compute(64, 1, 1))
+            pub fn step_particles(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                in_buf: Buffer<Particle>,
+                out_buf: RWBuffer<Particle>,
+            ) {
+                let i = gid.x;
+                let p = in_buf[i].pos;
+                let m = in_buf[i].xform;
+                let next_pos = m * p + vec4(in_buf[i].vel * in_buf[i].mass, 0.0);
+                out_buf[i].pos = next_pos;
+                out_buf[i].mass = in_buf[i].mass + 1.0;
+                out_buf[i].count = in_buf[i].count + 1u;
+                atomic_add::<Scope::Device, Order::Relaxed>(&out_buf[i].count, 1u);
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let out =
+            compiler.compile_shader_source("ssbo_struct.vsl", src, &CompileOptions::default());
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        validate_spirv_with_spirv_val("user_rwbuffer_struct", &out.units[0].spirv);
+    }
+
+    #[test]
+    fn gi_cache_accumulate_bda_struct_field_atomics_passes_spirv_val() {
+        let gi_cache_src = include_str!("../../../examples/sunlit_vanilla/gi_cache.vsl");
+        let entry_src = r"
+            module pack::gi_entry;
+            import pack::gi_cache::{CacheCell, cache_accumulate};
+
+            struct PushData {
+                keys_addr: ptr_mut<u64, align = 8>,
+                cells_addr: ptr_mut<CacheCell, align = 16>,
+                mask: u32,
+            }
+
+            #[cap(int64_atomics)]
+            @stage(compute(8, 8, 1))
+            pub fn accumulate_entry(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                #[push_constant] pc: PushData,
+            ) {
+                let key = u64(gid.x) + (u64(gid.y) << 16u64) + 1u64;
+                let ok = cache_accumulate(
+                    pc.keys_addr,
+                    pc.cells_addr,
+                    pc.mask,
+                    key,
+                    vec3(0.25, 0.5, 0.75),
+                );
+                if ok {
+                    let c = pc.cells_addr.offset(i64(gid.x & pc.mask));
+                    let _r = c.rad_r;
+                }
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let files = vec![
+            ("gi_cache.vsl".to_owned(), gi_cache_src.to_owned()),
+            ("gi_entry.vsl".to_owned(), entry_src.to_owned()),
+        ];
+        let out = compiler.compile_project(&files, &CompileOptions::default());
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        validate_spirv_with_spirv_val("gi_cache_accumulate", &out.units[0].spirv);
+    }
+
+    #[test]
+    fn bda_struct_direct_field_read_write_and_nested_field_pass_spirv_val() {
+        let src = r"
+            module test::bda_fields;
+            import std::sync::{Scope, Order, atomic_add};
+
+            #[layout(std430)]
+            struct Inner {
+                counter: u32,
+                weight: f32,
+            }
+
+            #[layout(std430)]
+            struct Outer {
+                header: vec4,
+                inner: Inner,
+            }
+
+            struct PushData {
+                ptr: ptr_mut<Outer, align = 16>,
+            }
+
+            @stage(compute(8, 8, 1))
+            pub fn test_bda(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                #[push_constant] pc: PushData,
+            ) {
+                let o = pc.ptr.offset(i64(gid.x));
+                let h = o.header;
+                o.header = h + vec4(1.0);
+                o.inner.weight += 0.5;
+                atomic_add::<Scope::Device, Order::Relaxed>(&o.inner.counter, 1u);
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let out = compiler.compile_shader_source("bda_fields.vsl", src, &CompileOptions::default());
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        validate_spirv_with_spirv_val("bda_struct_fields", &out.units[0].spirv);
+    }
+
+    #[test]
+    fn pub_image_param_helper_cross_module_project_passes_spirv_val() {
+        let helper_src = r"
+            module pack::tex_helpers;
+
+            pub fn sample_albedo(tex: Texture2D<f32>, samp: Sampler, uv: vec2) -> vec4 {
+                tex.sample_lod(samp, uv, 0.0)
+            }
+        ";
+        let entry_src = r"
+            module pack::main_pass;
+            import pack::tex_helpers::sample_albedo;
+
+            @stage(compute(8, 8, 1))
+            pub fn main_cs(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                albedo: Texture2D<f32>,
+                samp: Sampler,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let uv = vec2(gid.xy) / 64.0;
+                let col = sample_albedo(albedo, samp, uv);
+                out_img.store(ivec2(gid.xy), col);
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let files = vec![
+            ("tex_helpers.vsl".to_owned(), helper_src.to_owned()),
+            ("main_pass.vsl".to_owned(), entry_src.to_owned()),
+        ];
+        let out = compiler.compile_project(&files, &CompileOptions::default());
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        validate_spirv_with_spirv_val("pub_image_helper", &out.units[0].spirv);
+    }
+
+    #[test]
+    fn shadow_dref_sampling_op_type_image_depth_passes_spirv_val() {
+        let src = r"
+            module test::shadow_dref;
+
+            @stage(compute(8, 8, 1))
+            pub fn shadow_cs(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                shadow_map: Texture2D<f32>,
+                shadow_samp: SamplerShadow,
+                out_img: RWImage2D<rgba16f>,
+            ) {
+                let uv = vec2(gid.xy) / 64.0;
+                let vis = shadow_map.sample_compare_lod(shadow_samp, uv, 0.5, 0.0);
+                out_img.store(ivec2(gid.xy), vec4(vis, vis, vis, 1.0));
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let out =
+            compiler.compile_shader_source("shadow_dref.vsl", src, &CompileOptions::default());
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        validate_spirv_with_spirv_val("shadow_dref", &out.units[0].spirv);
+    }
+
+    #[test]
+    fn standalone_abi_compute_explicit_bindings_and_no_world_ubo() {
+        let src = r"
+            module standalone::compute;
+
+            #[layout(std430)]
+            struct Item {
+                val: vec4,
+            }
+
+            @stage(compute(32, 1, 1))
+            pub fn cs_main(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                #[binding(set = 0, binding = 0)] src_buf: Buffer<Item>,
+                #[binding(set = 1, binding = 2)] dst_buf: RWBuffer<Item>,
+                auto_img: RWImage2D<rgba16f>,
+            ) {
+                let v = src_buf[gid.x].val;
+                dst_buf[gid.x].val = v * 2.0;
+                auto_img.store(ivec2(gid.xy), v);
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier0Raster);
+        opts.abi = AbiProfile::Standalone;
+        let out = compiler.compile_shader_source("standalone_cs.vsl", src, &opts);
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        let unit = &out.units[0];
+        assert!(
+            !unit.descriptors.iter().any(|d| d.name == "world"),
+            "Standalone mode must not auto-inject WorldUBO: {:?}",
+            unit.descriptors
+        );
+        assert_eq!(unit.descriptors.len(), 3);
+        assert_eq!(
+            (unit.descriptors[0].set, unit.descriptors[0].binding),
+            (0, 0)
+        );
+        assert_eq!(
+            (unit.descriptors[1].set, unit.descriptors[1].binding),
+            (0, 1)
+        );
+        assert_eq!(
+            (unit.descriptors[2].set, unit.descriptors[2].binding),
+            (1, 2)
+        );
+        validate_spirv_with_spirv_val("standalone_compute", &unit.spirv);
+    }
+
+    #[test]
+    fn standalone_abi_unsized_bindless_texture_array_passes_spirv_val() {
+        let src = r"
+            module standalone::bindless;
+
+            @stage(compute(8, 8, 1))
+            pub fn bindless_cs(
+                #[builtin(global_invocation_id)] gid: uvec3,
+                #[binding(set = 0, binding = 0)] textures: Texture2D<f32>[],
+                #[binding(set = 0, binding = 1)] samp: Sampler,
+                #[binding(set = 0, binding = 2)] out_img: RWImage2D<rgba16f>,
+            ) {
+                let idx = nonuniform(gid.x & 15u);
+                let col = textures[idx].sample_lod(samp, vec2(0.5, 0.5), 0.0);
+                out_img.store(ivec2(gid.xy), col);
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier0Raster);
+        opts.abi = AbiProfile::Standalone;
+        let out = compiler.compile_shader_source("standalone_bindless.vsl", src, &opts);
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 1);
+        let unit = &out.units[0];
+        assert!(unit.descriptors[0].is_unsized);
+        assert_eq!(unit.descriptors[0].count, None);
+        assert_eq!(unit.descriptors[0].kind, DescriptorKind::SampledImage);
+        validate_spirv_with_spirv_val("standalone_bindless", &unit.spirv);
+    }
+
+    #[test]
+    fn standalone_abi_vertex_and_fragment_without_mc_pass_spirv_val() {
+        let src = r"
+            module standalone::raster;
+
+            struct PushMvp {
+                mvp: mat4,
+                tint: vec4,
+            }
+
+            @stage(vertex)
+            pub fn vs_main(
+                #[location(0)] in_pos: vec3,
+                #[location(1)] in_uv: vec2,
+                #[push_constant] pc: PushMvp,
+                #[builtin(position)] out clip_pos: vec4,
+                #[location(0)] out v_uv: vec2,
+            ) {
+                clip_pos = pc.mvp * vec4(in_pos, 1.0);
+                v_uv = in_uv;
+            }
+
+            @stage(fragment)
+            pub fn fs_main(
+                #[location(0)] v_uv: vec2,
+                #[binding(set = 0, binding = 0)] albedo: Texture2D<f32>,
+                #[binding(set = 0, binding = 1)] samp: Sampler,
+                #[push_constant] pc: PushMvp,
+                #[location(0)] out frag_color: vec4,
+            ) {
+                frag_color = albedo.sample(samp, v_uv) * pc.tint;
+            }
+        ";
+        let mut compiler = VslCompiler::new();
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier0Raster);
+        opts.abi = AbiProfile::Standalone;
+        let out = compiler.compile_shader_source("standalone_raster.vsl", src, &opts);
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert_eq!(out.units.len(), 2);
+        for unit in &out.units {
+            assert!(
+                !unit.descriptors.iter().any(|d| d.name == "world"),
+                "Standalone raster shader must not inject WorldUBO: {:?}",
+                unit.descriptors
+            );
+            validate_spirv_with_spirv_val(&unit.entry_point, &unit.spirv);
+        }
+    }
+
+    #[test]
+    fn sunlit_vanilla_examples_all_compile_and_pass_spirv_val() {
+        let pack_src = include_str!("../../../examples/sunlit_vanilla/pack.vsl");
+        let pack_parsed = parse_source(FileId(0), pack_src);
+        assert!(!pack_parsed.has_errors(), "{:?}", pack_parsed.diagnostics);
+        let (pipeline, eval_diags) = vsl_pack::evaluate_pack_vsl(
+            &pack_parsed.unit,
+            &vsl_pack::EvalConfig {
+                tier: RenderTier::Tier2RayQuery,
+                ..vsl_pack::EvalConfig::default()
+            },
+        );
+        assert!(!eval_diags.has_errors(), "{eval_diags:?}");
+        let schema = pack_schema_from_pipeline(&pipeline);
+
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
+        opts.pack_schema = Some(schema);
+
+        let files = vec![
+            (
+                "gi_cache.vsl".to_owned(),
+                include_str!("../../../examples/sunlit_vanilla/gi_cache.vsl").to_owned(),
+            ),
+            (
+                "tiled_lighting.vsl".to_owned(),
+                include_str!("../../../examples/sunlit_vanilla/tiled_lighting.vsl").to_owned(),
+            ),
+            (
+                "reflections.vsl".to_owned(),
+                include_str!("../../../examples/sunlit_vanilla/reflections.vsl").to_owned(),
+            ),
+            (
+                "restir.vsl".to_owned(),
+                include_str!("../../../examples/sunlit_vanilla/restir.vsl").to_owned(),
+            ),
+            (
+                "fog.vsl".to_owned(),
+                include_str!("../../../examples/sunlit_vanilla/fog.vsl").to_owned(),
+            ),
+            (
+                "hooks_clouds.vsl".to_owned(),
+                include_str!("../../../examples/sunlit_vanilla/hooks_clouds.vsl").to_owned(),
+            ),
+            (
+                "hooks_water.vsl".to_owned(),
+                include_str!("../../../examples/sunlit_vanilla/hooks_water.vsl").to_owned(),
+            ),
+        ];
+
+        let mut compiler = VslCompiler::new();
+        let out = compiler.compile_project(&files, &opts);
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        assert!(!out.units.is_empty(), "expected compiled shader units");
+        for unit in &out.units {
+            validate_spirv_with_spirv_val(&unit.entry_point, &unit.spirv);
+        }
     }
 }

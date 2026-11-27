@@ -1223,6 +1223,7 @@ fn compute_defined_in_loop(
     }
 
     let mut defined_in_loop: IndexSet<InstId> = IndexSet::new();
+    let mut loop_varying: IndexSet<InstId> = IndexSet::new();
     let mut changed = true;
     while changed {
         changed = false;
@@ -1232,6 +1233,7 @@ fn compute_defined_in_loop(
             }
             if direct_evals.contains(&id) {
                 defined_in_loop.insert(id);
+                loop_varying.insert(id);
                 changed = true;
                 continue;
             }
@@ -1239,9 +1241,10 @@ fn compute_defined_in_loop(
             let depends_on_loop = data
                 .operands()
                 .into_iter()
-                .any(|op| Some(op) == induction_init || defined_in_loop.contains(&op));
+                .any(|op| Some(op) == induction_init || loop_varying.contains(&op));
             if depends_on_loop {
                 defined_in_loop.insert(id);
+                loop_varying.insert(id);
                 changed = true;
                 continue;
             }
@@ -1280,6 +1283,7 @@ fn compute_defined_in_loop(
                     };
                 if aliases_loop_store {
                     defined_in_loop.insert(id);
+                    loop_varying.insert(id);
                     changed = true;
                 }
                 continue;

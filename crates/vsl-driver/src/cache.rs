@@ -7,19 +7,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use vsl_hir::PackSchema;
 use vsl_hir::module::L1ModuleHash;
-use vsl_mc::{CompiledShaderUnit, HardwareCaps, PackParamType, RenderTier};
+use vsl_mc::{AbiProfile, CompiledShaderUnit, HardwareCaps, PackParamType, RenderTier};
 
 /// Monotonic intra-process counter appended to temporary cache filenames so concurrent worker
 /// threads writing the same L2 key never race on the same temp file.
 static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Composite L1 cache key incorporating source/import hash, target tier, active hardware caps,
-/// and `pack.vsl` schema hash so HIR caching is sound across configurations.
+/// ABI profile, and `pack.vsl` schema hash so HIR caching is sound across configurations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct L1CacheKey {
     pub(crate) hash: L1ModuleHash,
     pub(crate) tier: RenderTier,
     pub(crate) active_caps: HardwareCaps,
+    pub(crate) abi: AbiProfile,
     pub(crate) pack_schema_hash: [u8; 32],
 }
 
