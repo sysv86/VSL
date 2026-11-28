@@ -127,11 +127,17 @@ the expected hit/miss values of 501 and 0. A separate pipeline with nested
 std140 shader record data and a callable invocation returned 526 and 9,
 matching its reference values.
 
+Position fetch was also executed with a bottom-level acceleration structure
+built with `VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR`.
+Both the native and GLSL ray-query backends returned the expected encoded
+triangle coordinates (1531 for a hit and 0 for a miss). This regression
+exposed a local-array read incorrectly hoisted ahead of its guarded store;
+the emitter now treats local loads as order-sensitive.
+
 Those host programs were temporary development fixtures, not part of the
 compiler or the example validation script. Actual micromap construction and
-traversal, position-fetch execution and performance benchmarking were not
-covered by those GPU tests. OMM and position-fetch shader generation were
-checked through SPIRV-Tools and the GLSL oracle instead.
+traversal and performance benchmarking were not covered by those GPU tests.
+OMM shader generation was checked through SPIRV-Tools and the GLSL oracle.
 
 ## Scope and references
 

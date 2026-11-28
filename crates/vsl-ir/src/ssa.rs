@@ -1465,12 +1465,13 @@ pub enum InstData {
 }
 
 impl InstData {
-    /// Reads whose result depends on mutable ray traversal or shader interface state.
+    /// Reads whose result depends on mutable memory, ray traversal or shader interface state.
     /// These may be eliminated when unused, but must not be speculated across control flow.
     pub const fn is_order_sensitive_read(&self) -> bool {
         matches!(
             self,
-            Self::RayQueryCommittedType(_)
+            Self::LocalLoad { .. }
+                | Self::RayQueryCommittedType(_)
                 | Self::RayQueryCandidateType(_)
                 | Self::RayQueryCommittedT(_)
                 | Self::RayQueryCandidateT(_)

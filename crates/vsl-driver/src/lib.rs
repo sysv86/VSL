@@ -3034,6 +3034,77 @@ mod tests {
     }
 
     #[test]
+    fn position_fetch_array_loads_follow_the_guarded_store() {
+        let units = compile_standalone_and_validate(
+            "position_fetch_guarded_array",
+            r"
+            #[cap(ray_query, position_fetch)]
+            @stage(compute(1, 1, 1))
+            fn query_main(
+                #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+                #[binding(set = 0, binding = 1)] result: RWBuffer<u32>,
+            ) {
+                let rq: RayQuery;
+                rq.initialize(tlas, 0u, 255u, vec3(0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0);
+                while rq.proceed() {
+                    if rq.candidate_type() == 0u { rq.confirm_intersection(); }
+                }
+                let mut value = 0u;
+                if rq.committed_type() == 1u {
+                    let vertices: [vec3; 3] = rq.committed_triangle_vertex_positions();
+                    value = u32((vertices[0u].z + vertices[1u].z + vertices[2u].z) * 100.0);
+                }
+                result[0u] = value;
+            }
+            ",
+            false,
+        );
+        let instructions: Vec<_> = spirv_instructions(&units[0].spirv).collect();
+        let (fetch_index, fetched) = instructions
+            .iter()
+            .enumerate()
+            .find(|(_, (op, _))| *op == 5340)
+            .map(|(index, (_, args))| (index, args[1]))
+            .expect("missing position fetch");
+        let (store_index, array) = instructions
+            .iter()
+            .enumerate()
+            .find(|(_, (op, args))| *op == 62 && args[1] == fetched)
+            .map(|(index, (_, args))| (index, args[0]))
+            .expect("missing fetched array store");
+        let pointers: Vec<_> = instructions
+            .iter()
+            .filter(|(op, args)| *op == 65 && args[2] == array)
+            .map(|(_, args)| args[1])
+            .collect();
+        let block = |index: usize| {
+            instructions[..index]
+                .iter()
+                .rev()
+                .find(|(op, _)| *op == 248)
+                .map(|(_, args)| args[0])
+        };
+        assert!(store_index > fetch_index);
+        assert_eq!(block(store_index), block(fetch_index));
+        let mut loads = 0;
+        for (index, (op, args)) in instructions.iter().enumerate() {
+            if *op == 61 && pointers.contains(&args[2]) {
+                assert!(
+                    index > store_index,
+                    "local array read before initialization"
+                );
+                assert_eq!(
+                    block(index),
+                    block(store_index),
+                    "local array read escaped hit guard"
+                );
+                loads += 1;
+            }
+        }
+        assert_eq!(loads, 3);
+    }
+
+    #[test]
     fn ray_query_inferred_intersection_types_validate() {
         compile_standalone_and_validate(
             "ray_query_inferred_types",
