@@ -12948,4 +12948,242 @@ mod tests {
         );
         validate_with_spirv_val_if_available(&words64, "i64_arith");
     }
+
+    #[test]
+    fn emits_rt_pipeline_and_mesh_and_legacy_stages() {
+        // 1. RayGen with OpTraceRayKHR
+        let mut rg = IrFunction::new("rgen_main");
+        rg.stage = Some(ShaderStage::RayGen);
+        rg.descriptors.push(IrDescriptorVar {
+            name: "tlas".into(),
+            set: 0,
+            binding: 0,
+            kind: DescriptorKind::AccelerationStructure,
+            dim: None,
+            sample_scalar: None,
+            image_format: None,
+            access: DescriptorAccess::ReadOnly,
+            is_unsized: false,
+            count: None,
+            struct_layout: None,
+        });
+        rg.stage_vars.push(IrStageVar {
+            name: "payload".into(),
+            storage_class: IrStorageClass::RayPayloadKhr,
+            ty: IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 4,
+            },
+            location: Some(0),
+            struct_layout: None,
+        });
+        let u0 = rg.emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(0));
+        let f0 = rg.emit_typed(IrType::Scalar(ScalarIrTy::F32), InstData::const_f32(0.0));
+        let f1 = rg.emit_typed(IrType::Scalar(ScalarIrTy::F32), InstData::const_f32(1.0));
+        let f100 = rg.emit_typed(IrType::Scalar(ScalarIrTy::F32), InstData::const_f32(100.0));
+        let orig = rg.emit_typed(
+            IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 3,
+            },
+            InstData::CompositeConstruct {
+                components: vec![f0, f0, f0],
+            },
+        );
+        let dir = rg.emit_typed(
+            IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 3,
+            },
+            InstData::CompositeConstruct {
+                components: vec![f0, f0, f1],
+            },
+        );
+        let trace = rg.emit_typed(
+            IrType::Void,
+            InstData::TraceRayKhr {
+                accel_descriptor_index: 0,
+                ray_flags: u0,
+                cull_mask: u0,
+                sbt_offset: u0,
+                sbt_stride: u0,
+                miss_index: u0,
+                origin: orig,
+                tmin: f0,
+                direction: dir,
+                tmax: f100,
+                payload_var_index: 0,
+            },
+        );
+        rg.body.push(StructuredStmt::Eval(trace));
+        let rg_words = emit_module_spirv(&IrModule {
+            name: "pack::rt_pipeline".into(),
+            functions: vec![rg],
+        });
+        let rg_insts = decode_instructions(&rg_words);
+        assert!(rg_insts.iter().any(|&(op, ops)| op == spirv::Op::Capability as u32 && ops == [4479]));
+        assert!(rg_insts.iter().any(|&(op, _)| op == 4445)); // OpTraceRayKHR
+
+        // 2. Mesh stage with OpSetMeshOutputsEXT + OutputVertices/OutputPrimitivesEXT/OutputTrianglesEXT
+        let mut ms = IrFunction::new("mesh_main");
+        ms.stage = Some(ShaderStage::Mesh);
+        ms.workgroup_size = Some([32, 1, 1]);
+        ms.stage_exec_meta.max_vertices = Some(64);
+        ms.stage_exec_meta.max_primitives = Some(126);
+        ms.stage_exec_meta.output_topology = Some(IrTopology::Triangles);
+        let v3 = ms.emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(3));
+        let p1 = ms.emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(1));
+        let set_out = ms.emit_typed(
+            IrType::Void,
+            InstData::SetMeshOutputsExt {
+                vertex_count: v3,
+                primitive_count: p1,
+            },
+        );
+        ms.body.push(StructuredStmt::Eval(set_out));
+        let ms_words = emit_module_spirv(&IrModule {
+            name: "pack::mesh_stage".into(),
+            functions: vec![ms],
+        });
+        let ms_insts = decode_instructions(&ms_words);
+        assert!(ms_insts.iter().any(|&(op, ops)| op == spirv::Op::Capability as u32 && ops == [5283]));
+        assert!(ms_insts.iter().any(|&(op, _)| op == 5295)); // OpSetMeshOutputsEXT
+
+        // 3. Geometry stage with OpEmitVertex + OpEndPrimitive
+        let mut gs = IrFunction::new("geom_main");
+        gs.stage = Some(ShaderStage::Geometry);
+        gs.stage_exec_meta.max_vertices = Some(3);
+        gs.stage_exec_meta.input_topology = Some(IrTopology::Triangles);
+        gs.stage_exec_meta.output_topology = Some(IrTopology::TriangleStrip);
+        let ev = gs.emit_typed(IrType::Void, InstData::EmitVertex);
+        let ep = gs.emit_typed(IrType::Void, InstData::EndPrimitive);
+        gs.body.push(StructuredStmt::Eval(ev));
+        gs.body.push(StructuredStmt::Eval(ep));
+        let gs_words = emit_module_spirv(&IrModule {
+            name: "pack::geom_stage".into(),
+            functions: vec![gs],
+        });
+        let gs_insts = decode_instructions(&gs_words);
+        assert!(gs_insts.iter().any(|&(op, _)| op == spirv::Op::EmitVertex as u32));
+        assert!(gs_insts.iter().any(|&(op, _)| op == spirv::Op::EndPrimitive as u32));
+    }
+
+    #[test]
+    fn emits_ser_coop_matrix_raster_subgroups_and_debug_info() {
+        // 1. Cooperative Matrix
+        let mut cm = IrFunction::new("coop_main");
+        cm.stage = Some(ShaderStage::Compute);
+        cm.workgroup_size = Some([32, 1, 1]);
+        let mat_ty = IrType::CoopMatrix {
+            scalar: CoopMatrixScalar::F16,
+            scope: AtomicScope::Subgroup,
+            rows: 16,
+            cols: 16,
+            use_kind: CoopMatrixUse::MatrixA,
+        };
+        let len_id = cm.emit_typed(
+            IrType::Scalar(ScalarIrTy::U32),
+            InstData::CoopMatrixLength { mat_ty },
+        );
+        cm.body.push(StructuredStmt::Eval(len_id));
+        let cm_words = emit_module_spirv(&IrModule {
+            name: "pack::coop_matrix".into(),
+            functions: vec![cm],
+        });
+        let cm_insts = decode_instructions(&cm_words);
+        assert!(cm_insts.iter().any(|&(op, ops)| op == spirv::Op::Capability as u32 && ops == [6022]));
+        assert!(cm_insts.iter().any(|&(op, _)| op == 4456)); // OpTypeCooperativeMatrixKHR
+        assert!(cm_insts.iter().any(|&(op, _)| op == 4460)); // OpCooperativeMatrixLengthKHR
+
+        // 2. Raster: EarlyFragmentTests + Fragment Interlock + SubpassData + Dim2DMS
+        let mut frag = IrFunction::new("frag_raster");
+        frag.stage = Some(ShaderStage::Fragment);
+        frag.stage_exec_meta.early_fragment_tests = true;
+        frag.stage_exec_meta.interlock_mode = Some(IrInterlockMode::PixelOrdered);
+        frag.stage_exec_meta.input_attachment_indices.push((0, 0));
+        frag.descriptors.push(IrDescriptorVar {
+            name: "gbuf".into(),
+            set: 0,
+            binding: 0,
+            kind: DescriptorKind::InputAttachment,
+            dim: Some(TextureDim::SubpassData),
+            sample_scalar: Some(SampleScalar::F32),
+            image_format: None,
+            access: DescriptorAccess::ReadOnly,
+            is_unsized: false,
+            count: None,
+            struct_layout: None,
+        });
+        let b_il = frag.emit_typed(IrType::Void, InstData::BeginInvocationInterlockExt);
+        let sub_ld = frag.emit_typed(
+            IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 4,
+            },
+            InstData::SubpassLoad {
+                descriptor_index: 0,
+                sample: None,
+            },
+        );
+        let e_il = frag.emit_typed(IrType::Void, InstData::EndInvocationInterlockExt);
+        frag.body.push(StructuredStmt::Eval(b_il));
+        frag.body.push(StructuredStmt::Eval(sub_ld));
+        frag.body.push(StructuredStmt::Eval(e_il));
+        let frag_words = emit_module_spirv(&IrModule {
+            name: "pack::raster_ext".into(),
+            functions: vec![frag],
+        });
+        let frag_insts = decode_instructions(&frag_words);
+        assert!(frag_insts.iter().any(|&(op, _)| op == 5364)); // OpBeginInvocationInterlockEXT
+        assert!(frag_insts.iter().any(|&(op, _)| op == 5365)); // OpEndInvocationInterlockEXT
+        assert!(frag_insts.iter().any(|&(op, ops)| {
+            op == spirv::Op::ExecutionMode as u32
+                && ops.len() >= 2
+                && ops[1] == spirv::ExecutionMode::EarlyFragmentTests as u32
+        }));
+
+        // 3. Clustered Subgroup + QuadBroadcast + DebugInfo.100 + DebugPrintf
+        let mut dbg_fn = IrFunction::new("dbg_sg_main");
+        dbg_fn.stage = Some(ShaderStage::Compute);
+        dbg_fn.workgroup_size = Some([64, 1, 1]);
+        dbg_fn.debug_source = Some(vsl_ir::IrDebugSource {
+            file_name: "shader.vsl".into(),
+            source_text: Some("@compute fn dbg_sg_main() {}".into()),
+        });
+        let v = dbg_fn.emit_typed(IrType::Scalar(ScalarIrTy::F32), InstData::const_f32(1.5));
+        let cs = dbg_fn.emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(4));
+        let cl = dbg_fn.emit_typed(
+            IrType::Scalar(ScalarIrTy::F32),
+            InstData::SubgroupClustered {
+                op: SubgroupClusteredOp::Add,
+                value: v,
+                cluster_size: cs,
+            },
+        );
+        let pf = dbg_fn.emit_typed(
+            IrType::Void,
+            InstData::DebugPrintf {
+                format: "cl=%f".into(),
+                args: vec![cl],
+            },
+        );
+        dbg_fn.body.push(StructuredStmt::Eval(cl));
+        dbg_fn.body.push(StructuredStmt::Eval(pf));
+        let dbg_words = emit_module_spirv(&IrModule {
+            name: "pack::dbg_sg".into(),
+            functions: vec![dbg_fn],
+        });
+        let dbg_insts = decode_instructions(&dbg_words);
+        // Verify OpString appears BEFORE OpName per SPIR-V section 2.4
+        let first_string = dbg_insts
+            .iter()
+            .position(|&(op, _)| op == spirv::Op::String as u32)
+            .expect("expected OpString");
+        let first_name = dbg_insts
+            .iter()
+            .position(|&(op, _)| op == spirv::Op::Name as u32)
+            .expect("expected OpName");
+        assert!(first_string < first_name, "OpString must precede OpName");
+        assert!(dbg_insts.iter().any(|&(op, ops)| op == spirv::Op::Capability as u32 && ops == [67]));
+    }
 }

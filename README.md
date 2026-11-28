@@ -84,3 +84,14 @@ cargo run -p vsl-lsp
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+## Vulkan 1.3/1.4 Stage & Subsystem Foundation
+
+VSL supports the following shader stages and hardware extension foundations across HIR, SSA IR, and SPIR-V 1.6 emission:
+
+- **Stages**: `compute`, `vertex`, `fragment`, Ray Tracing Pipeline (`raygen`, `closest_hit`, `any_hit`, `miss`, `intersection`, `callable`), Mesh Pipeline (`task`, `mesh`), and Legacy Geometry (`tess_control`, `tess_eval`, `geometry`).
+- **RT Extensions**: Shader Execution Reordering (`VK_NV_shader_invocation_reorder` / `VK_EXT_ray_tracing_invocation_reorder` `HitObject`), Opacity Micromaps (`VK_EXT_opacity_micromap`), and Ray Position Fetch (`VK_KHR_ray_tracing_position_fetch`).
+- **Matrix / Tensor Cores**: Cooperative Matrix (`VK_KHR_cooperative_matrix` / Coop Matrix 2 types & ops).
+- **Advanced Rasterization**: `SubpassInput` / `VK_KHR_dynamic_rendering_local_read`, `Texture2DMS`, `SampleId`/`SamplePosition`/`SampleMask`, `OpDemoteToHelperInvocation`, VRS (`VK_KHR_fragment_shading_rate`), Fragment Interlock (`VK_EXT_fragment_shader_interlock`), Multiview (`ViewIndex`), `ClipDistance`/`CullDistance`, `FragDepth`, and `EarlyFragmentTests`.
+- **Compiler Base**: Full subgroup operations (ballot, broadcast, shuffle/relative, arithmetic, bitwise/logical, clustered, quad), explicit per-call `Sampler` binding, and 1D / texel-buffer textures (`Texture1D`, `RWImage1D`, `BufferView`, `RWBufferView`).
+- **GPU Debugging**: `NonSemantic.Shader.DebugInfo.100` (via `CompileOptions::emit_debug_info`) and `debug_printf` (`NonSemantic.DebugPrintf`).
