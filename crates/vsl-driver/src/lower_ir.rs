@@ -24,7 +24,7 @@ use vsl_ir::{
 use vsl_mc::{
     BuiltinStructDesc, DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS,
     DESCRIPTOR_SET_SCENE_GLOBALS, DescriptorAccess, DescriptorBinding, DescriptorKind,
-    EMISSIVE_LIGHT_LAYOUT, EMISSIVE_LIGHT_SSBO_LAYOUT, INSTANCE_META_LAYOUT,
+    EMISSIVE_LIGHT_LAYOUT, EMISSIVE_LIGHT_SSBO_LAYOUT, HardwareCaps, INSTANCE_META_LAYOUT,
     INSTANCE_META_SSBO_LAYOUT, ImageFormat, PackParamLayout, PackParamType,
     RESTIR_RESERVOIR_LAYOUT, RESTIR_RESERVOIR_SSBO_LAYOUT, ShaderStage, SpecConstantDefault,
     TextureDim, WORLD_UBO_LAYOUT, builtin_descriptor_layout,
@@ -98,6 +98,22 @@ pub(crate) fn lower_entry_module_to_ir(
         functions.push(helper_ir);
     }
 
+    let reachable_helpers = collect_reachable_helpers(hir, entry_fn);
+    for function in &functions {
+        let source = if function.name == entry_fn.name {
+            entry_fn
+        } else if let Some(helper) = reachable_helpers
+            .iter()
+            .copied()
+            .find(|helper| helper.name == function.name)
+        {
+            helper
+        } else {
+            continue;
+        };
+        validate_rt_instruction_stages(function, stage, source.span, &mut diagnostics);
+    }
+
     LoweredEntryModule {
         ir_module: IrModule {
             name: hir.module_name.clone(),
@@ -105,6 +121,67 @@ pub(crate) fn lower_entry_module_to_ir(
         },
         unified_descriptors,
         diagnostics,
+    }
+}
+
+fn validate_rt_instruction_stages(
+    function: &IrFunction,
+    stage: ShaderStage,
+    span: Span,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let trace_stage = matches!(
+        stage,
+        ShaderStage::RayGen | ShaderStage::ClosestHit | ShaderStage::Miss
+    );
+    for (_, inst) in function.insts.iter() {
+        let (name, allowed, ser) = match inst.data {
+            InstData::TraceRayKhr { .. } => ("trace_ray", trace_stage, false),
+            InstData::ExecuteCallableKhr { .. } => (
+                "execute_callable",
+                trace_stage || stage == ShaderStage::Callable,
+                false,
+            ),
+            InstData::IgnoreIntersectionKhr => {
+                ("ignore_intersection", stage == ShaderStage::AnyHit, false)
+            }
+            InstData::TerminateRayKhr => ("terminate_ray", stage == ShaderStage::AnyHit, false),
+            InstData::ReportIntersectionKhr { .. } => (
+                "report_intersection",
+                stage == ShaderStage::Intersection,
+                false,
+            ),
+            InstData::ReorderThreadWithHint { .. }
+            | InstData::ReorderThreadWithHitObject { .. } => {
+                ("SER reordering", stage == ShaderStage::RayGen, true)
+            }
+            InstData::HitObjectTraceRay { .. }
+            | InstData::HitObjectRecordEmpty(_)
+            | InstData::HitObjectIsHit(_)
+            | InstData::HitObjectGetRayTMax(_)
+            | InstData::HitObjectGetSbtRecordIndex(_)
+            | InstData::HitObjectExecuteShader { .. } => ("HitObject operation", trace_stage, true),
+            _ => continue,
+        };
+        if !allowed {
+            diagnostics.push(Diagnostic::error(
+                "E0520",
+                format!("`{name}` is not allowed in the {stage:?} shader stage"),
+                span,
+            ));
+        }
+        if ser
+            && !function.required_caps.intersects(
+                HardwareCaps::SHADER_INVOCATION_REORDER
+                    | HardwareCaps::SHADER_INVOCATION_REORDER_EXT,
+            )
+        {
+            diagnostics.push(Diagnostic::error(
+                "E0520",
+                format!("`{name}` requires `#[cap(ser_nv)]` or `#[cap(ser_ext)]`"),
+                span,
+            ));
+        }
     }
 }
 
@@ -4758,6 +4835,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 return Ok(id);
             }
             "reorder_thread_with_hint" => {
+                if args.len() != 2 {
+                    return Err(self.emit_diag(
+                        "E0528",
+                        "`reorder_thread_with_hint` requires exactly 2 arguments",
+                        span,
+                    ));
+                }
                 let hint = self.require_arg(args, 0, joined, span, out)?;
                 let bits = self.require_arg(args, 1, joined, span, out)?;
                 let id = self
@@ -4767,9 +4851,24 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 return Ok(id);
             }
             "reorder_thread_with_hit_object" => {
-                let hit_object_id = args
-                    .first()
-                    .map_or(0, |a| self.hit_object_id_for_receiver(&a.value));
+                if !matches!(args.len(), 1 | 3) {
+                    return Err(self.emit_diag(
+                        "E0528",
+                        "`reorder_thread_with_hit_object` requires 1 or 3 arguments",
+                        span,
+                    ));
+                }
+                let receiver = &args[0].value;
+                if !matches!(self.hir.types.get(receiver.ty), Type::HitObject)
+                    || !matches!(&receiver.kind, HirExprKind::Path { .. })
+                {
+                    return Err(self.emit_diag(
+                        "E0525",
+                        "`reorder_thread_with_hit_object` requires a HitObject variable",
+                        span,
+                    ));
+                }
+                let hit_object_id = self.hit_object_id_for_receiver(receiver);
                 let hint = if args.len() >= 3 {
                     Some(self.require_arg(args, 1, joined, span, out)?)
                 } else {

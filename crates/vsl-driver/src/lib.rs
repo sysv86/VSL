@@ -2435,6 +2435,51 @@ mod tests {
     }
 
     #[test]
+    fn rt_stage_and_ser_capability_validation() {
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
+        opts.abi = AbiProfile::Standalone;
+        opts.active_caps = HardwareCaps::all();
+        for (src, expected) in [
+            (
+                "@stage(compute(1, 1, 1)) fn main() { terminate_ray(); }",
+                "not allowed",
+            ),
+            (
+                "@raygen fn main() { report_intersection(1.0, 0u); }",
+                "not allowed",
+            ),
+            (
+                "#[cap(ser_nv)] @miss fn main() { reorder_thread_with_hint(0u, 1u); }",
+                "not allowed",
+            ),
+            (
+                "@raygen fn main() { reorder_thread_with_hint(0u, 1u); }",
+                "requires `#[cap(ser_nv)]`",
+            ),
+            (
+                "#[cap(ser_ext)] @raygen fn main() { let ho: HitObject; reorder_thread_with_hit_object(ho, 1u); }",
+                "requires 1 or 3 arguments",
+            ),
+            (
+                "#[cap(ser_ext)] @raygen fn main() { reorder_thread_with_hit_object(0u); }",
+                "requires a HitObject variable",
+            ),
+            (
+                "fn helper() { ignore_intersection(); } @raygen fn main() { helper(); }",
+                "not allowed",
+            ),
+        ] {
+            let out = VslCompiler::new().compile_shader_source("invalid_rt.vsl", src, &opts);
+            assert!(out.has_errors(), "invalid RT source compiled: {src}");
+            assert!(
+                out.diagnostics.iter().any(|d| d.message.contains(expected)),
+                "{src}: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    #[test]
     fn rt_calls_require_matching_interface_storage_classes() {
         let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
         opts.abi = AbiProfile::Standalone;
