@@ -1,0 +1,34 @@
+// The host traces one hit and one miss. Both shader calls mutate nested payload
+// fields rather than replacing the whole aggregate. Expected results: [501, 0].
+struct Inner { value: u32 }
+struct Payload { inner: Inner, samples: [u32; 2], color: vec4 }
+
+fn increment(inout p: Payload) { p.inner.value += 1u; }
+
+@raygen
+fn rgen(
+    #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+    #[binding(set = 0, binding = 1)] result: RWBuffer<u32>,
+    #[builtin(launch_id)] lid: uvec3,
+    #[ray_payload(0)] inout p: Payload,
+) {
+    p = Payload { inner: Inner { value: 999u }, samples: [0u, 0u], color: vec4(0.0) };
+    let origin = vec3(f32(lid.x) * 4.0, 0.0, 0.0);
+    trace_ray(tlas, 0u, 255u, 0u, 0u, 0u, origin, 0.001, vec3(0.0, 0.0, 1.0), 100.0, p);
+    result[lid.x] = p.inner.value + p.samples[1u] + u32(p.color.x + p.color.y);
+}
+
+@closest_hit
+fn rchit(#[incoming_ray_payload(0)] inout p: Payload) {
+    p.inner.value = 400u;
+    p.samples[1u] = 50u;
+    p.color.xy = vec2(20.0, 30.0);
+    increment(p);
+}
+
+@miss
+fn rmiss(#[incoming_ray_payload(0)] inout p: Payload) {
+    p.inner.value = 0u;
+    p.samples[1u] = 0u;
+    p.color.xy = vec2(0.0);
+}

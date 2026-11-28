@@ -224,6 +224,45 @@ pub enum RayInterfaceLink {
     ProceduralHit,
 }
 
+/// Checks the fixed-function triangle hit attribute ABI of an actual hit-group
+/// member. A shader that does not read hit attributes need not declare them.
+/// See the Vulkan specification, Ray Tracing Pipeline Interface.
+pub fn validate_triangle_hit_interface(target: &CompiledShaderUnit) -> Result<(), String> {
+    if !matches!(target.stage, ShaderStage::AnyHit | ShaderStage::ClosestHit) {
+        return Err(format!(
+            "{}: triangle hit interface requires an any-hit or closest-hit shader",
+            target.entry_point
+        ));
+    }
+    let mut attributes = target
+        .ray_interfaces
+        .iter()
+        .filter(|v| v.kind == RayInterfaceKind::HitAttribute);
+    let Some(attribute) = attributes.next() else {
+        return Ok(());
+    };
+    if attributes.next().is_some() {
+        return Err(format!(
+            "{}: multiple triangle hit attributes",
+            target.entry_point
+        ));
+    }
+    if attribute.location.is_some()
+        || attribute.record_layout.is_some()
+        || attribute.ty
+            != (RayInterfaceType::Vector {
+                scalar: RayScalar::F32,
+                len: 2,
+            })
+    {
+        return Err(format!(
+            "{}: triangle hit attribute must be an unlocated vec2 of f32 barycentrics",
+            target.entry_point
+        ));
+    }
+    Ok(())
+}
+
 /// Validates one concrete caller/target relation before creating an RT pipeline.
 /// Pass each possible runtime target separately, including targets selected through
 /// dynamic SBT indices. Missing incoming variables are reported, rather than silently

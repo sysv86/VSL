@@ -531,6 +531,9 @@ fn lower_unit_internal(
         }
 
         for field in &pending.hir_fields {
+            if module.types.contains_hit_object(field.ty) {
+                diags.push(Diagnostic::error("E0210", "`HitObject` is only supported as a standalone function-local variable, not a struct field", field.span));
+            }
             if !pending.direct_rq_fields.contains(&field.name)
                 && module.types.contains_ray_query(field.ty)
             {
@@ -733,6 +736,13 @@ fn lower_unit_internal(
                             "`RayQuery` is forbidden in `workgroup var {}`",
                             var.name.name
                         ),
+                        var.span,
+                    ));
+                }
+                if module.types.contains_hit_object(ty) {
+                    diags.push(Diagnostic::error(
+                        "E0212",
+                        "`HitObject` is forbidden in workgroup variables",
                         var.span,
                     ));
                 }
@@ -3503,6 +3513,13 @@ impl LowerCtx<'_> {
                 if self.module.types.contains_pointer(ty_id) {
                     uses_bda = true;
                 }
+                if self.module.types.contains_hit_object(ty_id) {
+                    self.diags.push(Diagnostic::error(
+                        "E0213",
+                        "`HitObject` is not supported as a function parameter",
+                        param.span,
+                    ));
+                }
                 if self.module.types.contains_ray_query(ty_id)
                     && param
                         .ty
@@ -3592,6 +3609,13 @@ impl LowerCtx<'_> {
 
         if let Some(ty_id) = return_ty {
             self.check_buffer_struct_bool(ty_id, func.span);
+            if self.module.types.contains_hit_object(ty_id) {
+                self.diags.push(Diagnostic::error(
+                    "E0214",
+                    "`HitObject` is not supported as a function return type",
+                    func.span,
+                ));
+            }
             if self.module.types.contains_ray_query(ty_id)
                 && func
                     .return_ty
@@ -5800,6 +5824,25 @@ impl BodyScanner<'_, '_> {
                     );
                     if let Some(ty_id) = resolved_ty {
                         self.ctx.check_buffer_struct_bool(ty_id, *span);
+                        if self.ctx.module.types.contains_hit_object(ty_id) {
+                            if !matches!(self.ctx.module.types.get(ty_id), Type::HitObject) {
+                                self.ctx.diags.push(Diagnostic::error(
+                                    "E0211",
+                                    "`HitObject` aggregates and pointers are not supported",
+                                    *span,
+                                ));
+                            }
+                            if !self.caps.intersects(
+                                HardwareCaps::SHADER_INVOCATION_REORDER
+                                    | HardwareCaps::SHADER_INVOCATION_REORDER_EXT,
+                            ) {
+                                self.ctx.diags.push(Diagnostic::error(
+                                    "E0233",
+                                    "`HitObject` requires `#[cap(ser_nv)]` or `#[cap(ser_ext)]`",
+                                    *span,
+                                ));
+                            }
+                        }
                     }
                     if let Some(ty_id) = resolved_ty
                         && self.ctx.module.types.requires_float16(ty_id)
@@ -5833,6 +5876,13 @@ impl BodyScanner<'_, '_> {
                         );
                     }
                     let (hir_init, inferred) = self.lower_expr(expr, false);
+                    if inferred.is_some_and(|t| self.ctx.module.types.contains_hit_object(t)) {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0217",
+                            "`HitObject` cannot be assigned or copied into another variable",
+                            *span,
+                        ));
+                    }
                     if let Some(ty_id) = inferred
                         && self.ctx.module.types.contains_ray_query(ty_id)
                     {
@@ -5877,6 +5927,13 @@ impl BodyScanner<'_, '_> {
             Stmt::Return { value, span } => {
                 let (hir_val, val_ty) = if let Some(expr) = value {
                     let (e, ty) = self.lower_expr(expr, false);
+                    if ty.is_some_and(|t| self.ctx.module.types.contains_hit_object(t)) {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0214",
+                            "`HitObject` cannot be returned from a function",
+                            *span,
+                        ));
+                    }
                     if let Some(ty_id) = ty
                         && self.ctx.module.types.contains_ray_query(ty_id)
                     {
@@ -7271,6 +7328,15 @@ impl BodyScanner<'_, '_> {
                 }
 
                 if matches!(op, BinaryOp::Assign) {
+                    if lhs_ty.is_some_and(|t| self.ctx.module.types.contains_hit_object(t))
+                        || rhs_ty.is_some_and(|t| self.ctx.module.types.contains_hit_object(t))
+                    {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0217",
+                            "`HitObject` cannot be assigned or copied",
+                            *span,
+                        ));
+                    }
                     if expr_yields_addr_of(rhs) {
                         self.ctx.diags.push(Diagnostic::error(
                             "E0215",
@@ -7406,6 +7472,16 @@ impl BodyScanner<'_, '_> {
                 } else {
                     (None, None)
                 };
+                if else_branch.is_some()
+                    && (then_ty.is_some_and(|t| self.ctx.module.types.contains_hit_object(t))
+                        || else_ty.is_some_and(|t| self.ctx.module.types.contains_hit_object(t)))
+                {
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0216",
+                        "`HitObject` values cannot be merged by an if-expression",
+                        *span,
+                    ));
+                }
                 if else_branch.is_some()
                     && (then_ty.is_some_and(|t| self.ctx.module.types.contains_ray_query(t))
                         || else_ty.is_some_and(|t| self.ctx.module.types.contains_ray_query(t)))
@@ -8414,6 +8490,16 @@ fn validate_monomorphized_struct(
     };
 
     for field in &fields {
+        if ctx.types.contains_hit_object(field.ty) {
+            diags.push(Diagnostic::error(
+                "E0210",
+                format!(
+                    "`HitObject` is forbidden inside struct `{mono_name}` field `{}`",
+                    field.name
+                ),
+                use_span,
+            ));
+        }
         if ctx.types.contains_ray_query(field.ty) {
             diags.push(
                 Diagnostic::error(

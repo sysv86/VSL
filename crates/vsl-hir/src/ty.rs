@@ -223,23 +223,35 @@ impl TypeArena {
     /// Returns `true` if `id` is `RayQuery` or transitively contains one.
     pub fn contains_ray_query(&self, id: TypeId) -> bool {
         let mut visited = Vec::new();
-        self.contains_ray_query_inner(id, &mut visited)
+        self.contains_opaque_ray_type(id, &Type::RayQuery, &mut visited)
     }
 
-    fn contains_ray_query_inner(&self, id: TypeId, visited: &mut Vec<TypeId>) -> bool {
+    /// Returns `true` if `id` is `HitObject` or transitively contains one.
+    pub fn contains_hit_object(&self, id: TypeId) -> bool {
+        self.contains_opaque_ray_type(id, &Type::HitObject, &mut Vec::new())
+    }
+
+    fn contains_opaque_ray_type(
+        &self,
+        id: TypeId,
+        needle: &Type,
+        visited: &mut Vec<TypeId>,
+    ) -> bool {
         if visited.contains(&id) {
             return false;
         }
         visited.push(id);
         let result = match &self.arena[id] {
-            Type::RayQuery => true,
+            ty if ty == needle => true,
             Type::Array { element, .. } | Type::Buffer { element } | Type::RwBuffer { element } => {
-                self.contains_ray_query_inner(*element, visited)
+                self.contains_opaque_ray_type(*element, needle, visited)
             }
-            Type::Pointer { pointee, .. } => self.contains_ray_query_inner(*pointee, visited),
+            Type::Pointer { pointee, .. } => {
+                self.contains_opaque_ray_type(*pointee, needle, visited)
+            }
             Type::Struct { fields, .. } => fields
                 .iter()
-                .any(|(_, field_ty)| self.contains_ray_query_inner(*field_ty, visited)),
+                .any(|(_, field_ty)| self.contains_opaque_ray_type(*field_ty, needle, visited)),
             _ => false,
         };
         visited.pop();

@@ -30,8 +30,10 @@ ray queries into KHR opacity micromap traversal; the legacy capability permits
 the force-two-state ray flag. A shader using both needs both capabilities.
 The compiler does not construct or attach opacity micromaps.
 
-Use one SER profile per compiled module. The EXT profile is selected when
-both profiles are present in its accumulated required capabilities.
+Use one SER profile per entry-point call graph. The compiler rejects a graph
+that requires both NV and EXT SER instead of silently changing instruction
+families. Independent entry points may select different profiles; unreachable
+helpers do not add their capabilities to the emitted module.
 Choose the profile supported by the target device, not merely its vendor name.
 
 ## Ray interfaces
@@ -94,6 +96,10 @@ fn validate_primary_ray(
 
 Use `RayInterfaceLink::Callable` for each callable edge and
 `RayInterfaceLink::ProceduralHit` for each intersection-to-hit edge.
+Use `validate_triangle_hit_interface` for each member of a triangle hit group;
+an explicitly declared triangle hit attribute must be a two-component f32 vector.
+The trace link requires an incoming payload even when the target does not read it,
+as specified by the [Vulkan ray tracing pipeline interface](https://docs.vulkan.org/spec/latest/chapters/interfaces.html).
 Type comparisons are structural and recursive: equal byte counts alone
 are insufficient. Struct names and member names are descriptive.
 The API validates edges explicitly selected by the application; it cannot infer
@@ -126,6 +132,15 @@ ray-query backends, the ordinary RT pipeline and both SER profiles produced
 the expected hit/miss values of 501 and 0. A separate pipeline with nested
 std140 shader record data and a callable invocation returned 526 and 9,
 matching its reference values.
+
+The aggregate payload regression exposed an independently validated SPIR-V
+module returning `[999, 999]` instead of `[501, 0]` on the same GPU. Synchronizing
+the root interface shadow after field, index, swizzle and mutable helper writes
+restored `[501, 0]`. The retained `differential/aggregate_pipeline.vsl` fixture
+also returned `[501, 0]` with nested fields, arrays, vector swizzles and an inout
+helper. HitObject handles are supported only as standalone local variables;
+copies, aggregate placement, and passing or returning them as ordinary values
+are diagnosed rather than lowered to an unrelated opaque handle.
 
 Position fetch was also executed with a bottom-level acceleration structure
 built with `VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR`.

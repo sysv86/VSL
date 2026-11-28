@@ -40,8 +40,8 @@ pub(crate) struct LoweredEntryModule {
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
-/// Lowers a validated entry-point [`HirFunction`] and all concrete non-entry helper functions in
-/// `hir` into a typed [`IrModule`].
+/// Lowers a validated entry-point [`HirFunction`] and its reachable concrete helpers into a
+/// typed [`IrModule`].
 pub(crate) fn lower_entry_module_to_ir(
     hir: &HirModule,
     entry_fn: &HirFunction,
@@ -70,10 +70,10 @@ pub(crate) fn lower_entry_module_to_ir(
 
     let mut functions = vec![entry_ir_fn];
 
-    // Lower every concrete non-entry helper function into a first-class `IrFunction` so
-    // `FunctionCall` instructions target real `IrModule::functions` entries and `SelectiveInlinePass`
-    // can inline small helpers cleanly.
-    for (_, helper) in hir.functions.iter() {
+    // Only the reachable call graph belongs to this module. An unrelated helper
+    // must not introduce device requirements, execution modes, or descriptors.
+    let reachable_helpers = collect_reachable_helpers(hir, entry_fn);
+    for helper in reachable_helpers.iter().copied() {
         if helper.name == entry_fn.name
             || helper.stage.is_some()
             || helper.hook.is_some()
@@ -98,7 +98,18 @@ pub(crate) fn lower_entry_module_to_ir(
         functions.push(helper_ir);
     }
 
-    let reachable_helpers = collect_reachable_helpers(hir, entry_fn);
+    let ser_profiles =
+        HardwareCaps::SHADER_INVOCATION_REORDER | HardwareCaps::SHADER_INVOCATION_REORDER_EXT;
+    let required_ser = functions.iter().fold(HardwareCaps::empty(), |caps, f| {
+        caps | (f.required_caps & ser_profiles)
+    });
+    if required_ser.contains(ser_profiles) {
+        diagnostics.push(Diagnostic::error(
+            "E0520",
+            "mixed NV and EXT SER profiles in a single entry-point call graph are not supported",
+            entry_fn.span,
+        ));
+    }
     for function in &functions {
         let source = if function.name == entry_fn.name {
             entry_fn
@@ -1596,32 +1607,18 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         self.ir_fn.emit_typed(IrType::Void, InstData::Nop)
     }
 
-    fn ray_query_id_for_receiver(&mut self, receiver: &HirExpr) -> u32 {
-        let key = match &receiver.kind {
-            HirExprKind::Path { path, .. } => path.clone(),
-            _ => SmolStr::new_static("__default_rq"),
+    fn ray_query_id_for_receiver(&self, receiver: &HirExpr) -> Option<u32> {
+        let HirExprKind::Path { path, .. } = &receiver.kind else {
+            return None;
         };
-        if let Some(&id) = self.ray_query_handles.get(&key) {
-            return id;
-        }
-        let next_id = self.next_ray_query_id;
-        self.next_ray_query_id = self.next_ray_query_id.saturating_add(1);
-        self.ray_query_handles.insert(key, next_id);
-        next_id
+        self.ray_query_handles.get(path).copied()
     }
 
-    fn hit_object_id_for_receiver(&mut self, receiver: &HirExpr) -> u32 {
-        let key = match &receiver.kind {
-            HirExprKind::Path { path, .. } => path.clone(),
-            _ => SmolStr::new_static("__default_ho"),
+    fn hit_object_id_for_receiver(&self, receiver: &HirExpr) -> Option<u32> {
+        let HirExprKind::Path { path, .. } = &receiver.kind else {
+            return None;
         };
-        if let Some(&id) = self.hit_object_handles.get(&key) {
-            return id;
-        }
-        let next_id = self.next_hit_object_id;
-        self.next_hit_object_id = self.next_hit_object_id.saturating_add(1);
-        self.hit_object_handles.insert(key, next_id);
-        next_id
+        self.hit_object_handles.get(path).copied()
     }
 
     fn clear_local_binding(&mut self, name: &SmolStr) {
@@ -2858,15 +2855,28 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         }
     }
 
-    fn flush_output_shadow_if_needed(
-        &mut self,
-        target: &HirExpr,
-        value: InstId,
-        out: &mut Vec<StructuredStmt>,
-    ) {
-        if let HirExprKind::Path { path, .. } = &target.kind
+    fn flush_output_shadow_if_needed(&mut self, target: &HirExpr, out: &mut Vec<StructuredStmt>) {
+        // Nested mutations affect the entire interface value. Reload its root
+        // shadow without evaluating any index expressions a second time.
+        let mut root = target;
+        loop {
+            root = match &root.kind {
+                HirExprKind::Field { receiver, .. } | HirExprKind::Index { receiver, .. } => {
+                    receiver
+                }
+                HirExprKind::Swizzle { base, .. } => base,
+                _ => break,
+            };
+        }
+        if let HirExprKind::Path { path, .. } = &root.kind
             && !path.contains("::")
+            && (self.stage_io_outputs.contains_key(path)
+                || self.stage_var_indices.contains_key(path)
+                || self.builtin_params.contains_key(path))
+            && let Some((slot, ty)) = self.local_var_slots.get(path).cloned()
         {
+            let ptr = emit_local_addr(self.ir_fn, slot, &ty);
+            let value = self.ir_fn.emit_typed(ty, InstData::LocalLoad { ptr });
             if let Some(&var_index) = self.stage_io_outputs.get(path) {
                 let store = self.ir_fn.emit_typed(
                     IrType::Void,
@@ -3103,6 +3113,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         },
                     );
                     out.push(StructuredStmt::Eval(store));
+                    self.flush_output_shadow_if_needed(receiver, out);
                     return final_val;
                 }
                 if let HirExprKind::Path { path, .. } = &receiver.kind
@@ -3211,6 +3222,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                             },
                         );
                         out.push(StructuredStmt::Eval(store));
+                        self.flush_output_shadow_if_needed(receiver, out);
                         return final_val;
                     }
                 }
@@ -3560,7 +3572,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             },
         );
         out.push(StructuredStmt::Eval(store));
-        self.flush_output_shadow_if_needed(base, updated, out);
+        self.flush_output_shadow_if_needed(base, out);
         final_val
     }
 
@@ -4665,6 +4677,11 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 },
             );
             out.push(StructuredStmt::Eval(id));
+            for (arg, mode) in args.iter().zip(param_modes) {
+                if matches!(mode, ParamMode::Out | ParamMode::InOut) {
+                    self.flush_output_shadow_if_needed(&arg.value, out);
+                }
+            }
             return Ok(id);
         }
 
@@ -5019,7 +5036,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         span,
                     ));
                 }
-                let hit_object_id = self.hit_object_id_for_receiver(receiver);
+                let Some(hit_object_id) = self.hit_object_id_for_receiver(receiver) else {
+                    return Err(self.emit_diag(
+                        "E0525",
+                        "SER requires a declared function-local HitObject variable",
+                        span,
+                    ));
+                };
                 let hint = if args.len() >= 3 {
                     Some(self.require_arg(args, 1, joined, span, out)?)
                 } else {
@@ -5758,6 +5781,11 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 },
             );
             out.push(StructuredStmt::Eval(id));
+            for (arg, mode) in args.iter().zip(param_modes) {
+                if matches!(mode, ParamMode::Out | ParamMode::InOut) {
+                    self.flush_output_shadow_if_needed(&arg.value, out);
+                }
+            }
             return Ok(id);
         }
 
@@ -6877,6 +6905,14 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 },
             );
             out.push(StructuredStmt::Eval(id));
+            if matches!(param_modes.first(), Some(ParamMode::Out | ParamMode::InOut)) {
+                self.flush_output_shadow_if_needed(receiver, out);
+            }
+            for (arg, mode) in args.iter().zip(param_modes.into_iter().skip(1)) {
+                if matches!(mode, ParamMode::Out | ParamMode::InOut) {
+                    self.flush_output_shadow_if_needed(&arg.value, out);
+                }
+            }
             return id;
         }
 
@@ -7024,7 +7060,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 span,
             ));
         }
-        let hit_object_id = self.hit_object_id_for_receiver(receiver);
+        let Some(hit_object_id) = self.hit_object_id_for_receiver(receiver) else {
+            return Some(self.emit_diag(
+                "E0525",
+                "HitObject method requires a declared function-local variable",
+                span,
+            ));
+        };
         let id = match method {
             "trace_ray" => {
                 if args.len() != 11 {
@@ -7195,7 +7237,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 span,
             ));
         }
-        let ray_query_id = self.ray_query_id_for_receiver(receiver);
+        let Some(ray_query_id) = self.ray_query_id_for_receiver(receiver) else {
+            return Some(self.emit_diag(
+                "E0525",
+                "RayQuery method requires a declared function-local variable",
+                span,
+            ));
+        };
         let id = match method {
             "initialize" => {
                 if args.len() != 7 {

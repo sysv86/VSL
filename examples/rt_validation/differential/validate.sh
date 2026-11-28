@@ -27,21 +27,25 @@ for name in ray_query position_fetch omm_khr omm_ext; do
 done
 "$slang" "$here/ray_query.slang" -entry main -target spirv -profile spirv_1_6 -o "$out/ray_query.slang.spv"
 
-mkdir -p "$out/pipeline-vsl" "$out/pipeline-slang"
+mkdir -p "$out/pipeline-vsl" "$out/pipeline-slang" "$out/aggregate-pipeline"
 "$compiler" emit-spv "$here/pipeline.vsl" --abi standalone --tier 3 --out "$out/pipeline-vsl"
+"$compiler" emit-spv "$here/aggregate_pipeline.vsl" --abi standalone --tier 3 --out "$out/aggregate-pipeline"
 for entry in rgen rchit rmiss; do
     "$slang" "$here/pipeline.slang" -entry "$entry" -target spirv -profile spirv_1_6 \
         -fvk-use-entrypoint-name -o "$out/pipeline-slang/$entry.spv"
 done
 
-count=0
-while IFS= read -r -d '' binary; do
+# Validate only artifacts produced by this invocation, even in a reused directory.
+binaries=()
+for name in ray_query position_fetch omm_khr omm_ext; do
+    binaries+=("$out/$name.vsl.spv" "$out/$name.glsl.spv")
+done
+binaries+=("$out/ray_query.slang.spv")
+for entry in rgen rchit rmiss; do
+    binaries+=("$out/pipeline-vsl/$entry.spv" "$out/pipeline-slang/$entry.spv" "$out/aggregate-pipeline/$entry.spv")
+done
+for binary in "${binaries[@]}"; do
     spirv-val --target-env vulkan1.3 "$binary"
     spirv-val --target-env vulkan1.4 "$binary"
-    count=$((count + 1))
-done < <(find "$out" -name '*.spv' -type f -print0)
-if (( count != 15 )); then
-    printf 'Expected 15 SPIR-V modules, found %d\n' "$count" >&2
-    exit 1
-fi
-printf 'Validated %d differential SPIR-V modules. Artifacts: %s\n' "$count" "$out"
+done
+printf 'Validated %d differential SPIR-V modules. Artifacts: %s\n' "${#binaries[@]}" "$out"

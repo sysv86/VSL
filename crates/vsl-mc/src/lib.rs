@@ -24,6 +24,7 @@ pub use layouts::{
 pub use ray_interface::{
     RayInterfaceKind, RayInterfaceLink, RayInterfaceMember, RayInterfaceType, RayInterfaceVariable,
     RayScalar, ShaderRecordField, ShaderRecordLayout, validate_ray_interface_link,
+    validate_triangle_hit_interface,
 };
 pub use reflection::{
     CompiledShaderUnit, DebugChannelBinding, DescriptorAccess, DescriptorBinding, DescriptorKind,

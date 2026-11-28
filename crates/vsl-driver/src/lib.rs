@@ -2497,6 +2497,116 @@ mod tests {
     }
 
     #[test]
+    fn hit_objects_are_not_lowered_as_ordinary_values() {
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
+        opts.abi = AbiProfile::Standalone;
+        opts.active_caps = HardwareCaps::all();
+        for (source, expected) in [
+            (
+                "@raygen fn main() { let h: HitObject; }",
+                "requires `#[cap(ser_nv)]`",
+            ),
+            (
+                "#[cap(ser_nv)] @raygen fn main() { let h: [HitObject; 2]; }",
+                "aggregates and pointers",
+            ),
+            (
+                "#[cap(ser_nv)] @raygen fn main() { let h: HitObject; let copy = h; }",
+                "cannot be assigned or copied",
+            ),
+            (
+                "struct Data { h: HitObject } @raygen fn main() {}",
+                "not a struct field",
+            ),
+            (
+                "#[cap(ser_nv)] fn helper(h: HitObject) {} @raygen fn main() {}",
+                "function parameter",
+            ),
+            (
+                "#[cap(ser_nv)] fn helper() -> HitObject { let h: HitObject; return h; } @raygen fn main() {}",
+                "function return type",
+            ),
+        ] {
+            let out =
+                VslCompiler::new().compile_shader_source("invalid_hit_object.vsl", source, &opts);
+            assert!(out.has_errors(), "{source}");
+            assert!(
+                out.diagnostics.iter().any(|d| d.message.contains(expected)),
+                "{source}: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn ser_profiles_follow_the_reachable_call_graph() {
+        let units = compile_standalone_and_validate(
+            "ser_reachability",
+            r"
+            #[cap(ser_nv)]
+            fn nv_helper() { reorder_thread_with_hint(0u, 1u); }
+            #[cap(ser_ext)]
+            fn ext_helper() { reorder_thread_with_hint(0u, 1u); }
+            #[cap(omm_khr)]
+            fn unused_micromap() {}
+            @raygen
+            fn nv_main() { nv_helper(); }
+            @raygen
+            fn ext_main() { ext_helper(); }
+            @miss
+            fn plain() {}
+            ",
+            false,
+        );
+        for (name, nv, ext) in [
+            ("nv_main", true, false),
+            ("ext_main", false, true),
+            ("plain", false, false),
+        ] {
+            let unit = units.iter().find(|u| u.entry_point == name).unwrap();
+            let capabilities: Vec<_> = spirv_instructions(&unit.spirv)
+                .filter(|(op, _)| *op == 17)
+                .map(|(_, args)| args[0])
+                .collect();
+            assert_eq!(capabilities.contains(&5383), nv, "{name}");
+            assert_eq!(capabilities.contains(&5388), ext, "{name}");
+            assert_eq!(
+                unit.required_caps
+                    .contains(HardwareCaps::SHADER_INVOCATION_REORDER),
+                nv
+            );
+            assert_eq!(
+                unit.required_caps
+                    .contains(HardwareCaps::SHADER_INVOCATION_REORDER_EXT),
+                ext
+            );
+            assert!(
+                !unit
+                    .required_caps
+                    .contains(HardwareCaps::OPACITY_MICROMAP_KHR)
+            );
+            assert!(!capabilities.contains(&6032));
+        }
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
+        opts.abi = AbiProfile::Standalone;
+        opts.active_caps = HardwareCaps::all();
+        for source in [
+            "#[cap(ser_nv)] fn nv() { reorder_thread_with_hint(0u, 1u); } #[cap(ser_ext)] @raygen fn main() { nv(); reorder_thread_with_hint(0u, 1u); }",
+            "#[cap(ser_nv, ser_ext)] @raygen fn main() { reorder_thread_with_hint(0u, 1u); }",
+        ] {
+            let out = VslCompiler::new().compile_shader_source("mixed_ser.vsl", source, &opts);
+            assert!(out.has_errors());
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("mixed NV and EXT SER")),
+                "{:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    #[test]
     fn rt_stage_requires_pipeline_feature_and_reflects_it() {
         let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
         opts.abi = AbiProfile::Standalone;
@@ -2673,6 +2783,54 @@ mod tests {
     }
 
     #[test]
+    fn rt_nested_interface_writes_reach_global_storage() {
+        let units = compile_standalone_and_validate(
+            "rt_nested_interface_writes",
+            r"
+            struct Inner { value: u32 }
+            struct Payload { inner: Inner, samples: [u32; 2], color: vec4 }
+            fn change(inout p: Payload) { p.inner.value += 1u; }
+            @closest_hit
+            fn hit(#[incoming_ray_payload(0)] inout p: Payload) {
+                p.inner.value = 501u;
+                p.samples[1u] = 2u;
+                p.color.xy = vec2(3.0, 4.0);
+                change(p);
+            }
+            @callable
+            fn call(#[incoming_callable_data(0)] inout p: Payload) {
+                p.inner.value = 9u;
+            }
+            @intersection
+            fn intersect(#[hit_attribute] out a: vec2) {
+                a = vec2(0.0);
+                a.x = 0.5;
+                report_intersection(1.0, 0u);
+            }
+            ",
+            false,
+        );
+        for (name, storage, min_stores) in
+            [("hit", 5342, 4), ("call", 5329, 1), ("intersect", 5339, 2)]
+        {
+            let unit = units.iter().find(|u| u.entry_point == name).unwrap();
+            let instructions: Vec<_> = spirv_instructions(&unit.spirv).collect();
+            let pointer = instructions
+                .iter()
+                .find_map(|(op, args)| (*op == 59 && args[2] == storage).then(|| args[1]))
+                .expect("missing interface variable");
+            let stores = instructions
+                .iter()
+                .filter(|(op, args)| *op == 62 && args[0] == pointer)
+                .count();
+            assert!(
+                stores >= min_stores,
+                "{name}: {stores} interface stores, expected at least {min_stores}"
+            );
+        }
+    }
+
+    #[test]
     fn rt_shader_calls_reload_payload_after_return() {
         let units = compile_standalone_and_validate(
             "rt_payload_reload",
@@ -2836,7 +2994,7 @@ mod tests {
     fn ray_interfaces_reflect_recursive_payload_types_and_explicit_links() {
         use vsl_mc::{
             RayInterfaceKind, RayInterfaceLink, RayInterfaceType, RayScalar,
-            validate_ray_interface_link,
+            validate_ray_interface_link, validate_triangle_hit_interface,
         };
         let units = compile_standalone_and_validate(
             "rt_interface_links",
@@ -2858,6 +3016,10 @@ mod tests {
             fn rint(#[hit_attribute] out attr: vec2) { attr = vec2(0.5); report_intersection(1.0, 0u); }
             @any_hit
             fn rahit(#[hit_attribute] attr: vec2) {}
+            @closest_hit
+            fn wrong_triangle(#[hit_attribute] attr: vec3) {}
+            @miss
+            fn missing_payload() {}
             ",
             false,
         );
@@ -2883,6 +3045,19 @@ mod tests {
             location: 0,
         };
         assert!(validate_ray_interface_link(rgen, unit("rchit"), trace).is_ok());
+        assert!(
+            validate_ray_interface_link(rgen, unit("missing_payload"), trace)
+                .unwrap_err()
+                .contains("target is missing")
+        );
+        assert!(validate_triangle_hit_interface(unit("rchit")).is_ok());
+        assert!(validate_triangle_hit_interface(unit("rahit")).is_ok());
+        assert!(
+            validate_triangle_hit_interface(unit("wrong_triangle"))
+                .unwrap_err()
+                .contains("vec2")
+        );
+        assert!(validate_triangle_hit_interface(unit("rint")).is_err());
         assert!(
             validate_ray_interface_link(rgen, unit("mismatch"), trace)
                 .unwrap_err()

@@ -9,8 +9,8 @@ VSL 2.0 is a pure-Rust, zero-C++ shader language, SPIR-V 1.6 compiler, and unifi
 Hard boundary between engine core and shader packs:
 
 - Core engine shaders stay in `vulkanshaders-core`: Tier 3 RT pipelines (`pathtrace.{rgen,rchit,rahit,rmiss}`), `UberGpuBuffer` vertex decoding, `SER`/`HitObject`, `VK_EXT_opacity_micromap`, `SHaRC` resolve, `SVGF`/NRD bridge, `TSR`/DLSS/FSR3/XeSS, Optical Flow FrameGen, and raster G-Buffer passes.
-- VSL 2.0 owns shader packs (`extend` and `custom` modes): all 16 `@hook` stages, custom compute and raster passes, typed `pack.vsl` authoring, `pack.toml` v2 desugaring, and native SPIR-V 1.6 emission with `CompiledShaderUnit` reflection.
-- Explicit non-goals: `RayTracingKHR` SBT stages, `HitObject`/SER, OMM, DXIL/MSL/WGSL/CUDA cross-compilation, automatic differentiation, GPU dynamic dispatch.
+- VSL 2.0 owns shader packs (`extend` and `custom` modes): all 16 `@hook` stages, custom compute and raster passes, typed `pack.vsl` authoring, `pack.toml` v2 desugaring, and native SPIR-V 1.6 emission with `CompiledShaderUnit` reflection. Standalone compilation also supports RayQuery, native ray tracing stages, SBT shader record interfaces, SER and opacity micromap shader capabilities.
+- Acceleration structure and micromap construction, pipeline/SBT allocation and dispatch remain the host application's responsibility. Explicit non-goals: DXIL/MSL/WGSL/CUDA cross-compilation, automatic differentiation, general GPU dynamic dispatch.
 
 ## 2. Code standards
 
