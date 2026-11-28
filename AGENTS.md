@@ -21,7 +21,7 @@ Hard boundary between engine core and shader packs:
 
 ## 3. Licensing
 
-GPL-3.0-only, matching Hyaloclast. Clean-room implementation: do not copy from Shader-Slang, Iris/Aperture, Sodium, OptiFine, or VulkanMod. Follow the Khronos SPIR-V Registry directly (`SPV_KHR_physical_storage_buffer`, `SPV_KHR_vulkan_memory_model`, `SPV_KHR_ray_query`, `SPV_EXT_descriptor_indexing`, `SPV_KHR_maximal_reconvergence`, `SPV_KHR_quad_control`).
+Apache-2.0. Clean-room implementation: do not copy from Shader-Slang, Iris/Aperture, Sodium, OptiFine, or VulkanMod. Follow the Khronos SPIR-V Registry directly (`SPV_KHR_physical_storage_buffer`, `SPV_KHR_vulkan_memory_model`, `SPV_KHR_ray_query`, `SPV_EXT_descriptor_indexing`, `SPV_KHR_maximal_reconvergence`, `SPV_KHR_quad_control`).
 
 ## 4. Compiler invariants
 

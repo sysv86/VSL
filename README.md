@@ -83,4 +83,4 @@ cargo run -p vsl-lsp
 
 ## License
 
-GPL-3.0-only.
+Apache-2.0. See [LICENSE](LICENSE).

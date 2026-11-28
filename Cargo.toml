@@ -19,7 +19,7 @@ version = "2.0.0-alpha.2"
 edition = "2024"
 rust-version = "1.88"
 authors = ["VulkanShaders Contributors"]
-license = "GPL-3.0-only"
+license = "Apache-2.0"
 repository = "https://github.com/sysv86/VSL"
 
 [workspace.dependencies]
