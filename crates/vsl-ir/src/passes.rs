@@ -442,12 +442,33 @@ impl IrPass for ConstFoldPass {
                     | InstData::SubgroupInclusiveAdd(_)
                     | InstData::SubgroupShuffle { .. }
                     | InstData::SubgroupShuffleXor { .. }
+                    | InstData::SubgroupBroadcast { .. }
+                    | InstData::SubgroupBallotBitExtract { .. }
+                    | InstData::SubgroupBallotFindLsb(_)
+                    | InstData::SubgroupBallotFindMsb(_)
+                    | InstData::SubgroupShuffleUp { .. }
+                    | InstData::SubgroupShuffleDown { .. }
+                    | InstData::SubgroupMul(_)
+                    | InstData::SubgroupExclusiveMul(_)
+                    | InstData::SubgroupInclusiveMul(_)
+                    | InstData::SubgroupExclusiveMin(_)
+                    | InstData::SubgroupInclusiveMin(_)
+                    | InstData::SubgroupExclusiveMax(_)
+                    | InstData::SubgroupInclusiveMax(_)
+                    | InstData::SubgroupBitAnd(_)
+                    | InstData::SubgroupBitOr(_)
+                    | InstData::SubgroupBitXor(_)
+                    | InstData::SubgroupLogicalAnd(_)
+                    | InstData::SubgroupLogicalOr(_)
+                    | InstData::SubgroupLogicalXor(_)
+                    | InstData::SubgroupClustered { .. }
                     | InstData::SubgroupAny(_)
                     | InstData::SubgroupAll(_)
                     | InstData::SubgroupElect
                     | InstData::QuadSwapHorizontal(_)
                     | InstData::QuadSwapVertical(_)
                     | InstData::QuadSwapDiagonal(_)
+                    | InstData::QuadBroadcast { .. }
                     | InstData::BitFieldExtract { .. }
                     | InstData::BitFieldInsert { .. }
                     | InstData::BitCount(_)
@@ -2063,12 +2084,14 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         },
         InstData::ImageSample {
             descriptor_index,
+            sampler_descriptor_index,
             image_inst,
             coord,
             lod,
             is_fetch,
         } => InstData::ImageSample {
             descriptor_index: *descriptor_index,
+            sampler_descriptor_index: *sampler_descriptor_index,
             image_inst: image_inst.map(|i| remap_id(i, remap)),
             coord: remap_id(*coord, remap),
             lod: remap_id(*lod, remap),
@@ -2296,21 +2319,25 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         },
         InstData::ImageSampleImplicitLod {
             descriptor_index,
+            sampler_descriptor_index,
             image_inst,
             coord,
         } => InstData::ImageSampleImplicitLod {
             descriptor_index: *descriptor_index,
+            sampler_descriptor_index: *sampler_descriptor_index,
             image_inst: image_inst.map(|i| remap_id(i, remap)),
             coord: remap_id(*coord, remap),
         },
         InstData::ImageSampleGrad {
             descriptor_index,
+            sampler_descriptor_index,
             image_inst,
             coord,
             ddx,
             ddy,
         } => InstData::ImageSampleGrad {
             descriptor_index: *descriptor_index,
+            sampler_descriptor_index: *sampler_descriptor_index,
             image_inst: image_inst.map(|i| remap_id(i, remap)),
             coord: remap_id(*coord, remap),
             ddx: remap_id(*ddx, remap),
@@ -2318,12 +2345,14 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         },
         InstData::ImageSampleDrefExplicitLod {
             descriptor_index,
+            sampler_descriptor_index,
             image_inst,
             coord,
             dref,
             lod,
         } => InstData::ImageSampleDrefExplicitLod {
             descriptor_index: *descriptor_index,
+            sampler_descriptor_index: *sampler_descriptor_index,
             image_inst: image_inst.map(|i| remap_id(i, remap)),
             coord: remap_id(*coord, remap),
             dref: remap_id(*dref, remap),
@@ -2331,11 +2360,13 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         },
         InstData::ImageGather {
             descriptor_index,
+            sampler_descriptor_index,
             image_inst,
             coord,
             component,
         } => InstData::ImageGather {
             descriptor_index: *descriptor_index,
+            sampler_descriptor_index: *sampler_descriptor_index,
             image_inst: image_inst.map(|i| remap_id(i, remap)),
             coord: remap_id(*coord, remap),
             component: *component,
@@ -2387,7 +2418,51 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         InstData::SubgroupElect => InstData::SubgroupElect,
         InstData::QuadSwapHorizontal(v) => InstData::QuadSwapHorizontal(remap_id(*v, remap)),
         InstData::QuadSwapVertical(v) => InstData::QuadSwapVertical(remap_id(*v, remap)),
+        InstData::SubgroupBroadcast { value, lane } => InstData::SubgroupBroadcast {
+            value: remap_id(*value, remap),
+            lane: remap_id(*lane, remap),
+        },
+        InstData::SubgroupBallotBitExtract { ballot, index } => InstData::SubgroupBallotBitExtract {
+            ballot: remap_id(*ballot, remap),
+            index: remap_id(*index, remap),
+        },
+        InstData::SubgroupBallotFindLsb(v) => InstData::SubgroupBallotFindLsb(remap_id(*v, remap)),
+        InstData::SubgroupBallotFindMsb(v) => InstData::SubgroupBallotFindMsb(remap_id(*v, remap)),
+        InstData::SubgroupShuffleUp { value, delta } => InstData::SubgroupShuffleUp {
+            value: remap_id(*value, remap),
+            delta: remap_id(*delta, remap),
+        },
+        InstData::SubgroupShuffleDown { value, delta } => InstData::SubgroupShuffleDown {
+            value: remap_id(*value, remap),
+            delta: remap_id(*delta, remap),
+        },
+        InstData::SubgroupMul(v) => InstData::SubgroupMul(remap_id(*v, remap)),
+        InstData::SubgroupExclusiveMul(v) => InstData::SubgroupExclusiveMul(remap_id(*v, remap)),
+        InstData::SubgroupInclusiveMul(v) => InstData::SubgroupInclusiveMul(remap_id(*v, remap)),
+        InstData::SubgroupExclusiveMin(v) => InstData::SubgroupExclusiveMin(remap_id(*v, remap)),
+        InstData::SubgroupInclusiveMin(v) => InstData::SubgroupInclusiveMin(remap_id(*v, remap)),
+        InstData::SubgroupExclusiveMax(v) => InstData::SubgroupExclusiveMax(remap_id(*v, remap)),
+        InstData::SubgroupInclusiveMax(v) => InstData::SubgroupInclusiveMax(remap_id(*v, remap)),
+        InstData::SubgroupBitAnd(v) => InstData::SubgroupBitAnd(remap_id(*v, remap)),
+        InstData::SubgroupBitOr(v) => InstData::SubgroupBitOr(remap_id(*v, remap)),
+        InstData::SubgroupBitXor(v) => InstData::SubgroupBitXor(remap_id(*v, remap)),
+        InstData::SubgroupLogicalAnd(v) => InstData::SubgroupLogicalAnd(remap_id(*v, remap)),
+        InstData::SubgroupLogicalOr(v) => InstData::SubgroupLogicalOr(remap_id(*v, remap)),
+        InstData::SubgroupLogicalXor(v) => InstData::SubgroupLogicalXor(remap_id(*v, remap)),
+        InstData::SubgroupClustered {
+            op,
+            value,
+            cluster_size,
+        } => InstData::SubgroupClustered {
+            op: *op,
+            value: remap_id(*value, remap),
+            cluster_size: remap_id(*cluster_size, remap),
+        },
         InstData::QuadSwapDiagonal(v) => InstData::QuadSwapDiagonal(remap_id(*v, remap)),
+        InstData::QuadBroadcast { value, lane } => InstData::QuadBroadcast {
+            value: remap_id(*value, remap),
+            lane: remap_id(*lane, remap),
+        },
         InstData::BitFieldExtract {
             base,
             offset,
@@ -3163,12 +3238,33 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::SubgroupInclusiveAdd(_)
                     | InstData::SubgroupShuffle { .. }
                     | InstData::SubgroupShuffleXor { .. }
+                    | InstData::SubgroupBroadcast { .. }
+                    | InstData::SubgroupBallotBitExtract { .. }
+                    | InstData::SubgroupBallotFindLsb(_)
+                    | InstData::SubgroupBallotFindMsb(_)
+                    | InstData::SubgroupShuffleUp { .. }
+                    | InstData::SubgroupShuffleDown { .. }
+                    | InstData::SubgroupMul(_)
+                    | InstData::SubgroupExclusiveMul(_)
+                    | InstData::SubgroupInclusiveMul(_)
+                    | InstData::SubgroupExclusiveMin(_)
+                    | InstData::SubgroupInclusiveMin(_)
+                    | InstData::SubgroupExclusiveMax(_)
+                    | InstData::SubgroupInclusiveMax(_)
+                    | InstData::SubgroupBitAnd(_)
+                    | InstData::SubgroupBitOr(_)
+                    | InstData::SubgroupBitXor(_)
+                    | InstData::SubgroupLogicalAnd(_)
+                    | InstData::SubgroupLogicalOr(_)
+                    | InstData::SubgroupLogicalXor(_)
+                    | InstData::SubgroupClustered { .. }
                     | InstData::SubgroupAny(_)
                     | InstData::SubgroupAll(_)
                     | InstData::SubgroupElect
                     | InstData::QuadSwapHorizontal(_)
                     | InstData::QuadSwapVertical(_)
                     | InstData::QuadSwapDiagonal(_)
+                    | InstData::QuadBroadcast { .. }
                     | InstData::IsNan(_)
                     | InstData::IsInf(_)
                     | InstData::SpecConstant { .. }
@@ -3829,6 +3925,26 @@ impl IrPass for DeadCodeEliminationPass {
                     | InstData::SubgroupInclusiveAdd(_)
                     | InstData::SubgroupShuffle { .. }
                     | InstData::SubgroupShuffleXor { .. }
+                    | InstData::SubgroupBroadcast { .. }
+                    | InstData::SubgroupBallotBitExtract { .. }
+                    | InstData::SubgroupBallotFindLsb(_)
+                    | InstData::SubgroupBallotFindMsb(_)
+                    | InstData::SubgroupShuffleUp { .. }
+                    | InstData::SubgroupShuffleDown { .. }
+                    | InstData::SubgroupMul(_)
+                    | InstData::SubgroupExclusiveMul(_)
+                    | InstData::SubgroupInclusiveMul(_)
+                    | InstData::SubgroupExclusiveMin(_)
+                    | InstData::SubgroupInclusiveMin(_)
+                    | InstData::SubgroupExclusiveMax(_)
+                    | InstData::SubgroupInclusiveMax(_)
+                    | InstData::SubgroupBitAnd(_)
+                    | InstData::SubgroupBitOr(_)
+                    | InstData::SubgroupBitXor(_)
+                    | InstData::SubgroupLogicalAnd(_)
+                    | InstData::SubgroupLogicalOr(_)
+                    | InstData::SubgroupLogicalXor(_)
+                    | InstData::SubgroupClustered { .. }
                     | InstData::SubgroupAny(_)
                     | InstData::SubgroupAll(_)
                     | InstData::SubgroupElect
@@ -3844,6 +3960,7 @@ impl IrPass for DeadCodeEliminationPass {
                 InstData::QuadSwapHorizontal(_)
                     | InstData::QuadSwapVertical(_)
                     | InstData::QuadSwapDiagonal(_)
+                    | InstData::QuadBroadcast { .. }
             )
         });
     }
@@ -5633,22 +5750,47 @@ fn remap_inlined_resource_indices(data: &mut InstData, res: &InlineResourceRemap
         InstData::LocalAddr { local_index } => {
             *local_index += res.local_offset;
         }
+        InstData::ImageSample {
+            descriptor_index,
+            sampler_descriptor_index,
+            ..
+        }
+        | InstData::ImageSampleImplicitLod {
+            descriptor_index,
+            sampler_descriptor_index,
+            ..
+        }
+        | InstData::ImageSampleGrad {
+            descriptor_index,
+            sampler_descriptor_index,
+            ..
+        }
+        | InstData::ImageSampleDrefExplicitLod {
+            descriptor_index,
+            sampler_descriptor_index,
+            ..
+        }
+        | InstData::ImageGather {
+            descriptor_index,
+            sampler_descriptor_index,
+            ..
+        } => {
+            if let Some(&mapped) = res.desc_remap.get(*descriptor_index as usize) {
+                *descriptor_index = mapped;
+            }
+            if let Some(s_idx) = sampler_descriptor_index
+                && let Some(&mapped) = res.desc_remap.get(*s_idx as usize)
+            {
+                *s_idx = mapped;
+            }
+        }
         InstData::DescriptorAccessChain {
             descriptor_index, ..
         }
-        | InstData::ImageSample {
+        | InstData::SubpassLoad {
             descriptor_index, ..
         }
-        | InstData::ImageSampleImplicitLod {
-            descriptor_index, ..
-        }
-        | InstData::ImageSampleGrad {
-            descriptor_index, ..
-        }
-        | InstData::ImageSampleDrefExplicitLod {
-            descriptor_index, ..
-        }
-        | InstData::ImageGather {
+        | InstData::ImageFetchMs {
             descriptor_index, ..
         }
         | InstData::ImageQuerySize {
@@ -6475,6 +6617,7 @@ mod tests {
             None,
             InstData::ImageSample {
                 descriptor_index: 0,
+                sampler_descriptor_index: None,
                 image_inst: None,
                 coord,
                 lod,
@@ -6512,6 +6655,7 @@ mod tests {
             None,
             InstData::ImageSample {
                 descriptor_index: 0,
+                sampler_descriptor_index: None,
                 image_inst: Some(load),
                 coord,
                 lod: image_lod,

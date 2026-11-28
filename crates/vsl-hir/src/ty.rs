@@ -96,14 +96,22 @@ pub enum Type {
     TextureCube {
         sample_scalar: ScalarKind,
     },
+    Texture1D {
+        sample_scalar: ScalarKind,
+    },
     Texture2DMS {
+        sample_scalar: ScalarKind,
+    },
+    BufferView {
         sample_scalar: ScalarKind,
     },
     SubpassInput {
         sample_scalar: ScalarKind,
         ms: bool,
     },
+    RwImage1D(ImageFormat),
     RwImage2D(ImageFormat),
+    RwBufferView(ImageFormat),
     RwImage2DArray(ImageFormat),
     RwImage3D(ImageFormat),
     Sampler,

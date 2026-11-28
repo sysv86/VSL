@@ -15,5 +15,5 @@ pub use ssa::{
     IrInterpolation, IrLocalVar, IrModule, IrParam, IrPushConstantBlock,
     IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
     IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,
-    IrType, IrWorkgroupVar, MemoryAccess, ScalarIrTy, SpecConstantOpKind, StructuredStmt,
+    IrType, IrWorkgroupVar, MemoryAccess, ScalarIrTy, SpecConstantOpKind, StructuredStmt, SubgroupClusteredOp,
 };

@@ -2,7 +2,7 @@ use indexmap::{IndexMap, IndexSet};
 use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixScalar, GlslStd450Op, InstData, InstId,
     IrDescriptorVar,
-    IrFunction, IrInterlockMode, IrInterpolation, IrModule, IrPushConstantBlock, IrStorageClass,
+    IrFunction, IrInterlockMode, SubgroupClusteredOp, IrInterpolation, IrModule, IrPushConstantBlock, IrStorageClass,
     IrStructLayout,
     IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology, IrType, IrWorkgroupVar, ScalarIrTy,
     SpecConstantOpKind, StructuredStmt,
@@ -1514,17 +1514,38 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                 | InstData::SubgroupBallotBitCount(_)
                 | InstData::SubgroupBallotExclusiveBitCount(_)
                 | InstData::SubgroupBallotInclusiveBitCount(_)
-                | InstData::SubgroupBroadcastFirst(_) => {
+                | InstData::SubgroupBroadcastFirst(_)
+                | InstData::SubgroupBroadcast { .. }
+                | InstData::SubgroupBallotBitExtract { .. }
+                | InstData::SubgroupBallotFindLsb(_)
+                | InstData::SubgroupBallotFindMsb(_) => {
                     uses_subgroups = true;
                 }
                 InstData::SubgroupAdd(_)
                 | InstData::SubgroupMin(_)
                 | InstData::SubgroupMax(_)
                 | InstData::SubgroupExclusiveAdd(_)
-                | InstData::SubgroupInclusiveAdd(_) => {
+                | InstData::SubgroupInclusiveAdd(_)
+                | InstData::SubgroupMul(_)
+                | InstData::SubgroupExclusiveMul(_)
+                | InstData::SubgroupInclusiveMul(_)
+                | InstData::SubgroupExclusiveMin(_)
+                | InstData::SubgroupInclusiveMin(_)
+                | InstData::SubgroupExclusiveMax(_)
+                | InstData::SubgroupInclusiveMax(_)
+                | InstData::SubgroupBitAnd(_)
+                | InstData::SubgroupBitOr(_)
+                | InstData::SubgroupBitXor(_)
+                | InstData::SubgroupLogicalAnd(_)
+                | InstData::SubgroupLogicalOr(_)
+                | InstData::SubgroupLogicalXor(_)
+                | InstData::SubgroupClustered { .. } => {
                     uses_subgroup_arith = true;
                 }
-                InstData::SubgroupShuffle { .. } | InstData::SubgroupShuffleXor { .. } => {
+                InstData::SubgroupShuffle { .. }
+                | InstData::SubgroupShuffleXor { .. }
+                | InstData::SubgroupShuffleUp { .. }
+                | InstData::SubgroupShuffleDown { .. } => {
                     uses_subgroup_shuffle = true;
                 }
                 InstData::SubgroupAny(_) | InstData::SubgroupAll(_) => {
@@ -1535,7 +1556,8 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                 }
                 InstData::QuadSwapHorizontal(_)
                 | InstData::QuadSwapVertical(_)
-                | InstData::QuadSwapDiagonal(_) => {
+                | InstData::QuadSwapDiagonal(_)
+                | InstData::QuadBroadcast { .. } => {
                     uses_subgroup_quad = true;
                 }
                 InstData::LoadBuiltin {
@@ -2381,10 +2403,12 @@ fn map_image_format(fmt: Option<ImageFormat>) -> spirv::ImageFormat {
 /// Returns `(spv_dim, arrayed, coord_components, grad_components, query_size_components)`.
 fn map_texture_dim(dim: Option<TextureDim>) -> (spirv::Dim, u32, u32, u32, u32) {
     match dim.unwrap_or(TextureDim::Dim2D) {
+        TextureDim::Dim1D => (spirv::Dim::Dim1D, 0, 1, 1, 1),
         TextureDim::Dim2D | TextureDim::Dim2DMS => (spirv::Dim::Dim2D, 0, 2, 2, 2),
         TextureDim::Dim2DArray => (spirv::Dim::Dim2D, 1, 3, 2, 3),
         TextureDim::Dim3D => (spirv::Dim::Dim3D, 0, 3, 3, 3),
         TextureDim::DimCube => (spirv::Dim::DimCube, 0, 3, 3, 2),
+        TextureDim::DimBuffer => (spirv::Dim::DimBuffer, 0, 1, 1, 1),
         TextureDim::SubpassData => (spirv::Dim::SubpassData, 0, 2, 2, 2),
     }
 }
@@ -2452,6 +2476,11 @@ fn emit_descriptor_var(
             (spirv::StorageClass::StorageBuffer, block_ty, 0, u32_ty)
         }
         DescriptorKind::SampledImage => {
+            if desc.dim == Some(TextureDim::Dim1D) {
+                emitter.emit_capability(spirv::Capability::Sampled1D);
+            } else if desc.dim == Some(TextureDim::DimBuffer) {
+                emitter.emit_capability(spirv::Capability::SampledBuffer);
+            }
             let sampled_ty = map_sample_scalar(emitter, desc.sample_scalar);
             let ms = u32::from(desc.dim == Some(TextureDim::Dim2DMS));
             let img_ty = emitter.emit_type_image(
@@ -2490,6 +2519,11 @@ fn emit_descriptor_var(
             )
         }
         DescriptorKind::StorageImage => {
+            if desc.dim == Some(TextureDim::Dim1D) {
+                emitter.emit_capability(spirv::Capability::Image1D);
+            } else if desc.dim == Some(TextureDim::DimBuffer) {
+                emitter.emit_capability(spirv::Capability::ImageBuffer);
+            }
             let sampled_ty = match desc.image_format {
                 Some(ImageFormat::R32ui) => u32_ty,
                 Some(ImageFormat::R32i) => emitter.emit_type_int(32, 1),
@@ -3441,6 +3475,10 @@ impl FnLowerCtx<'_> {
             | InstData::SubgroupAny(_)
             | InstData::SubgroupAll(_)
             | InstData::SubgroupElect
+            | InstData::SubgroupBallotBitExtract { .. }
+            | InstData::SubgroupLogicalAnd(_)
+            | InstData::SubgroupLogicalOr(_)
+            | InstData::SubgroupLogicalXor(_)
             | InstData::RayQueryProceed(_)
             | InstData::RayQueryCommittedFrontFace(_) => Some(self.bool_ty()),
             InstData::ConstI32(_) | InstData::CastToI32(_) => Some(self.i32_ty()),
@@ -3453,6 +3491,8 @@ impl FnLowerCtx<'_> {
             | InstData::SubgroupBallotBitCount(_)
             | InstData::SubgroupBallotExclusiveBitCount(_)
             | InstData::SubgroupBallotInclusiveBitCount(_)
+            | InstData::SubgroupBallotFindLsb(_)
+            | InstData::SubgroupBallotFindMsb(_)
             | InstData::BitCount(_)
             | InstData::ImageQueryLevels { .. }
             | InstData::RayQueryCommittedType(_)
@@ -3811,6 +3851,7 @@ impl FnLowerCtx<'_> {
         desc: &EmittedDescriptor,
         image_inst: Option<InstId>,
         preloaded_img: Option<u32>,
+        sampler_descriptor_index: Option<u32>,
     ) -> Option<u32> {
         match desc.kind {
             DescriptorKind::CombinedImageSampler => {
@@ -3826,7 +3867,11 @@ impl FnLowerCtx<'_> {
                 }
             }
             DescriptorKind::SampledImage => {
-                let sampler_var = self.default_sampler_var?;
+                let sampler_var = sampler_descriptor_index
+                    .and_then(|idx| self.descriptors.get(idx as usize))
+                    .filter(|d| d.kind == DescriptorKind::Sampler)
+                    .map(|d| d.var_id)
+                    .or(self.default_sampler_var)?;
                 let img_id = if let Some(loaded) = preloaded_img {
                     loaded
                 } else if desc.is_arrayed_descriptor() {
@@ -5027,6 +5072,7 @@ impl FnLowerCtx<'_> {
             }
             InstData::ImageSample {
                 descriptor_index,
+                sampler_descriptor_index,
                 image_inst,
                 coord,
                 lod,
@@ -5100,7 +5146,7 @@ impl FnLowerCtx<'_> {
                         }
                         DescriptorKind::SampledImage | DescriptorKind::CombinedImageSampler => {
                             if let Some(sampled_img_id) =
-                                self.load_sampled_image(&desc, image_inst, preloaded_img)
+                                self.load_sampled_image(&desc, image_inst, preloaded_img, sampler_descriptor_index)
                             {
                                 let coord_vec_id = self.emit_coord_vec(
                                     raw_coord_id,
@@ -5172,6 +5218,7 @@ impl FnLowerCtx<'_> {
             }
             InstData::ImageSampleImplicitLod {
                 descriptor_index,
+                sampler_descriptor_index,
                 image_inst,
                 coord,
             } => {
@@ -5181,7 +5228,7 @@ impl FnLowerCtx<'_> {
                 let coord_ty = self.inst_types.get(&coord).copied().unwrap_or(f32_ty);
                 if let Some(desc) = self.descriptors.get(descriptor_index as usize).cloned()
                     && let Some(sampled_img_id) =
-                        self.load_sampled_image(&desc, image_inst, preloaded_img)
+                        self.load_sampled_image(&desc, image_inst, preloaded_img, sampler_descriptor_index)
                 {
                     let coord_vec_id =
                         self.emit_coord_vec(raw_coord_id, coord_ty, f32_ty, desc.coord_components);
@@ -5201,6 +5248,7 @@ impl FnLowerCtx<'_> {
             }
             InstData::ImageSampleGrad {
                 descriptor_index,
+                sampler_descriptor_index,
                 image_inst,
                 coord,
                 ddx,
@@ -5216,7 +5264,7 @@ impl FnLowerCtx<'_> {
                 let ddy_ty = self.inst_types.get(&ddy).copied().unwrap_or(f32_ty);
                 if let Some(desc) = self.descriptors.get(descriptor_index as usize).cloned()
                     && let Some(sampled_img_id) =
-                        self.load_sampled_image(&desc, image_inst, preloaded_img)
+                        self.load_sampled_image(&desc, image_inst, preloaded_img, sampler_descriptor_index)
                 {
                     let coord_vec_id =
                         self.emit_coord_vec(raw_coord_id, coord_ty, f32_ty, desc.coord_components);
@@ -5248,6 +5296,7 @@ impl FnLowerCtx<'_> {
             }
             InstData::ImageSampleDrefExplicitLod {
                 descriptor_index,
+                sampler_descriptor_index,
                 image_inst,
                 coord,
                 dref,
@@ -5263,7 +5312,7 @@ impl FnLowerCtx<'_> {
                 let lod_ty = self.inst_types.get(&lod).copied().unwrap_or(f32_ty);
                 if let Some(desc) = self.descriptors.get(descriptor_index as usize).cloned()
                     && let Some(sampled_img_id) =
-                        self.load_sampled_image(&desc, image_inst, preloaded_img)
+                        self.load_sampled_image(&desc, image_inst, preloaded_img, sampler_descriptor_index)
                 {
                     let coord_vec_id =
                         self.emit_coord_vec(raw_coord_id, coord_ty, f32_ty, desc.coord_components);
@@ -5292,6 +5341,7 @@ impl FnLowerCtx<'_> {
             }
             InstData::ImageGather {
                 descriptor_index,
+                sampler_descriptor_index,
                 image_inst,
                 coord,
                 component,
@@ -5303,7 +5353,7 @@ impl FnLowerCtx<'_> {
                 let coord_ty = self.inst_types.get(&coord).copied().unwrap_or(f32_ty);
                 if let Some(desc) = self.descriptors.get(descriptor_index as usize).cloned()
                     && let Some(sampled_img_id) =
-                        self.load_sampled_image(&desc, image_inst, preloaded_img)
+                        self.load_sampled_image(&desc, image_inst, preloaded_img, sampler_descriptor_index)
                 {
                     let coord_vec_id =
                         self.emit_coord_vec(raw_coord_id, coord_ty, f32_ty, desc.coord_components);
@@ -5865,7 +5915,212 @@ impl FnLowerCtx<'_> {
             }
             InstData::QuadSwapHorizontal(val) => self.emit_quad_swap(val, 0),
             InstData::QuadSwapVertical(val) => self.emit_quad_swap(val, 1),
+            InstData::SubgroupBroadcast { value, lane } => {
+                self.emitter
+                    .emit_capability(spirv::Capability::GroupNonUniformBallot);
+                let raw_val = self.ensure_inst(value);
+                let raw_lane = self.ensure_inst(lane);
+                let u32_ty = self.u32_ty();
+                let val_ty = self.inst_types.get(&value).copied().unwrap_or(u32_ty);
+                let lane_ty = self.inst_types.get(&lane).copied().unwrap_or(u32_ty);
+                let lane_u32 = self.coerce_to_ty(raw_lane, lane_ty, u32_ty);
+                let scope = self
+                    .emitter
+                    .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+                let res = self.emitter.alloc_id();
+                self.emitter
+                    .emit_fn_inst_raw(337, &[val_ty, res, scope, raw_val, lane_u32]); // OpGroupNonUniformBroadcast
+                (res, val_ty)
+            }
+            InstData::SubgroupBallotBitExtract { ballot, index } => {
+                self.emitter
+                    .emit_capability(spirv::Capability::GroupNonUniformBallot);
+                let raw_ballot = self.ensure_inst(ballot);
+                let raw_idx = self.ensure_inst(index);
+                let u32_ty = self.u32_ty();
+                let bool_ty = self.bool_ty();
+                let idx_ty = self.inst_types.get(&index).copied().unwrap_or(u32_ty);
+                let idx_u32 = self.coerce_to_ty(raw_idx, idx_ty, u32_ty);
+                let scope = self
+                    .emitter
+                    .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+                let res = self.emitter.alloc_id();
+                self.emitter
+                    .emit_fn_inst_raw(341, &[bool_ty, res, scope, raw_ballot, idx_u32]); // OpGroupNonUniformBallotBitExtract
+                (res, bool_ty)
+            }
+            InstData::SubgroupBallotFindLsb(ballot) => {
+                self.emitter
+                    .emit_capability(spirv::Capability::GroupNonUniformBallot);
+                let raw_ballot = self.ensure_inst(ballot);
+                let u32_ty = self.u32_ty();
+                let scope = self
+                    .emitter
+                    .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+                let res = self.emitter.alloc_id();
+                self.emitter
+                    .emit_fn_inst_raw(343, &[u32_ty, res, scope, raw_ballot]); // OpGroupNonUniformBallotFindLSB
+                (res, u32_ty)
+            }
+            InstData::SubgroupBallotFindMsb(ballot) => {
+                self.emitter
+                    .emit_capability(spirv::Capability::GroupNonUniformBallot);
+                let raw_ballot = self.ensure_inst(ballot);
+                let u32_ty = self.u32_ty();
+                let scope = self
+                    .emitter
+                    .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+                let res = self.emitter.alloc_id();
+                self.emitter
+                    .emit_fn_inst_raw(344, &[u32_ty, res, scope, raw_ballot]); // OpGroupNonUniformBallotFindMSB
+                (res, u32_ty)
+            }
+            InstData::SubgroupShuffleUp { value, delta } => {
+                self.emitter.emit_capability_raw(66); // GroupNonUniformShuffleRelative
+                let raw_val = self.ensure_inst(value);
+                let raw_delta = self.ensure_inst(delta);
+                let u32_ty = self.u32_ty();
+                let val_ty = self.inst_types.get(&value).copied().unwrap_or(u32_ty);
+                let delta_ty = self.inst_types.get(&delta).copied().unwrap_or(u32_ty);
+                let delta_u32 = self.coerce_to_ty(raw_delta, delta_ty, u32_ty);
+                let scope = self
+                    .emitter
+                    .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+                let res = self.emitter.alloc_id();
+                self.emitter
+                    .emit_fn_inst_raw(347, &[val_ty, res, scope, raw_val, delta_u32]); // OpGroupNonUniformShuffleUp
+                (res, val_ty)
+            }
+            InstData::SubgroupShuffleDown { value, delta } => {
+                self.emitter.emit_capability_raw(66); // GroupNonUniformShuffleRelative
+                let raw_val = self.ensure_inst(value);
+                let raw_delta = self.ensure_inst(delta);
+                let u32_ty = self.u32_ty();
+                let val_ty = self.inst_types.get(&value).copied().unwrap_or(u32_ty);
+                let delta_ty = self.inst_types.get(&delta).copied().unwrap_or(u32_ty);
+                let delta_u32 = self.coerce_to_ty(raw_delta, delta_ty, u32_ty);
+                let scope = self
+                    .emitter
+                    .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+                let res = self.emitter.alloc_id();
+                self.emitter
+                    .emit_fn_inst_raw(348, &[val_ty, res, scope, raw_val, delta_u32]); // OpGroupNonUniformShuffleDown
+                (res, val_ty)
+            }
+            InstData::SubgroupMul(val) => {
+                self.emit_subgroup_arith(val, SubgroupArithKind::Mul, spirv::GroupOperation::Reduce)
+            }
+            InstData::SubgroupExclusiveMul(val) => self.emit_subgroup_arith(
+                val,
+                SubgroupArithKind::Mul,
+                spirv::GroupOperation::ExclusiveScan,
+            ),
+            InstData::SubgroupInclusiveMul(val) => self.emit_subgroup_arith(
+                val,
+                SubgroupArithKind::Mul,
+                spirv::GroupOperation::InclusiveScan,
+            ),
+            InstData::SubgroupExclusiveMin(val) => self.emit_subgroup_arith(
+                val,
+                SubgroupArithKind::Min,
+                spirv::GroupOperation::ExclusiveScan,
+            ),
+            InstData::SubgroupInclusiveMin(val) => self.emit_subgroup_arith(
+                val,
+                SubgroupArithKind::Min,
+                spirv::GroupOperation::InclusiveScan,
+            ),
+            InstData::SubgroupExclusiveMax(val) => self.emit_subgroup_arith(
+                val,
+                SubgroupArithKind::Max,
+                spirv::GroupOperation::ExclusiveScan,
+            ),
+            InstData::SubgroupInclusiveMax(val) => self.emit_subgroup_arith(
+                val,
+                SubgroupArithKind::Max,
+                spirv::GroupOperation::InclusiveScan,
+            ),
+            InstData::SubgroupBitAnd(val) => {
+                self.emit_subgroup_bitwise(val, 359, spirv::GroupOperation::Reduce, None)
+            }
+            InstData::SubgroupBitOr(val) => {
+                self.emit_subgroup_bitwise(val, 360, spirv::GroupOperation::Reduce, None)
+            }
+            InstData::SubgroupBitXor(val) => {
+                self.emit_subgroup_bitwise(val, 361, spirv::GroupOperation::Reduce, None)
+            }
+            InstData::SubgroupLogicalAnd(val) => self.emit_subgroup_logical(val, 362),
+            InstData::SubgroupLogicalOr(val) => self.emit_subgroup_logical(val, 363),
+            InstData::SubgroupLogicalXor(val) => self.emit_subgroup_logical(val, 364),
+            InstData::SubgroupClustered {
+                op,
+                value,
+                cluster_size,
+            } => {
+                self.emitter.emit_capability_raw(67); // GroupNonUniformClustered
+                let raw_cs = self.ensure_inst(cluster_size);
+                let u32_ty = self.u32_ty();
+                let cs_ty = self.inst_types.get(&cluster_size).copied().unwrap_or(u32_ty);
+                let cs_u32 = self.coerce_to_ty(raw_cs, cs_ty, u32_ty);
+                match op {
+                    SubgroupClusteredOp::Add => self.emit_subgroup_arith_clustered(
+                        value,
+                        SubgroupArithKind::Add,
+                        cs_u32,
+                    ),
+                    SubgroupClusteredOp::Mul => self.emit_subgroup_arith_clustered(
+                        value,
+                        SubgroupArithKind::Mul,
+                        cs_u32,
+                    ),
+                    SubgroupClusteredOp::Min => self.emit_subgroup_arith_clustered(
+                        value,
+                        SubgroupArithKind::Min,
+                        cs_u32,
+                    ),
+                    SubgroupClusteredOp::Max => self.emit_subgroup_arith_clustered(
+                        value,
+                        SubgroupArithKind::Max,
+                        cs_u32,
+                    ),
+                    SubgroupClusteredOp::BitAnd => self.emit_subgroup_bitwise(
+                        value,
+                        359,
+                        spirv::GroupOperation::ClusteredReduce,
+                        Some(cs_u32),
+                    ),
+                    SubgroupClusteredOp::BitOr => self.emit_subgroup_bitwise(
+                        value,
+                        360,
+                        spirv::GroupOperation::ClusteredReduce,
+                        Some(cs_u32),
+                    ),
+                    SubgroupClusteredOp::BitXor => self.emit_subgroup_bitwise(
+                        value,
+                        361,
+                        spirv::GroupOperation::ClusteredReduce,
+                        Some(cs_u32),
+                    ),
+                }
+            }
             InstData::QuadSwapDiagonal(val) => self.emit_quad_swap(val, 2),
+            InstData::QuadBroadcast { value, lane } => {
+                self.emitter
+                    .emit_capability(spirv::Capability::GroupNonUniformQuad);
+                let raw_val = self.ensure_inst(value);
+                let raw_lane = self.ensure_inst(lane);
+                let u32_ty = self.u32_ty();
+                let val_ty = self.inst_types.get(&value).copied().unwrap_or(u32_ty);
+                let lane_ty = self.inst_types.get(&lane).copied().unwrap_or(u32_ty);
+                let lane_u32 = self.coerce_to_ty(raw_lane, lane_ty, u32_ty);
+                let scope = self
+                    .emitter
+                    .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+                let res = self.emitter.alloc_id();
+                self.emitter
+                    .emit_fn_inst_raw(365, &[val_ty, res, scope, raw_val, lane_u32]); // OpGroupNonUniformQuadBroadcast
+                (res, val_ty)
+            }
             InstData::BitFieldExtract {
                 base,
                 offset,
@@ -7334,6 +7589,8 @@ impl FnLowerCtx<'_> {
         ) {
             (SubgroupArithKind::Add, true, _) => spirv::Op::GroupNonUniformFAdd,
             (SubgroupArithKind::Add, false, _) => spirv::Op::GroupNonUniformIAdd,
+            (SubgroupArithKind::Mul, true, _) => spirv::Op::GroupNonUniformFMul,
+            (SubgroupArithKind::Mul, false, _) => spirv::Op::GroupNonUniformIMul,
             (SubgroupArithKind::Min, true, _) => spirv::Op::GroupNonUniformFMin,
             (SubgroupArithKind::Min, false, true) => spirv::Op::GroupNonUniformSMin,
             (SubgroupArithKind::Min, false, false) => spirv::Op::GroupNonUniformUMin,
@@ -7348,6 +7605,98 @@ impl FnLowerCtx<'_> {
         self.emitter
             .emit_fn_inst(spv_op, &[val_ty, res, scope, group_op as u32, raw]);
         (res, val_ty)
+    }
+
+    fn emit_subgroup_arith_clustered(
+        &mut self,
+        val: InstId,
+        kind: SubgroupArithKind,
+        cluster_size_id: u32,
+    ) -> (u32, u32) {
+        self.emitter
+            .emit_capability(spirv::Capability::GroupNonUniformArithmetic);
+        let raw = self.ensure_inst(val);
+        let u32_ty = self.u32_ty();
+        let val_ty = self.inst_types.get(&val).copied().unwrap_or(u32_ty);
+        let spv_op = match (
+            kind,
+            self.is_float_spv_ty(val_ty),
+            self.is_signed_int_spv_ty(val_ty),
+        ) {
+            (SubgroupArithKind::Add, true, _) => spirv::Op::GroupNonUniformFAdd,
+            (SubgroupArithKind::Add, false, _) => spirv::Op::GroupNonUniformIAdd,
+            (SubgroupArithKind::Mul, true, _) => spirv::Op::GroupNonUniformFMul,
+            (SubgroupArithKind::Mul, false, _) => spirv::Op::GroupNonUniformIMul,
+            (SubgroupArithKind::Min, true, _) => spirv::Op::GroupNonUniformFMin,
+            (SubgroupArithKind::Min, false, true) => spirv::Op::GroupNonUniformSMin,
+            (SubgroupArithKind::Min, false, false) => spirv::Op::GroupNonUniformUMin,
+            (SubgroupArithKind::Max, true, _) => spirv::Op::GroupNonUniformFMax,
+            (SubgroupArithKind::Max, false, true) => spirv::Op::GroupNonUniformSMax,
+            (SubgroupArithKind::Max, false, false) => spirv::Op::GroupNonUniformUMax,
+        };
+        let scope = self
+            .emitter
+            .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+        let res = self.emitter.alloc_id();
+        self.emitter.emit_fn_inst(
+            spv_op,
+            &[
+                val_ty,
+                res,
+                scope,
+                spirv::GroupOperation::ClusteredReduce as u32,
+                raw,
+                cluster_size_id,
+            ],
+        );
+        (res, val_ty)
+    }
+
+    fn emit_subgroup_bitwise(
+        &mut self,
+        val: InstId,
+        opcode: u16,
+        group_op: spirv::GroupOperation,
+        cluster_size_id: Option<u32>,
+    ) -> (u32, u32) {
+        self.emitter
+            .emit_capability(spirv::Capability::GroupNonUniformArithmetic);
+        let raw = self.ensure_inst(val);
+        let u32_ty = self.u32_ty();
+        let val_ty = self.inst_types.get(&val).copied().unwrap_or(u32_ty);
+        let scope = self
+            .emitter
+            .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+        let res = self.emitter.alloc_id();
+        let mut ops = vec![val_ty, res, scope, group_op as u32, raw];
+        if let Some(cs) = cluster_size_id {
+            ops.push(cs);
+        }
+        self.emitter.emit_fn_inst_raw(opcode, &ops);
+        (res, val_ty)
+    }
+
+    fn emit_subgroup_logical(&mut self, val: InstId, opcode: u16) -> (u32, u32) {
+        self.emitter
+            .emit_capability(spirv::Capability::GroupNonUniformArithmetic);
+        let pred_id = self.ensure_bool(val);
+        let u32_ty = self.u32_ty();
+        let bool_ty = self.bool_ty();
+        let scope = self
+            .emitter
+            .emit_constant_32(u32_ty, spirv::Scope::Subgroup as u32);
+        let res = self.emitter.alloc_id();
+        self.emitter.emit_fn_inst_raw(
+            opcode,
+            &[
+                bool_ty,
+                res,
+                scope,
+                spirv::GroupOperation::Reduce as u32,
+                pred_id,
+            ],
+        );
+        (res, bool_ty)
     }
 
     fn emit_quad_swap(&mut self, val: InstId, direction: u32) -> (u32, u32) {
@@ -9054,6 +9403,7 @@ enum AtomicOpKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubgroupArithKind {
     Add,
+    Mul,
     Min,
     Max,
 }
@@ -10277,6 +10627,7 @@ mod tests {
             None,
             InstData::ImageSample {
                 descriptor_index: 0,
+                sampler_descriptor_index: None,
                 image_inst: None,
                 coord,
                 lod,
@@ -10287,6 +10638,7 @@ mod tests {
             None,
             InstData::ImageSample {
                 descriptor_index: 1,
+                sampler_descriptor_index: None,
                 image_inst: None,
                 coord,
                 lod,
@@ -10821,6 +11173,7 @@ mod tests {
             None,
             InstData::ImageSample {
                 descriptor_index: 0,
+                sampler_descriptor_index: None,
                 image_inst: Some(resource_load),
                 coord,
                 lod,
@@ -10910,6 +11263,7 @@ mod tests {
             None,
             InstData::ImageSample {
                 descriptor_index: 0,
+                sampler_descriptor_index: None,
                 image_inst: Some(image_load),
                 coord,
                 lod,
@@ -11604,6 +11958,7 @@ mod tests {
             vec4_f32.clone(),
             InstData::ImageSample {
                 descriptor_index: 0,
+                sampler_descriptor_index: None,
                 image_inst: None,
                 coord: uv,
                 lod,
@@ -11614,6 +11969,7 @@ mod tests {
             vec4_f32.clone(),
             InstData::ImageSampleGrad {
                 descriptor_index: 0,
+                sampler_descriptor_index: None,
                 image_inst: None,
                 coord: uv,
                 ddx: uv,
@@ -11624,6 +11980,7 @@ mod tests {
             vec4_f32,
             InstData::ImageGather {
                 descriptor_index: 0,
+                sampler_descriptor_index: None,
                 image_inst: None,
                 coord: uv,
                 component: 0,

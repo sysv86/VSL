@@ -1270,8 +1270,12 @@ fn is_image_param_type(types: &TypeArena, ty: TypeId) -> bool {
             | Type::Texture2DArray { .. }
             | Type::Texture3D { .. }
             | Type::TextureCube { .. }
+            | Type::Texture1D { .. }
             | Type::Texture2DMS { .. }
+            | Type::BufferView { .. }
             | Type::SubpassInput { .. }
+            | Type::RwImage1D(_)
+            | Type::RwBufferView(_)
             | Type::RwImage2D(_)
             | Type::RwImage2DArray(_)
             | Type::RwImage3D(_)
@@ -4883,6 +4887,34 @@ fn classify_resource_type(ty: &Type, mode: ParamMode) -> Option<ClassifiedResour
             access: DescriptorAccess::ReadOnly,
             is_unsized: false,
         }),
+        Type::Texture1D { sample_scalar } => Some(ClassifiedResource {
+            kind: DescriptorKind::SampledImage,
+            dim: Some(TextureDim::Dim1D),
+            image_format: None,
+            sample_scalar: Some(*sample_scalar),
+            access: DescriptorAccess::ReadOnly,
+        }),
+        Type::BufferView { sample_scalar } => Some(ClassifiedResource {
+            kind: DescriptorKind::SampledImage,
+            dim: Some(TextureDim::DimBuffer),
+            image_format: None,
+            sample_scalar: Some(*sample_scalar),
+            access: DescriptorAccess::ReadOnly,
+        }),
+        Type::RwImage1D(fmt) => Some(ClassifiedResource {
+            kind: DescriptorKind::StorageImage,
+            dim: Some(TextureDim::Dim1D),
+            image_format: Some(*fmt),
+            sample_scalar: None,
+            access: DescriptorAccess::ReadWrite,
+        }),
+        Type::RwBufferView(fmt) => Some(ClassifiedResource {
+            kind: DescriptorKind::StorageImage,
+            dim: Some(TextureDim::DimBuffer),
+            image_format: Some(*fmt),
+            sample_scalar: None,
+            access: DescriptorAccess::ReadWrite,
+        }),
         Type::Texture2DMS { sample_scalar } => Some(ClassifiedResource {
             kind: DescriptorKind::SampledImage,
             dim: Some(TextureDim::Dim2DMS),
@@ -5100,8 +5132,12 @@ const fn is_opaque_handle_type(ty: &Type) -> bool {
             | Type::Texture2DArray { .. }
             | Type::Texture3D { .. }
             | Type::TextureCube { .. }
+            | Type::Texture1D { .. }
             | Type::Texture2DMS { .. }
+            | Type::BufferView { .. }
             | Type::SubpassInput { .. }
+            | Type::RwImage1D(_)
+            | Type::RwBufferView(_)
             | Type::RwImage2D(_)
             | Type::RwImage2DArray(_)
             | Type::RwImage3D(_)
@@ -6890,7 +6926,9 @@ impl BodyScanner<'_, '_> {
                         | Type::Texture2DArray { sample_scalar }
                         | Type::Texture3D { sample_scalar }
                         | Type::TextureCube { sample_scalar }
+                        | Type::Texture1D { sample_scalar }
                         | Type::Texture2DMS { sample_scalar }
+                        | Type::BufferView { sample_scalar }
                         | Type::SubpassInput { sample_scalar, .. } => {
                             if matches!(
                                 method.name.as_str(),
@@ -7532,11 +7570,50 @@ fn infer_builtin_call_return_type(
             scalar: ScalarKind::U32,
             len: 4,
         })),
-        "subgroup_ballot_bit_count" | "subgroup_ballot_exclusive_bit_count" => {
-            Some(types.alloc(Type::Scalar(ScalarKind::U32)))
-        }
+        "subgroup_ballot_bit_count"
+        | "subgroup_ballot_exclusive_bit_count"
+        | "subgroup_ballot_inclusive_bit_count"
+        | "subgroup_ballot_find_lsb"
+        | "subgroup_ballot_find_msb" => Some(types.alloc(Type::Scalar(ScalarKind::U32))),
+        "subgroup_ballot_bit_extract"
+        | "subgroup_any"
+        | "subgroup_all"
+        | "subgroup_elect"
+        | "subgroup_logical_and"
+        | "subgroup_logical_or"
+        | "subgroup_logical_xor" => Some(types.alloc(Type::Scalar(ScalarKind::Bool))),
         "subgroup_broadcast_first"
         | "subgroup_broadcast"
+        | "subgroup_add"
+        | "subgroup_mul"
+        | "subgroup_min"
+        | "subgroup_max"
+        | "subgroup_exclusive_add"
+        | "subgroup_inclusive_add"
+        | "subgroup_exclusive_mul"
+        | "subgroup_inclusive_mul"
+        | "subgroup_exclusive_min"
+        | "subgroup_inclusive_min"
+        | "subgroup_exclusive_max"
+        | "subgroup_inclusive_max"
+        | "subgroup_bit_and"
+        | "subgroup_bit_or"
+        | "subgroup_bit_xor"
+        | "subgroup_shuffle"
+        | "subgroup_shuffle_xor"
+        | "subgroup_shuffle_up"
+        | "subgroup_shuffle_down"
+        | "subgroup_clustered_add"
+        | "subgroup_clustered_mul"
+        | "subgroup_clustered_min"
+        | "subgroup_clustered_max"
+        | "subgroup_clustered_and"
+        | "subgroup_clustered_or"
+        | "subgroup_clustered_xor"
+        | "quad_swap_horizontal"
+        | "quad_swap_vertical"
+        | "quad_swap_diagonal"
+        | "quad_broadcast"
         | "nonuniform"
         | "min"
         | "max"
@@ -8103,9 +8180,17 @@ fn format_type_name(types: &TypeArena, id: TypeId) -> String {
         Type::TextureCube { sample_scalar } => {
             format!("TextureCube<{}>", scalar_name(*sample_scalar))
         }
+        Type::Texture1D { sample_scalar } => {
+            format!("Texture1D<{}>", scalar_name(*sample_scalar))
+        }
         Type::Texture2DMS { sample_scalar } => {
             format!("Texture2DMS<{}>", scalar_name(*sample_scalar))
         }
+        Type::BufferView { sample_scalar } => {
+            format!("BufferView<{}>", scalar_name(*sample_scalar))
+        }
+        Type::RwImage1D(fmt) => format!("RWImage1D<{fmt:?}>"),
+        Type::RwBufferView(fmt) => format!("RWBufferView<{fmt:?}>"),
         Type::SubpassInput { sample_scalar, ms } => {
             if *ms {
                 format!("SubpassInputMS<{}>", scalar_name(*sample_scalar))
@@ -8712,7 +8797,13 @@ fn lower_type_expr(
                 "TextureCube" => Type::TextureCube {
                     sample_scalar: first_type_arg_scalar(args).unwrap_or(ScalarKind::F32),
                 },
+                "Texture1D" => Type::Texture1D {
+                    sample_scalar: first_type_arg_scalar(args).unwrap_or(ScalarKind::F32),
+                },
                 "Texture2DMS" => Type::Texture2DMS {
+                    sample_scalar: first_type_arg_scalar(args).unwrap_or(ScalarKind::F32),
+                },
+                "BufferView" | "TextureBuffer" => Type::BufferView {
                     sample_scalar: first_type_arg_scalar(args).unwrap_or(ScalarKind::F32),
                 },
                 "SubpassInput" => Type::SubpassInput {
@@ -8723,7 +8814,11 @@ fn lower_type_expr(
                     sample_scalar: first_type_arg_scalar(args).unwrap_or(ScalarKind::F32),
                     ms: true,
                 },
+                "RWImage1D" | "RwImage1D" => Type::RwImage1D(first_type_arg_image_format(args)?),
                 "RWImage2D" => Type::RwImage2D(first_type_arg_image_format(args)?),
+                "RWBufferView" | "RwBufferView" | "RWTextureBuffer" | "RwTextureBuffer" => {
+                    Type::RwBufferView(first_type_arg_image_format(args)?)
+                }
                 "RWImage2DArray" => Type::RwImage2DArray(first_type_arg_image_format(args)?),
                 "RWImage3D" => Type::RwImage3D(first_type_arg_image_format(args)?),
                 "Sampler" => Type::Sampler,

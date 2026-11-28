@@ -144,7 +144,9 @@ pub enum TextureDim {
     Dim2DArray,
     Dim3D,
     DimCube,
+    Dim1D,
     Dim2DMS,
+    DimBuffer,
     SubpassData,
 }
 

@@ -318,8 +318,12 @@ impl IrType {
             | Type::Texture2DArray { .. }
             | Type::Texture3D { .. }
             | Type::TextureCube { .. }
+            | Type::Texture1D { .. }
             | Type::Texture2DMS { .. }
+            | Type::BufferView { .. }
             | Type::SubpassInput { .. }
+            | Type::RwImage1D(_)
+            | Type::RwBufferView(_)
             | Type::RwImage2D(_)
             | Type::RwImage2DArray(_)
             | Type::RwImage3D(_)
@@ -607,6 +611,19 @@ pub enum IrTessSpacing {
 pub enum IrTessOrder {
     Cw,
     Ccw,
+}
+
+/// Clustered subgroup reduction operation (`GroupNonUniformClustered`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubgroupClusteredOp {
+    Add,
+    Mul,
+    Min,
+    Max,
+    BitAnd,
+    BitOr,
+    BitXor,
 }
 
 /// Fragment shader interlock execution mode (`VK_EXT_fragment_shader_interlock`).
@@ -994,6 +1011,7 @@ pub enum InstData {
     /// normalized UV/cube sampling (`OpImageSampleExplicitLod`) is emitted.
     ImageSample {
         descriptor_index: u32,
+        sampler_descriptor_index: Option<u32>,
         image_inst: Option<InstId>,
         coord: InstId,
         lod: InstId,
@@ -1002,12 +1020,14 @@ pub enum InstData {
     /// Fragment-stage implicit-LOD image sample (`OpImageSampleImplicitLod`).
     ImageSampleImplicitLod {
         descriptor_index: u32,
+        sampler_descriptor_index: Option<u32>,
         image_inst: Option<InstId>,
         coord: InstId,
     },
     /// Explicit-gradient image sample (`OpImageSampleExplicitLod` with `Grad`).
     ImageSampleGrad {
         descriptor_index: u32,
+        sampler_descriptor_index: Option<u32>,
         image_inst: Option<InstId>,
         coord: InstId,
         ddx: InstId,
@@ -1016,6 +1036,7 @@ pub enum InstData {
     /// Depth-comparison image sample with explicit LOD (`OpImageSampleDrefExplicitLod`).
     ImageSampleDrefExplicitLod {
         descriptor_index: u32,
+        sampler_descriptor_index: Option<u32>,
         image_inst: Option<InstId>,
         coord: InstId,
         dref: InstId,
@@ -1024,6 +1045,7 @@ pub enum InstData {
     /// 4-texel component gather (`OpImageGather`).
     ImageGather {
         descriptor_index: u32,
+        sampler_descriptor_index: Option<u32>,
         image_inst: Option<InstId>,
         coord: InstId,
         component: u32,
@@ -1127,9 +1149,49 @@ pub enum InstData {
     SubgroupAny(InstId),
     SubgroupAll(InstId),
     SubgroupElect,
+    SubgroupBroadcast {
+        value: InstId,
+        lane: InstId,
+    },
+    SubgroupBallotBitExtract {
+        ballot: InstId,
+        index: InstId,
+    },
+    SubgroupBallotFindLsb(InstId),
+    SubgroupBallotFindMsb(InstId),
+    SubgroupShuffleUp {
+        value: InstId,
+        delta: InstId,
+    },
+    SubgroupShuffleDown {
+        value: InstId,
+        delta: InstId,
+    },
+    SubgroupMul(InstId),
+    SubgroupExclusiveMul(InstId),
+    SubgroupInclusiveMul(InstId),
+    SubgroupExclusiveMin(InstId),
+    SubgroupInclusiveMin(InstId),
+    SubgroupExclusiveMax(InstId),
+    SubgroupInclusiveMax(InstId),
+    SubgroupBitAnd(InstId),
+    SubgroupBitOr(InstId),
+    SubgroupBitXor(InstId),
+    SubgroupLogicalAnd(InstId),
+    SubgroupLogicalOr(InstId),
+    SubgroupLogicalXor(InstId),
+    SubgroupClustered {
+        op: SubgroupClusteredOp,
+        value: InstId,
+        cluster_size: InstId,
+    },
     QuadSwapHorizontal(InstId),
     QuadSwapVertical(InstId),
     QuadSwapDiagonal(InstId),
+    QuadBroadcast {
+        value: InstId,
+        lane: InstId,
+    },
     /// Bitfield extract (`OpBitFieldSExtract` / `OpBitFieldUExtract`).
     BitFieldExtract {
         base: InstId,
@@ -1421,6 +1483,21 @@ impl InstData {
             | Self::SubgroupInclusiveAdd(v)
             | Self::SubgroupAny(v)
             | Self::SubgroupAll(v)
+            | Self::SubgroupBallotFindLsb(v)
+            | Self::SubgroupBallotFindMsb(v)
+            | Self::SubgroupMul(v)
+            | Self::SubgroupExclusiveMul(v)
+            | Self::SubgroupInclusiveMul(v)
+            | Self::SubgroupExclusiveMin(v)
+            | Self::SubgroupInclusiveMin(v)
+            | Self::SubgroupExclusiveMax(v)
+            | Self::SubgroupInclusiveMax(v)
+            | Self::SubgroupBitAnd(v)
+            | Self::SubgroupBitOr(v)
+            | Self::SubgroupBitXor(v)
+            | Self::SubgroupLogicalAnd(v)
+            | Self::SubgroupLogicalOr(v)
+            | Self::SubgroupLogicalXor(v)
             | Self::QuadSwapHorizontal(v)
             | Self::QuadSwapVertical(v)
             | Self::QuadSwapDiagonal(v)
@@ -1509,7 +1586,20 @@ impl InstData {
                 ptr: a, value: b, ..
             }
             | Self::SubgroupShuffle { value: a, lane: b }
-            | Self::SubgroupShuffleXor { value: a, mask: b } => vec![*a, *b],
+            | Self::SubgroupShuffleXor { value: a, mask: b }
+            | Self::SubgroupBroadcast { value: a, lane: b }
+            | Self::SubgroupBallotBitExtract {
+                ballot: a,
+                index: b,
+            }
+            | Self::SubgroupShuffleUp { value: a, delta: b }
+            | Self::SubgroupShuffleDown { value: a, delta: b }
+            | Self::SubgroupClustered {
+                value: a,
+                cluster_size: b,
+                ..
+            }
+            | Self::QuadBroadcast { value: a, lane: b } => vec![*a, *b],
             Self::AtomicCas {
                 ptr,
                 expected,
@@ -1780,6 +1870,10 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
         | InstData::SubgroupAny(_)
         | InstData::SubgroupAll(_)
         | InstData::SubgroupElect
+        | InstData::SubgroupBallotBitExtract { .. }
+        | InstData::SubgroupLogicalAnd(_)
+        | InstData::SubgroupLogicalOr(_)
+        | InstData::SubgroupLogicalXor(_)
         | InstData::RayQueryProceed(_)
         | InstData::RayQueryCommittedFrontFace(_)
         | InstData::ReportIntersectionKhr { .. }
@@ -1790,6 +1884,8 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
         | InstData::SubgroupBallotBitCount(_)
         | InstData::SubgroupBallotExclusiveBitCount(_)
         | InstData::SubgroupBallotInclusiveBitCount(_)
+        | InstData::SubgroupBallotFindLsb(_)
+        | InstData::SubgroupBallotFindMsb(_)
         | InstData::BitCount(_)
         | InstData::ImageQueryLevels { .. }
         | InstData::RayQueryCommittedType(_)
@@ -1950,6 +2046,27 @@ impl Inst {
                 | InstData::SubgroupAny(_)
                 | InstData::SubgroupAll(_)
                 | InstData::SubgroupElect
+                | InstData::SubgroupBroadcast { .. }
+                | InstData::SubgroupBallotBitExtract { .. }
+                | InstData::SubgroupBallotFindLsb(_)
+                | InstData::SubgroupBallotFindMsb(_)
+                | InstData::SubgroupShuffleUp { .. }
+                | InstData::SubgroupShuffleDown { .. }
+                | InstData::SubgroupMul(_)
+                | InstData::SubgroupExclusiveMul(_)
+                | InstData::SubgroupInclusiveMul(_)
+                | InstData::SubgroupExclusiveMin(_)
+                | InstData::SubgroupInclusiveMin(_)
+                | InstData::SubgroupExclusiveMax(_)
+                | InstData::SubgroupInclusiveMax(_)
+                | InstData::SubgroupBitAnd(_)
+                | InstData::SubgroupBitOr(_)
+                | InstData::SubgroupBitXor(_)
+                | InstData::SubgroupLogicalAnd(_)
+                | InstData::SubgroupLogicalOr(_)
+                | InstData::SubgroupLogicalXor(_)
+                | InstData::SubgroupClustered { .. }
+                | InstData::QuadBroadcast { .. }
                 | InstData::QuadSwapHorizontal(_)
                 | InstData::QuadSwapVertical(_)
                 | InstData::QuadSwapDiagonal(_)
@@ -2103,6 +2220,21 @@ impl IrFunction {
             | InstData::SubgroupInclusiveAdd(a)
             | InstData::SubgroupShuffle { value: a, .. }
             | InstData::SubgroupShuffleXor { value: a, .. }
+            | InstData::SubgroupBroadcast { value: a, .. }
+            | InstData::SubgroupShuffleUp { value: a, .. }
+            | InstData::SubgroupShuffleDown { value: a, .. }
+            | InstData::SubgroupMul(a)
+            | InstData::SubgroupExclusiveMul(a)
+            | InstData::SubgroupInclusiveMul(a)
+            | InstData::SubgroupExclusiveMin(a)
+            | InstData::SubgroupInclusiveMin(a)
+            | InstData::SubgroupExclusiveMax(a)
+            | InstData::SubgroupInclusiveMax(a)
+            | InstData::SubgroupBitAnd(a)
+            | InstData::SubgroupBitOr(a)
+            | InstData::SubgroupBitXor(a)
+            | InstData::SubgroupClustered { value: a, .. }
+            | InstData::QuadBroadcast { value: a, .. }
             | InstData::QuadSwapHorizontal(a)
             | InstData::QuadSwapVertical(a)
             | InstData::QuadSwapDiagonal(a)

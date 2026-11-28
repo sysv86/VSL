@@ -16,7 +16,7 @@ use vsl_hir::{
 use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixLayout, GlslStd450Op, InstData, InstId,
     IrDescriptorVar,
-    IrFunction, IrInterlockMode, IrInterpolation, IrLocalVar, IrModule, IrParam,
+    IrFunction, IrInterlockMode, SubgroupClusteredOp, IrInterpolation, IrLocalVar, IrModule, IrParam,
     IrPushConstantBlock,
     IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
     IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,
@@ -4939,6 +4939,235 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }
+            "quad_broadcast" | "std::subgroup::quad_broadcast" => {
+                let value = self.require_arg(args, 0, joined, span, out)?;
+                let lane = self.require_arg(args, 1, joined, span, out)?;
+                self.ir_fn.uses_quad_control = true;
+                let ty = self.inst_ty(value).clone();
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::QuadBroadcast { value, lane });
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_broadcast" | "std::subgroup::subgroup_broadcast" => {
+                let value = self.require_arg(args, 0, joined, span, out)?;
+                let lane = self.require_arg(args, 1, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(value).clone();
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::SubgroupBroadcast { value, lane });
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_ballot_bit_extract" | "std::subgroup::subgroup_ballot_bit_extract" => {
+                let ballot = self.require_arg(args, 0, joined, span, out)?;
+                let index = self.require_arg(args, 1, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let id = self.ir_fn.emit_typed(
+                    IrType::Scalar(ScalarIrTy::Bool),
+                    InstData::SubgroupBallotBitExtract { ballot, index },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_ballot_find_lsb" | "std::subgroup::subgroup_ballot_find_lsb" => {
+                let ballot = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let id = self.ir_fn.emit_typed(
+                    IrType::Scalar(ScalarIrTy::U32),
+                    InstData::SubgroupBallotFindLsb(ballot),
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_ballot_find_msb" | "std::subgroup::subgroup_ballot_find_msb" => {
+                let ballot = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let id = self.ir_fn.emit_typed(
+                    IrType::Scalar(ScalarIrTy::U32),
+                    InstData::SubgroupBallotFindMsb(ballot),
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_shuffle_up" | "std::subgroup::subgroup_shuffle_up" => {
+                let value = self.require_arg(args, 0, joined, span, out)?;
+                let delta = self.require_arg(args, 1, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(value).clone();
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::SubgroupShuffleUp { value, delta });
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_shuffle_down" | "std::subgroup::subgroup_shuffle_down" => {
+                let value = self.require_arg(args, 0, joined, span, out)?;
+                let delta = self.require_arg(args, 1, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(value).clone();
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::SubgroupShuffleDown { value, delta });
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_mul" | "std::subgroup::subgroup_mul" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupMul(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_exclusive_mul" | "std::subgroup::subgroup_exclusive_mul" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupExclusiveMul(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_inclusive_mul" | "std::subgroup::subgroup_inclusive_mul" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupInclusiveMul(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_exclusive_min" | "std::subgroup::subgroup_exclusive_min" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupExclusiveMin(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_inclusive_min" | "std::subgroup::subgroup_inclusive_min" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupInclusiveMin(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_exclusive_max" | "std::subgroup::subgroup_exclusive_max" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupExclusiveMax(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_inclusive_max" | "std::subgroup::subgroup_inclusive_max" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupInclusiveMax(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_bit_and" | "std::subgroup::subgroup_bit_and" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupBitAnd(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_bit_or" | "std::subgroup::subgroup_bit_or" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupBitOr(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_bit_xor" | "std::subgroup::subgroup_bit_xor" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let ty = self.inst_ty(val).clone();
+                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupBitXor(val));
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_logical_and" | "std::subgroup::subgroup_logical_and" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let id = self.ir_fn.emit_typed(
+                    IrType::Scalar(ScalarIrTy::Bool),
+                    InstData::SubgroupLogicalAnd(val),
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_logical_or" | "std::subgroup::subgroup_logical_or" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let id = self.ir_fn.emit_typed(
+                    IrType::Scalar(ScalarIrTy::Bool),
+                    InstData::SubgroupLogicalOr(val),
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_logical_xor" | "std::subgroup::subgroup_logical_xor" => {
+                let val = self.require_arg(args, 0, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let id = self.ir_fn.emit_typed(
+                    IrType::Scalar(ScalarIrTy::Bool),
+                    InstData::SubgroupLogicalXor(val),
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "subgroup_clustered_add"
+            | "std::subgroup::subgroup_clustered_add"
+            | "subgroup_clustered_mul"
+            | "std::subgroup::subgroup_clustered_mul"
+            | "subgroup_clustered_min"
+            | "std::subgroup::subgroup_clustered_min"
+            | "subgroup_clustered_max"
+            | "std::subgroup::subgroup_clustered_max"
+            | "subgroup_clustered_and"
+            | "std::subgroup::subgroup_clustered_and"
+            | "subgroup_clustered_or"
+            | "std::subgroup::subgroup_clustered_or"
+            | "subgroup_clustered_xor"
+            | "std::subgroup::subgroup_clustered_xor" => {
+                let value = self.require_arg(args, 0, joined, span, out)?;
+                let cluster_size = self.require_arg(args, 1, joined, span, out)?;
+                self.ir_fn.uses_subgroups = true;
+                let op = if joined.ends_with("_add") {
+                    SubgroupClusteredOp::Add
+                } else if joined.ends_with("_mul") {
+                    SubgroupClusteredOp::Mul
+                } else if joined.ends_with("_min") {
+                    SubgroupClusteredOp::Min
+                } else if joined.ends_with("_max") {
+                    SubgroupClusteredOp::Max
+                } else if joined.ends_with("_and") {
+                    SubgroupClusteredOp::BitAnd
+                } else if joined.ends_with("_or") {
+                    SubgroupClusteredOp::BitOr
+                } else {
+                    SubgroupClusteredOp::BitXor
+                };
+                let ty = self.inst_ty(value).clone();
+                let id = self.ir_fn.emit_typed(
+                    ty,
+                    InstData::SubgroupClustered {
+                        op,
+                        value,
+                        cluster_size,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
             // Bit, predicate, and fragment derivative intrinsics.
             "bitfield_extract" => {
                 let base = self.require_arg(args, 0, joined, span, out)?;
@@ -5700,6 +5929,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 },
                 InstData::ImageSample {
                     descriptor_index: depth_desc_idx,
+                    sampler_descriptor_index: None,
                     image_inst: None,
                     coord: first_arg,
                     lod: lod0,
@@ -6576,11 +6806,18 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             vec4_f32.clone()
         };
 
+        let mut sampler_descriptor_index = None;
         let arg_offset = usize::from(args.first().is_some_and(|a| {
-            matches!(
+            let is_sampler = matches!(
                 self.hir.types.get(a.value.ty),
                 Type::Sampler | Type::SamplerShadow
-            )
+            );
+            if is_sampler
+                && let HirExprKind::Path(path) = &a.value.kind
+            {
+                sampler_descriptor_index = self.resolve_descriptor_path(path);
+            }
+            is_sampler
         }));
 
         let id = match method {
@@ -6619,6 +6856,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         res_ty,
                         InstData::ImageSampleImplicitLod {
                             descriptor_index,
+                            sampler_descriptor_index,
                             image_inst,
                             coord,
                         },
@@ -6631,6 +6869,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         res_ty,
                         InstData::ImageSample {
                             descriptor_index,
+                            sampler_descriptor_index,
                             image_inst,
                             coord,
                             lod,
@@ -6654,6 +6893,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     res_ty,
                     InstData::ImageSample {
                         descriptor_index,
+                        sampler_descriptor_index,
                         image_inst,
                         coord,
                         lod,
@@ -6681,6 +6921,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     res_ty,
                     InstData::ImageSampleGrad {
                         descriptor_index,
+                        sampler_descriptor_index,
                         image_inst,
                         coord,
                         ddx,
@@ -6709,6 +6950,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     IrType::Scalar(ScalarIrTy::F32),
                     InstData::ImageSampleDrefExplicitLod {
                         descriptor_index,
+                        sampler_descriptor_index,
                         image_inst,
                         coord,
                         dref,
@@ -6717,11 +6959,12 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 )
             }
             "gather" => {
-                let Ok(coord) = self.require_arg(args, 0, "texture::gather", span, out) else {
+                let Ok(coord) = self.require_arg(args, arg_offset, "texture::gather", span, out)
+                else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
                 let component = args
-                    .get(1)
+                    .get(arg_offset + 1)
                     .and_then(|a| parse_const_i64_hir(&a.value))
                     .and_then(|v| u32::try_from(v).ok())
                     .unwrap_or(0);
@@ -6729,6 +6972,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     res_ty,
                     InstData::ImageGather {
                         descriptor_index,
+                        sampler_descriptor_index,
                         image_inst,
                         coord,
                         component,
@@ -6749,6 +6993,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     res_ty,
                     InstData::ImageSample {
                         descriptor_index,
+                        sampler_descriptor_index: None,
                         image_inst,
                         coord,
                         lod,
