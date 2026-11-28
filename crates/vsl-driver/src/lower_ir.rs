@@ -4703,6 +4703,25 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }
+            "debug_printf" | "debugPrintfEXT" | "std::debug::debug_printf" => {
+                let format = match args.first().map(|a| &a.value.kind) {
+                    Some(HirExprKind::StringLit(raw)) => SmolStr::new(raw.trim_matches('"')),
+                    _ => SmolStr::new(""),
+                };
+                let mut printf_args = Vec::with_capacity(args.len().saturating_sub(1));
+                for arg in args.iter().skip(1) {
+                    printf_args.push(self.lower_expr(&arg.value, out));
+                }
+                let id = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::DebugPrintf {
+                        format,
+                        args: printf_args,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
             "nonuniform" => {
                 let inner = self.require_arg(args, 0, joined, span, out)?;
                 let ty = self.inst_ty(inner).clone();

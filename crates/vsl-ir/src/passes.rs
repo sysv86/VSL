@@ -544,6 +544,8 @@ impl IrPass for ConstFoldPass {
                     | InstData::ImageFetchMs { .. }
                     | InstData::BeginInvocationInterlockExt
                     | InstData::EndInvocationInterlockExt
+                    | InstData::DebugPrintf { .. }
+                    | InstData::DebugLine { .. }
                     | InstData::Nop => None,
                 };
                 if let Some(new_data) = folded {
@@ -2712,6 +2714,14 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         },
         InstData::BeginInvocationInterlockExt => InstData::BeginInvocationInterlockExt,
         InstData::EndInvocationInterlockExt => InstData::EndInvocationInterlockExt,
+        InstData::DebugPrintf { format, args } => InstData::DebugPrintf {
+            format: format.clone(),
+            args: args.iter().map(|&a| remap_id(a, remap)).collect(),
+        },
+        InstData::DebugLine { line, col } => InstData::DebugLine {
+            line: *line,
+            col: *col,
+        },
         InstData::Nop => InstData::Nop,
     }
 }
@@ -3321,6 +3331,8 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::ImageFetchMs { .. }
                     | InstData::BeginInvocationInterlockExt
                     | InstData::EndInvocationInterlockExt
+                    | InstData::DebugPrintf { .. }
+                    | InstData::DebugLine { .. }
                     | InstData::Nop => false,
                 };
                 if tainted {

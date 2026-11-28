@@ -55,6 +55,8 @@ pub struct CompileOptions {
     pub driver_uuid: [u8; 16],
     /// Optional directory for persistent disk L2 `CompiledShaderUnit` artifacts.
     pub l2_cache_dir: Option<PathBuf>,
+    /// Emit `NonSemantic.Shader.DebugInfo.100` metadata for RenderDoc / Nsight debugging.
+    pub emit_debug_info: bool,
 }
 
 impl CompileOptions {
@@ -89,6 +91,7 @@ impl CompileOptions {
             pack_schema: None,
             driver_uuid: [0u8; 16],
             l2_cache_dir: None,
+            emit_debug_info: false,
         }
     }
 }
@@ -922,6 +925,14 @@ fn compile_single_entry_unit(
         entry_ir.required_caps |= required_caps;
     }
 
+    if options.emit_debug_info
+        && let Some(entry_ir) = lowered.ir_module.functions.first_mut()
+    {
+        entry_ir.debug_source = Some(vsl_ir::IrDebugSource {
+            file_name: SmolStr::new(source_name),
+            source_text: Some(SmolStr::new(source)),
+        });
+    }
     let spirv = emit_module_spirv(&lowered.ir_module);
 
     let unit = CompiledShaderUnit {

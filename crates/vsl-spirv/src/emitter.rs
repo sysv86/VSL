@@ -180,10 +180,14 @@ pub struct SpirvEmitter {
     extensions_seen: IndexSet<String>,
     ext_inst_imports: Vec<u32>,
     glsl_std_450_id: Option<u32>,
+    debug_info_ext_id: Option<u32>,
+    debug_printf_ext_id: Option<u32>,
     decorations_seen: IndexSet<(u32, u32)>,
     memory_model: Vec<u32>,
     entry_points: Vec<u32>,
     execution_modes: Vec<u32>,
+    debug_strings: Vec<u32>,
+    string_cache: IndexMap<String, u32>,
     debug_names: Vec<u32>,
     decorations: Vec<u32>,
     types_globals: Vec<u32>,
@@ -214,10 +218,14 @@ impl SpirvEmitter {
             extensions_seen: IndexSet::new(),
             ext_inst_imports: Vec::new(),
             glsl_std_450_id: None,
+            debug_info_ext_id: None,
+            debug_printf_ext_id: None,
             decorations_seen: IndexSet::new(),
             memory_model: Vec::new(),
             entry_points: Vec::new(),
             execution_modes: Vec::new(),
+            debug_strings: Vec::new(),
+            string_cache: IndexMap::new(),
             debug_names: Vec::new(),
             decorations: Vec::new(),
             types_globals: Vec::new(),
@@ -265,6 +273,62 @@ impl SpirvEmitter {
         push_inst(&mut self.ext_inst_imports, spirv::Op::ExtInstImport, &ops);
         self.glsl_std_450_id = Some(id);
         id
+    }
+
+    pub fn emit_debug_info_import(&mut self) -> u32 {
+        if let Some(id) = self.debug_info_ext_id {
+            return id;
+        }
+        self.emit_extension("SPV_KHR_non_semantic_info");
+        let id = self.alloc_id();
+        let mut ops = vec![id];
+        ops.extend(encode_literal_string("NonSemantic.Shader.DebugInfo.100"));
+        push_inst(&mut self.ext_inst_imports, spirv::Op::ExtInstImport, &ops);
+        self.debug_info_ext_id = Some(id);
+        id
+    }
+
+    pub fn emit_debug_printf_import(&mut self) -> u32 {
+        if let Some(id) = self.debug_printf_ext_id {
+            return id;
+        }
+        self.emit_extension("SPV_KHR_non_semantic_info");
+        let id = self.alloc_id();
+        let mut ops = vec![id];
+        ops.extend(encode_literal_string("NonSemantic.DebugPrintf"));
+        push_inst(&mut self.ext_inst_imports, spirv::Op::ExtInstImport, &ops);
+        self.debug_printf_ext_id = Some(id);
+        id
+    }
+
+    pub fn emit_debug_string(&mut self, text: &str) -> u32 {
+        if let Some(&id) = self.string_cache.get(text) {
+            return id;
+        }
+        let id = self.alloc_id();
+        let mut ops = vec![id];
+        ops.extend(encode_literal_string(text));
+        push_inst(&mut self.debug_strings, spirv::Op::String, &ops);
+        self.string_cache.insert(text.to_owned(), id);
+        id
+    }
+
+    pub fn emit_types_ext_inst(
+        &mut self,
+        result_ty: u32,
+        ext_id: u32,
+        inst_op: u32,
+        operands: &[u32],
+    ) -> u32 {
+        let res = self.alloc_id();
+        let mut ops = Vec::with_capacity(4 + operands.len());
+        ops.push(result_ty);
+        ops.push(res);
+        ops.push(ext_id);
+        ops.push(inst_op);
+        ops.extend_from_slice(operands);
+        push_inst(&mut self.types_globals, spirv::Op::ExtInst, &ops);
+        res
     }
 
     pub fn emit_memory_model(
@@ -1101,6 +1165,7 @@ impl SpirvEmitter {
             + self.memory_model.len()
             + self.entry_points.len()
             + self.execution_modes.len()
+            + self.debug_strings.len()
             + self.debug_names.len()
             + self.decorations.len()
             + self.types_globals.len()
@@ -1119,6 +1184,7 @@ impl SpirvEmitter {
         words.extend_from_slice(&self.memory_model);
         words.extend_from_slice(&self.entry_points);
         words.extend_from_slice(&self.execution_modes);
+        words.extend_from_slice(&self.debug_strings);
         words.extend_from_slice(&self.debug_names);
         words.extend_from_slice(&self.decorations);
         words.extend_from_slice(&self.types_globals);
@@ -1816,6 +1882,41 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
     let void_ty = emitter.emit_type_void();
     let entry_fn_ty = emitter.emit_type_function(void_ty, &[]);
 
+    let module_debug_ctx: Option<(u32, u32, u32, u32)> = module
+        .functions
+        .iter()
+        .find_map(|f| f.debug_source.as_ref())
+        .map(|dbg| {
+            let ext_id = emitter.emit_debug_info_import();
+            let u32_ty = emitter.emit_type_int(32, 0);
+            let file_str = emitter.emit_debug_string(dbg.file_name.as_str());
+            let info_none = emitter.emit_types_ext_inst(void_ty, ext_id, 0, &[]); // DebugInfoNone
+            let debug_source = if let Some(src_text) = &dbg.source_text {
+                let text_str = emitter.emit_debug_string(src_text.as_str());
+                emitter.emit_types_ext_inst(void_ty, ext_id, 35, &[file_str, text_str])
+            // DebugSource
+            } else {
+                emitter.emit_types_ext_inst(void_ty, ext_id, 35, &[file_str])
+            };
+            let ver_100 = emitter.emit_constant_32(u32_ty, 100);
+            let dwarf_4 = emitter.emit_constant_32(u32_ty, 4);
+            let lang_hlsl = emitter.emit_constant_32(u32_ty, 5);
+            let compile_unit = emitter.emit_types_ext_inst(
+                void_ty,
+                ext_id,
+                1, // DebugCompilationUnit
+                &[ver_100, dwarf_4, debug_source, lang_hlsl],
+            );
+            let flags_0 = emitter.emit_constant_32(u32_ty, 0);
+            let debug_fn_ty = emitter.emit_types_ext_inst(
+                void_ty,
+                ext_id,
+                8, // DebugTypeFunction
+                &[flags_0, info_none],
+            );
+            (ext_id, debug_source, compile_unit, debug_fn_ty)
+        });
+
     // Pass 1: Pre-allocate function IDs and signatures for all helpers and entry points so
     // `OpFunctionCall` can reference any callee in `module.functions` regardless of order.
     let mut emitted_functions: IndexMap<String, EmittedFunctionInfo> = IndexMap::new();
@@ -2178,6 +2279,32 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
             existing_sampler_var
         };
 
+        let fn_debug_ctx =
+            module_debug_ctx.map(|(ext_id, debug_source, compile_unit, debug_fn_ty)| {
+                let u32_ty = emitter.emit_type_int(32, 0);
+                let name_str = emitter.emit_debug_string(func.name.as_str());
+                let line_1 = emitter.emit_constant_32(u32_ty, 1);
+                let col_1 = emitter.emit_constant_32(u32_ty, 1);
+                let flags_0 = emitter.emit_constant_32(u32_ty, 0);
+                let debug_fn = emitter.emit_types_ext_inst(
+                    void_ty,
+                    ext_id,
+                    20, // DebugFunction
+                    &[
+                        name_str,
+                        debug_fn_ty,
+                        debug_source,
+                        line_1,
+                        col_1,
+                        compile_unit,
+                        name_str,
+                        flags_0,
+                        line_1,
+                    ],
+                );
+                (ext_id, debug_source, debug_fn)
+            });
+
         let fn_id = emit_function_body(
             &mut emitter,
             func,
@@ -2192,6 +2319,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
             default_sampler_var,
             void_ty,
             uses_bda,
+            fn_debug_ctx,
         );
         emitter.emit_name(fn_id, func.name.as_str());
 
@@ -3022,6 +3150,7 @@ struct FnLowerCtx<'a> {
     ray_query_vars: IndexMap<u32, u32>,
     hit_object_vars: IndexMap<u32, u32>,
     use_ser_ext: bool,
+    debug_ctx: Option<(u32, u32)>,
     uses_bda: bool,
     inst_ids: IndexMap<InstId, u32>,
     preallocated_ids: IndexMap<InstId, (u32, u32)>,
@@ -7464,6 +7593,44 @@ impl FnLowerCtx<'_> {
                 self.emitter.emit_fn_inst_raw(5365, &[]); // OpEndInvocationInterlockEXT
                 (0, self.void_ty)
             }
+            InstData::DebugPrintf { format, args } => {
+                let ext_id = self.emitter.emit_debug_printf_import();
+                let fmt_id = self.emitter.emit_debug_string(format.as_str());
+                let arg_ids: Vec<u32> = args.iter().map(|&a| self.ensure_inst(a)).collect();
+                let res = self.emitter.alloc_id();
+                let mut ops = Vec::with_capacity(5 + arg_ids.len());
+                ops.push(self.void_ty);
+                ops.push(res);
+                ops.push(ext_id);
+                ops.push(1); // NonSemantic.DebugPrintf: DebugPrintf = 1
+                ops.push(fmt_id);
+                ops.extend(arg_ids);
+                self.emitter.emit_fn_inst(spirv::Op::ExtInst, &ops);
+                (0, self.void_ty)
+            }
+            InstData::DebugLine { line, col } => {
+                if let Some((ext_id, debug_source)) = self.debug_ctx {
+                    let u32_ty = self.u32_ty();
+                    let line_id = self.emitter.emit_constant_32(u32_ty, line);
+                    let col_id = self.emitter.emit_constant_32(u32_ty, col);
+                    let res = self.emitter.alloc_id();
+                    self.emitter.emit_fn_inst(
+                        spirv::Op::ExtInst,
+                        &[
+                            self.void_ty,
+                            res,
+                            ext_id,
+                            103, // DebugLine
+                            debug_source,
+                            line_id,
+                            line_id,
+                            col_id,
+                            col_id,
+                        ],
+                    );
+                }
+                (0, self.void_ty)
+            }
             InstData::Nop => (0, self.void_ty),
         };
 
@@ -9446,6 +9613,7 @@ fn emit_function_body(
     default_sampler_var: Option<u32>,
     void_ty: u32,
     uses_bda: bool,
+    debug_ctx: Option<(u32, u32, u32)>,
 ) -> u32 {
     let fn_id = fn_info.fn_id;
     let entry_label = emitter.alloc_id();
@@ -9598,12 +9766,21 @@ fn emit_function_body(
         workgroup_ptr_insts: IndexSet::new(),
         phi_target_types: IndexMap::new(),
         phi_coerced_inputs: IndexMap::new(),
+        debug_ctx: debug_ctx.map(|(ext_id, debug_source, _)| (ext_id, debug_source)),
         decorated_non_uniform: IndexSet::new(),
         loop_stack: Vec::new(),
         current_label: entry_label,
         entry_label,
         current_block_preds: Vec::new(),
     };
+
+    if let Some((ext_id, _, debug_fn)) = debug_ctx {
+        let def_res = ctx.emitter.alloc_id();
+        ctx.emitter.emit_fn_inst(
+            spirv::Op::ExtInst,
+            &[void_ty, def_res, ext_id, 101, debug_fn, fn_id], // DebugFunctionDefinition
+        );
+    }
 
     let terminated = ctx.emit_stmts(&func.body);
     if !terminated {

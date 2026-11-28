@@ -1447,6 +1447,16 @@ pub enum InstData {
     BeginInvocationInterlockExt,
     /// Ends a fragment shader interlock critical section (`OpEndInvocationInterlockEXT`).
     EndInvocationInterlockExt,
+    /// GPU printf via `NonSemantic.DebugPrintf` (`OpExtInst` 1).
+    DebugPrintf {
+        format: SmolStr,
+        args: Vec<InstId>,
+    },
+    /// Source line annotation via `NonSemantic.Shader.DebugInfo.100` (`DebugLine` = 103).
+    DebugLine {
+        line: u32,
+        col: u32,
+    },
     Nop,
 }
 
@@ -1753,7 +1763,9 @@ impl InstData {
             | Self::CoopMatrixLength { .. }
             | Self::BeginInvocationInterlockExt
             | Self::EndInvocationInterlockExt
+            | Self::DebugLine { .. }
             | Self::Nop => Vec::new(),
+            Self::DebugPrintf { args, .. } => args.clone(),
             Self::SubpassLoad { sample, .. } => sample.into_iter().copied().collect(),
             Self::ImageFetchMs { coord, sample, .. } => vec![*coord, *sample],
             Self::CoopMatrixLoad { ptr, stride, .. } => {
@@ -2093,6 +2105,8 @@ impl Inst {
                 | InstData::CoopMatrixStore { .. }
                 | InstData::BeginInvocationInterlockExt
                 | InstData::EndInvocationInterlockExt
+                | InstData::DebugPrintf { .. }
+                | InstData::DebugLine { .. }
         )
     }
 }
@@ -2146,6 +2160,8 @@ pub struct IrFunction {
     pub stage_io: Vec<IrStageIoVar>,
     pub stage_vars: Vec<IrStageVar>,
     pub stage_exec_meta: IrStageExecMeta,
+    /// Optional source metadata for `NonSemantic.Shader.DebugInfo.100`.
+    pub debug_source: Option<IrDebugSource>,
     pub descriptors: Vec<IrDescriptorVar>,
     pub workgroup_vars: Vec<IrWorkgroupVar>,
     pub push_constants: Option<IrPushConstantBlock>,
@@ -2171,6 +2187,7 @@ impl IrFunction {
             stage_io: Vec::new(),
             stage_vars: Vec::new(),
             stage_exec_meta: IrStageExecMeta::default(),
+            debug_source: None,
             descriptors: Vec::new(),
             workgroup_vars: Vec::new(),
             push_constants: None,
@@ -2363,6 +2380,14 @@ impl IrFunction {
             _ => infer_static_ir_type(data),
         }
     }
+}
+
+/// Source metadata attached to an [`IrFunction`] for `NonSemantic.Shader.DebugInfo.100`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrDebugSource {
+    pub file_name: SmolStr,
+    #[serde(default)]
+    pub source_text: Option<SmolStr>,
 }
 
 /// Complete structured SSA IR module ready for pass execution and SPIR-V emission.

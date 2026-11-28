@@ -11,7 +11,7 @@ pub use passes::{
 };
 pub use ssa::{
     AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixLayout, CoopMatrixScalar, CoopMatrixUse,
-    GlslStd450Op, Inst, InstData, InstId, IrDescriptorVar, IrFunction, IrInterlockMode,
+    GlslStd450Op, Inst, InstData, InstId, IrDebugSource, IrDescriptorVar, IrFunction, IrInterlockMode,
     IrInterpolation, IrLocalVar, IrModule, IrParam, IrPushConstantBlock,
     IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
     IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,
