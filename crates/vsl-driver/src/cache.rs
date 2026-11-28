@@ -18,6 +18,10 @@ static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct L1CacheKey {
     pub(crate) hash: L1ModuleHash,
+    // HIR retains source spans. Identical bytes at different source locations
+    // must never alias a cached arena with foreign FileIds.
+    pub(crate) source_context: [u8; 32],
+    pub(crate) file: vsl_diagnostics::FileId,
     pub(crate) tier: RenderTier,
     pub(crate) active_caps: HardwareCaps,
     pub(crate) abi: AbiProfile,

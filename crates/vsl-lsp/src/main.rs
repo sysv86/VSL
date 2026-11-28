@@ -29,7 +29,7 @@ use vsl_mc::{
     HardwareCaps, HookStage, RenderTier, WORLD_UBO_LAYOUT,
 };
 use vsl_pack::{EvalConfig, evaluate_pack_vsl, validate_and_schedule};
-use vsl_syntax::ast::ParamMode;
+use vsl_syntax::ast::{ImportTree, Item, ParamMode};
 use vsl_syntax::parse_source;
 
 const DEFAULT_ANALYSIS_CACHE_CAPACITY: usize = 64;
@@ -109,6 +109,22 @@ struct CachedAnalysis {
     pack_schema: Option<PackSchema>,
     symbols: Vec<IndexedSymbol>,
     tokens: Vec<RawSemanticToken>,
+    project_sources: Vec<SourceFile>,
+    project_symbols: Vec<IndexedSymbol>,
+}
+
+impl CachedAnalysis {
+    fn location(&self, span: Span) -> Option<Location> {
+        let source = self
+            .project_sources
+            .iter()
+            .find(|source| source.id == span.file)
+            .or_else(|| (self.source.id == span.file).then_some(&self.source))?;
+        Some(Location {
+            uri: source.name.parse().ok()?,
+            range: span_to_lsp_range(source, span),
+        })
+    }
 }
 
 /// Bounded FIFO/LRU-style analysis cache keyed by normalized document URI.
@@ -464,6 +480,8 @@ fn analyze_document(
                     pack_schema: None,
                     symbols: Vec::new(),
                     tokens: Vec::new(),
+                    project_sources: Vec::new(),
+                    project_symbols: Vec::new(),
                 },
                 lsp_diags,
             );
@@ -486,6 +504,8 @@ fn analyze_document(
             pack_schema: Some(schema),
             symbols: Vec::new(),
             tokens: Vec::new(),
+            project_sources: Vec::new(),
+            project_symbols: Vec::new(),
         };
         return (analysis, lsp_diags);
     }
@@ -493,43 +513,69 @@ fn analyze_document(
     let doc_path = uri_to_path(uri.as_str());
     let (pack_schema, sibling_files) = discover_workspace_context(doc_path.as_deref(), open_docs);
 
-    // Lower current file with full capabilities across all tiers so editor hover/goto/rename
-    // and diagnostics cover tier-gated functions without pruning.
-    let (hir, hir_diags) = lower_unit_with_schema(
-        &parsed.unit,
-        RenderTier::Tier3PathTracing,
-        HardwareCaps::all(),
-        pack_schema.as_ref(),
-    );
-    all_diags.extend(hir_diags.into_vec());
-
-    // When sibling `.vsl` files exist in the same pack directory, also run multi-file project
-    // linking via `vsl-driver` to surface cross-module visibility/collision diagnostics (`E0500`–`E0503`).
-    if !sibling_files.is_empty() && !all_diags.iter().any(Diagnostic::is_error) {
-        let mut project_files = Vec::with_capacity(1 + sibling_files.len());
-        let self_label = doc_path
-            .as_deref()
-            .and_then(Path::file_name)
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or("current.vsl")
-            .to_owned();
-        project_files.push((self_label, text.to_owned()));
-        project_files.extend(sibling_files);
-
+    // Resolve imports before lowering. An isolated HIR cannot distinguish a
+    // valid imported symbol from an unknown name.
+    let mut project_sources = vec![source_file.clone()];
+    let mut project_symbols = Vec::new();
+    let hir = if sibling_files.is_empty() {
+        let (hir, diagnostics) = lower_unit_with_schema(
+            &parsed.unit,
+            RenderTier::Tier3PathTracing,
+            HardwareCaps::all(),
+            pack_schema.as_ref(),
+        );
+        all_diags.extend(diagnostics.into_vec());
+        hir
+    } else {
+        let mut project_files = vec![(uri.as_str().to_owned(), text.to_owned())];
+        for (label, source) in sibling_files {
+            let Some(path) = doc_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(|dir| dir.join(&label))
+            else {
+                continue;
+            };
+            let Some(sibling_uri) = Uri::from_file_path(path) else {
+                continue;
+            };
+            project_files.push((sibling_uri.as_str().to_owned(), source));
+        }
         let mut opts = CompileOptions::for_tier(RenderTier::Tier3PathTracing);
         opts.active_caps = HardwareCaps::all();
         opts.pack_schema.clone_from(&pack_schema);
-
         let mut compiler = VslCompiler::new();
-        let proj_out = compiler.compile_project(&project_files, &opts);
-        for diag in proj_out.diagnostics {
-            if diag.primary_span.file == FileId(0) || diag.primary_span.file == FileId::SYNTHETIC {
-                all_diags.push(diag);
+        let mut result = compiler.compile_project(&project_files, &opts);
+        all_diags.extend(result.diagnostics.into_iter().filter(|d| {
+            d.primary_span.file == file_id || d.primary_span.file == FileId::SYNTHETIC
+        }));
+        project_sources = compiler.sources.files().to_vec();
+        for (id, module) in &result.hir_modules {
+            if let Some(source) = compiler.sources.get(*id) {
+                project_symbols.extend(index_hir_symbols(module, source, &project_sources));
             }
         }
+        result
+            .hir_modules
+            .shift_remove(&file_id)
+            .unwrap_or_else(|| {
+                // A broken dependency graph still allows local editor operations.
+                lower_unit_with_schema(
+                    &parsed.unit,
+                    RenderTier::Tier3PathTracing,
+                    HardwareCaps::all(),
+                    pack_schema.as_ref(),
+                )
+                .0
+            })
+    };
+    let mut symbols = index_hir_symbols(&hir, &source_file, &project_sources);
+    if project_symbols.is_empty() {
+        project_symbols.clone_from(&symbols);
     }
-
-    let symbols = index_hir_symbols(&hir, &source_file);
+    let imports = index_import_symbols(&project_sources, &project_symbols);
+    symbols.extend(imports.iter().filter(|s| s.span.file == file_id).cloned());
+    project_symbols.extend(imports);
     let tokens = build_semantic_tokens(&symbols, &source_file);
     let mut seen_diagnostics = HashSet::new();
     let lsp_diags = all_diags
@@ -544,6 +590,8 @@ fn analyze_document(
         pack_schema,
         symbols,
         tokens,
+        project_sources,
+        project_symbols,
     };
     (analysis, lsp_diags)
 }
@@ -763,12 +811,105 @@ fn find_ident_span_within(source: &SourceFile, enclosing: Span, ident: &str) -> 
     missing
 }
 
-fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol> {
+/// Index explicit import names using the actual module declaration and exported
+/// declaration span. A textual name alone cannot distinguish sibling modules.
+fn index_import_symbols(sources: &[SourceFile], symbols: &[IndexedSymbol]) -> Vec<IndexedSymbol> {
+    let units: Vec<_> = sources
+        .iter()
+        .map(|source| parse_source(source.id, &source.text).unit)
+        .collect();
+    let module_names: HashSet<_> = units
+        .iter()
+        .filter_map(|unit| unit.module_decl.as_ref().map(|m| m.path.joined()))
+        .collect();
+    let mut exports = HashMap::new();
+    for unit in &units {
+        let Some(module) = unit.module_decl.as_ref() else {
+            continue;
+        };
+        let module = module.path.joined();
+        for item in &unit.items {
+            let name = match item {
+                Item::Function(f) if f.is_pub => &f.name,
+                Item::Struct(st) if st.is_pub => &st.name,
+                Item::Const(c) if c.is_pub => &c.name,
+                Item::Trait(t) if t.is_pub => &t.name,
+                _ => continue,
+            };
+            if let Some(symbol) = symbols
+                .iter()
+                .find(|s| s.is_definition && s.span == name.span)
+            {
+                exports.insert((module.clone(), name.name.to_string()), symbol);
+            }
+        }
+    }
+    let mut references = Vec::new();
+    for unit in &units {
+        for import in &unit.imports {
+            let prefix = import.prefix.joined();
+            let (module, names) = match &import.tree {
+                ImportTree::Group(names) => (prefix, names.as_slice()),
+                ImportTree::Single
+                    if !module_names.contains(&prefix) && import.prefix.segments.len() >= 2 =>
+                {
+                    let (last, parent) = import
+                        .prefix
+                        .segments
+                        .split_last()
+                        .expect("nonempty import");
+                    (
+                        parent
+                            .iter()
+                            .map(|p| p.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                        std::slice::from_ref(last),
+                    )
+                }
+                _ => continue,
+            };
+            for name in names {
+                if let Some(definition) = exports.get(&(module.clone(), name.name.to_string())) {
+                    references.push(IndexedSymbol {
+                        name: name.name.to_string(),
+                        kind: definition.kind,
+                        span: name.span,
+                        def_span: definition.def_span,
+                        is_definition: false,
+                        type_display: definition.type_display.clone(),
+                    });
+                }
+            }
+        }
+    }
+    references
+}
+
+fn find_definition_span(sources: &[SourceFile], enclosing: Span, name: &str) -> Span {
+    sources
+        .iter()
+        .find(|source| source.id == enclosing.file)
+        .map_or(
+            Span::new(enclosing.file, enclosing.start, enclosing.start),
+            |source| find_ident_span_within(source, enclosing, name),
+        )
+}
+
+fn index_hir_symbols(
+    hir: &HirModule,
+    source: &SourceFile,
+    sources: &[SourceFile],
+) -> Vec<IndexedSymbol> {
     let mut out = Vec::new();
     let mut defs: HashMap<String, (IndexedSymbolKind, Span, String)> = HashMap::new();
 
     for (_, st) in hir.structs.iter() {
-        let name_span = find_ident_span_within(source, st.span, st.name.as_str());
+        let name_span = find_definition_span(
+            sources,
+            st.span,
+            st.name.split('<').next().unwrap_or(st.name.as_str()),
+        );
         let ty_str = format!("struct {}", st.name);
         defs.insert(
             st.name.to_string(),
@@ -783,7 +924,7 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
             type_display: ty_str,
         });
         for field in &st.fields {
-            let f_span = find_ident_span_within(source, field.span, field.name.as_str());
+            let f_span = find_definition_span(sources, field.span, field.name.as_str());
             let f_ty = format_hir_type(&hir.types, field.ty);
             out.push(IndexedSymbol {
                 name: field.name.to_string(),
@@ -797,7 +938,7 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
     }
 
     for tr in &hir.traits {
-        let t_span = find_ident_span_within(source, tr.span, tr.name.as_str());
+        let t_span = find_definition_span(sources, tr.span, tr.name.as_str());
         let ty_str = format!("trait {}", tr.name);
         defs.insert(
             tr.name.to_string(),
@@ -814,7 +955,7 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
     }
 
     for c in &hir.consts {
-        let c_span = find_ident_span_within(source, c.span, c.name.as_str());
+        let c_span = find_definition_span(sources, c.span, c.name.as_str());
         let ty_str = format_hir_type(&hir.types, c.ty);
         defs.insert(
             c.name.to_string(),
@@ -831,7 +972,7 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
     }
 
     for wg in &hir.workgroup_vars {
-        let w_span = find_ident_span_within(source, wg.span, wg.name.as_str());
+        let w_span = find_definition_span(sources, wg.span, wg.name.as_str());
         let ty_str = format_hir_type(&hir.types, wg.ty);
         defs.insert(
             wg.name.to_string(),
@@ -848,7 +989,8 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
     }
 
     for (_, func) in hir.functions.iter() {
-        let fn_span = find_ident_span_within(source, func.span, func.name.as_str());
+        let base_name = func.name.split('<').next().unwrap_or(func.name.as_str());
+        let fn_span = find_definition_span(sources, func.span, base_name);
         let sig = format_function_signature(hir, func);
         defs.insert(
             func.name.to_string(),
@@ -865,6 +1007,9 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
     }
 
     for (_, func) in hir.functions.iter() {
+        if func.span.file != source.id {
+            continue;
+        }
         let mut local_defs = defs.clone();
         for param in &func.params {
             let p_span = find_ident_span_within(source, param.span, param.name.as_str());
@@ -886,13 +1031,12 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
             });
         }
         if let Some(ref body) = func.body_hir {
-            index_hir_block(hir, source, body, &mut local_defs, &mut out);
+            index_hir_block(hir, source, sources, body, &mut local_defs, &mut out);
         }
     }
 
     out.retain(|symbol| {
         symbol.span.file == source.id
-            && symbol.def_span.file == source.id
             && symbol.span.start < symbol.span.end
             && symbol.def_span.start < symbol.def_span.end
     });
@@ -902,16 +1046,17 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
 fn index_hir_block(
     hir: &HirModule,
     source: &SourceFile,
+    sources: &[SourceFile],
     block: &HirBlock,
     scope: &mut HashMap<String, (IndexedSymbolKind, Span, String)>,
     out: &mut Vec<IndexedSymbol>,
 ) {
     let saved_scope = scope.clone();
     for stmt in &block.stmts {
-        index_hir_stmt(hir, source, stmt, scope, out);
+        index_hir_stmt(hir, source, sources, stmt, scope, out);
     }
     if let Some(ref tail) = block.tail_expr {
-        index_hir_expr(hir, source, tail, scope, out);
+        index_hir_expr(hir, source, sources, tail, scope, out);
     }
     *scope = saved_scope;
 }
@@ -919,6 +1064,7 @@ fn index_hir_block(
 fn index_hir_stmt(
     hir: &HirModule,
     source: &SourceFile,
+    sources: &[SourceFile],
     stmt: &HirStmt,
     scope: &mut HashMap<String, (IndexedSymbolKind, Span, String)>,
     out: &mut Vec<IndexedSymbol>,
@@ -932,7 +1078,7 @@ fn index_hir_stmt(
             ..
         } => {
             if let Some(init_expr) = init {
-                index_hir_expr(hir, source, init_expr, scope, out);
+                index_hir_expr(hir, source, sources, init_expr, scope, out);
             }
             let var_span = find_ident_span_within(source, *span, name.as_str());
             let ty_str = format_hir_type(&hir.types, *ty);
@@ -951,7 +1097,7 @@ fn index_hir_stmt(
         }
         HirStmt::Return { value, .. } => {
             if let Some(expr) = value {
-                index_hir_expr(hir, source, expr, scope, out);
+                index_hir_expr(hir, source, sources, expr, scope, out);
             }
         }
         HirStmt::For {
@@ -962,7 +1108,7 @@ fn index_hir_stmt(
             span,
             ..
         } => {
-            index_hir_expr(hir, source, iter, scope, out);
+            index_hir_expr(hir, source, sources, iter, scope, out);
             let saved = scope.clone();
             let b_span = find_ident_span_within(source, *span, binding.as_str());
             let ty_str = format_hir_type(&hir.types, *binding_ty);
@@ -978,15 +1124,15 @@ fn index_hir_stmt(
                 is_definition: true,
                 type_display: ty_str,
             });
-            index_hir_block(hir, source, body, scope, out);
+            index_hir_block(hir, source, sources, body, scope, out);
             *scope = saved;
         }
         HirStmt::While { cond, body, .. } => {
-            index_hir_expr(hir, source, cond, scope, out);
-            index_hir_block(hir, source, body, scope, out);
+            index_hir_expr(hir, source, sources, cond, scope, out);
+            index_hir_block(hir, source, sources, body, scope, out);
         }
         HirStmt::Loop { body, .. } => {
-            index_hir_block(hir, source, body, scope, out);
+            index_hir_block(hir, source, sources, body, scope, out);
         }
         HirStmt::Switch {
             selector,
@@ -994,16 +1140,16 @@ fn index_hir_stmt(
             default,
             ..
         } => {
-            index_hir_expr(hir, source, selector, scope, out);
+            index_hir_expr(hir, source, sources, selector, scope, out);
             for case in cases {
-                index_hir_expr(hir, source, &case.value, scope, out);
-                index_hir_block(hir, source, &case.body, scope, out);
+                index_hir_expr(hir, source, sources, &case.value, scope, out);
+                index_hir_block(hir, source, sources, &case.body, scope, out);
             }
             if let Some(def_block) = default {
-                index_hir_block(hir, source, def_block, scope, out);
+                index_hir_block(hir, source, sources, def_block, scope, out);
             }
         }
-        HirStmt::Expr { expr, .. } => index_hir_expr(hir, source, expr, scope, out),
+        HirStmt::Expr { expr, .. } => index_hir_expr(hir, source, sources, expr, scope, out),
         HirStmt::Break(_) | HirStmt::Continue(_) => {}
     }
 }
@@ -1011,13 +1157,15 @@ fn index_hir_stmt(
 fn index_hir_expr(
     hir: &HirModule,
     source: &SourceFile,
+    sources: &[SourceFile],
     expr: &HirExpr,
     scope: &mut HashMap<String, (IndexedSymbolKind, Span, String)>,
     out: &mut Vec<IndexedSymbol>,
 ) {
     match &expr.kind {
         HirExprKind::Path { path, .. } => {
-            let short = path.rsplit("::").next().unwrap_or(path.as_str());
+            let base = path.split('<').next().unwrap_or(path.as_str());
+            let short = base.rsplit("::").next().unwrap_or(base);
             if let Some((kind, def_span, ty_str)) = scope.get(path.as_str()) {
                 let ref_span = find_ident_span_within(source, expr.span, short);
                 out.push(IndexedSymbol {
@@ -1032,7 +1180,7 @@ fn index_hir_expr(
         }
         HirExprKind::ArrayLit { elements } => {
             for elem in elements {
-                index_hir_expr(hir, source, elem, scope, out);
+                index_hir_expr(hir, source, sources, elem, scope, out);
             }
         }
         HirExprKind::StructLit {
@@ -1040,7 +1188,14 @@ fn index_hir_expr(
             fields,
         } => {
             if let Some((kind, def_span, ty_str)) = scope.get(struct_name.as_str()) {
-                let ref_span = find_ident_span_within(source, expr.span, struct_name.as_str());
+                let ref_span = find_ident_span_within(
+                    source,
+                    expr.span,
+                    struct_name
+                        .split('<')
+                        .next()
+                        .unwrap_or(struct_name.as_str()),
+                );
                 out.push(IndexedSymbol {
                     name: struct_name.to_string(),
                     kind: *kind,
@@ -1051,20 +1206,40 @@ fn index_hir_expr(
                 });
             }
             for (_, val) in fields {
-                index_hir_expr(hir, source, val, scope, out);
+                index_hir_expr(hir, source, sources, val, scope, out);
             }
         }
         HirExprKind::Unary { operand, .. } => {
-            index_hir_expr(hir, source, operand, scope, out);
+            index_hir_expr(hir, source, sources, operand, scope, out);
         }
         HirExprKind::Binary { lhs, rhs, .. } => {
-            index_hir_expr(hir, source, lhs, scope, out);
-            index_hir_expr(hir, source, rhs, scope, out);
+            index_hir_expr(hir, source, sources, lhs, scope, out);
+            index_hir_expr(hir, source, sources, rhs, scope, out);
         }
-        HirExprKind::Call { callee, args, .. } => {
-            index_hir_expr(hir, source, callee, scope, out);
+        HirExprKind::Call {
+            callee,
+            args,
+            resolved_fn,
+        } => {
+            if let Some(id) = resolved_fn
+                && let HirExprKind::Path { path, .. } = &callee.kind
+            {
+                let target = &hir.functions[*id];
+                let base = path.split('<').next().unwrap_or(path.as_str());
+                let short = base.rsplit("::").next().unwrap_or(base);
+                out.push(IndexedSymbol {
+                    name: short.to_owned(),
+                    kind: IndexedSymbolKind::Function,
+                    span: find_ident_span_within(source, callee.span, short),
+                    def_span: find_definition_span(sources, target.span, short),
+                    is_definition: false,
+                    type_display: format_function_signature(hir, target),
+                });
+            } else {
+                index_hir_expr(hir, source, sources, callee, scope, out);
+            }
             for arg in args {
-                index_hir_expr(hir, source, &arg.value, scope, out);
+                index_hir_expr(hir, source, sources, &arg.value, scope, out);
             }
         }
         HirExprKind::MethodCall {
@@ -1074,11 +1249,10 @@ fn index_hir_expr(
             args,
             ..
         } => {
-            index_hir_expr(hir, source, receiver, scope, out);
+            index_hir_expr(hir, source, sources, receiver, scope, out);
             if let Some(fn_id) = resolved_fn {
                 let target_fn = &hir.functions[*fn_id];
-                let def_span =
-                    find_ident_span_within(source, target_fn.span, target_fn.name.as_str());
+                let def_span = find_definition_span(sources, target_fn.span, method.as_str());
                 let m_span = find_ident_span_within(
                     source,
                     Span::new(expr.span.file, receiver.span.end, expr.span.end),
@@ -1094,13 +1268,13 @@ fn index_hir_expr(
                 });
             }
             for arg in args {
-                index_hir_expr(hir, source, &arg.value, scope, out);
+                index_hir_expr(hir, source, sources, &arg.value, scope, out);
             }
         }
         HirExprKind::Field {
             receiver, field, ..
         } => {
-            index_hir_expr(hir, source, receiver, scope, out);
+            index_hir_expr(hir, source, sources, receiver, scope, out);
             let receiver_ty = match hir.types.get(receiver.ty) {
                 Type::Pointer { pointee, .. } => *pointee,
                 _ => receiver.ty,
@@ -1109,7 +1283,7 @@ fn index_hir_expr(
                 && let Some(st) = hir.find_struct(st_name.as_str())
                 && let Some(sf) = st.fields.iter().find(|f| f.name == *field)
             {
-                let def_span = find_ident_span_within(source, sf.span, sf.name.as_str());
+                let def_span = find_definition_span(sources, sf.span, sf.name.as_str());
                 let ref_span = find_ident_span_within(
                     source,
                     Span::new(expr.span.file, receiver.span.end, expr.span.end),
@@ -1126,22 +1300,22 @@ fn index_hir_expr(
             }
         }
         HirExprKind::Index { receiver, index } => {
-            index_hir_expr(hir, source, receiver, scope, out);
-            index_hir_expr(hir, source, index, scope, out);
+            index_hir_expr(hir, source, sources, receiver, scope, out);
+            index_hir_expr(hir, source, sources, index, scope, out);
         }
         HirExprKind::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            index_hir_expr(hir, source, cond, scope, out);
-            index_hir_block(hir, source, then_branch, scope, out);
+            index_hir_expr(hir, source, sources, cond, scope, out);
+            index_hir_block(hir, source, sources, then_branch, scope, out);
             if let Some(eb) = else_branch {
-                index_hir_expr(hir, source, eb, scope, out);
+                index_hir_expr(hir, source, sources, eb, scope, out);
             }
         }
-        HirExprKind::Block(b) => index_hir_block(hir, source, b, scope, out),
-        HirExprKind::Swizzle { base, .. } => index_hir_expr(hir, source, base, scope, out),
+        HirExprKind::Block(b) => index_hir_block(hir, source, sources, b, scope, out),
+        HirExprKind::Swizzle { base, .. } => index_hir_expr(hir, source, sources, base, scope, out),
         HirExprKind::IntLit(_)
         | HirExprKind::FloatLit(_)
         | HirExprKind::BoolLit(_)
@@ -1386,6 +1560,115 @@ fn is_valid_vsl_ident(name: &str) -> bool {
     let (tokens, diagnostics) = vsl_syntax::lex(FileId(0), name);
     diagnostics.is_empty()
         && matches!(tokens.as_slice(), [token] if matches!(&token.token, vsl_syntax::Token::Ident(ident) if ident.as_str() == name))
+}
+
+fn plan_rename(
+    analysis: &CachedAnalysis,
+    target: &IndexedSymbol,
+    new_name: &str,
+) -> Option<WorkspaceEdit> {
+    if !is_valid_vsl_ident(new_name) || target.name == new_name {
+        return None;
+    }
+    let target_def = target.def_span;
+    let is_local = matches!(
+        target.kind,
+        IndexedSymbolKind::Local | IndexedSymbolKind::Param
+    );
+    let is_project = analysis.project_sources.len() > 1;
+    let sources = if analysis.project_sources.is_empty() {
+        std::slice::from_ref(&analysis.source)
+    } else {
+        &analysis.project_sources
+    };
+    let symbols = if is_local {
+        &analysis.symbols
+    } else {
+        &analysis.project_symbols
+    };
+    if !is_local && is_project {
+        // Type references and method overloads are not fully indexed. Refuse
+        // partial project edits instead of silently breaking a dependent module.
+        if target.kind != IndexedSymbolKind::Function {
+            return None;
+        }
+        let defining_source = sources.iter().find(|s| s.id == target_def.file)?;
+        let parsed = parse_source(defining_source.id, &defining_source.text);
+        if !parsed.unit.items.iter().any(|item| {
+            matches!(item, Item::Function(f)
+            if f.name.span == target_def && !f.attrs.iter().any(|a| a.is_at_decorator))
+        }) {
+            return None;
+        }
+    }
+    // Conservative collision guard; rejecting a safe shadow is preferable
+    // to introducing a new capture or changing overload resolution.
+    if symbols
+        .iter()
+        .any(|s| s.name == new_name && s.def_span != target_def)
+    {
+        return None;
+    }
+    let mut by_file: HashMap<FileId, Vec<Span>> = HashMap::new();
+    for symbol in symbols.iter().filter(|s| s.def_span == target_def) {
+        let spans = by_file.entry(symbol.span.file).or_default();
+        if !spans.contains(&symbol.span) {
+            spans.push(symbol.span);
+        }
+    }
+    if by_file.is_empty() || !by_file.values().any(|spans| spans.contains(&target_def)) {
+        return None;
+    }
+    let original_name = sources
+        .iter()
+        .find(|source| source.id == target_def.file)?
+        .text
+        .get(target_def.to_range())?;
+    let mut changes = HashMap::new();
+    let mut edited_sources = Vec::new();
+    for source in sources {
+        let mut text = source.text.clone();
+        if let Some(spans) = by_file.get_mut(&source.id) {
+            spans.sort_by_key(|span| std::cmp::Reverse(span.start));
+            let mut edits = Vec::new();
+            for span in spans {
+                // Every edit must replace the actual source token, not a
+                // synthetic monomorphized symbol or a stale byte offset.
+                if text.get(span.to_range())? != original_name {
+                    return None;
+                }
+                text.replace_range(span.to_range(), new_name);
+                edits.push(TextEdit {
+                    range: span_to_lsp_range(source, *span),
+                    new_text: new_name.to_owned(),
+                });
+            }
+            changes.insert(source.name.parse().ok()?, edits);
+        }
+        edited_sources.push((source.name.clone(), text));
+    }
+    if !is_local {
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier3PathTracing);
+        opts.active_caps = HardwareCaps::all();
+        opts.pack_schema.clone_from(&analysis.pack_schema);
+        let mut compiler = VslCompiler::new();
+        let has_errors = if is_project {
+            compiler
+                .compile_project(&edited_sources, &opts)
+                .has_errors()
+        } else {
+            compiler
+                .compile_shader_source(&edited_sources[0].0, &edited_sources[0].1, &opts)
+                .has_errors()
+        };
+        if has_errors {
+            return None;
+        }
+    }
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        ..WorkspaceEdit::default()
+    })
 }
 
 impl LanguageServer for VslLanguageServer {
@@ -1939,14 +2222,9 @@ impl LanguageServer for VslLanguageServer {
         let Some(sym) = symbol_at_offset(&analysis.symbols, byte_off) else {
             return Ok(None);
         };
-        if sym.def_span.file == FileId::SYNTHETIC {
-            return Ok(None);
-        }
-        let range = span_to_lsp_range(&analysis.source, sym.def_span);
-        Ok(Some(GotoDefinitionResponse::Scalar(Location {
-            uri,
-            range,
-        })))
+        Ok(analysis
+            .location(sym.def_span)
+            .map(GotoDefinitionResponse::Scalar))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -1966,18 +2244,14 @@ impl LanguageServer for VslLanguageServer {
 
         let mut seen = HashSet::new();
         let mut locations = Vec::new();
-        for sym in &analysis.symbols {
-            if sym.def_span != target_def {
+        for sym in &analysis.project_symbols {
+            if sym.def_span != target_def || (!include_decl && sym.is_definition) {
                 continue;
             }
-            if !include_decl && sym.is_definition {
-                continue;
-            }
-            if seen.insert((sym.span.start, sym.span.end)) {
-                locations.push(Location {
-                    uri: uri.clone(),
-                    range: span_to_lsp_range(&analysis.source, sym.span),
-                });
+            if seen.insert(sym.span)
+                && let Some(location) = analysis.location(sym.span)
+            {
+                locations.push(location);
             }
         }
         Ok(Some(locations))
@@ -1998,27 +2272,7 @@ impl LanguageServer for VslLanguageServer {
         let Some(target) = symbol_at_offset(&analysis.symbols, byte_off) else {
             return Ok(None);
         };
-        let target_def = target.def_span;
-
-        let mut seen = HashSet::new();
-        let mut edits = Vec::new();
-        for sym in &analysis.symbols {
-            if sym.def_span == target_def && seen.insert((sym.span.start, sym.span.end)) {
-                edits.push(TextEdit {
-                    range: span_to_lsp_range(&analysis.source, sym.span),
-                    new_text: params.new_name.clone(),
-                });
-            }
-        }
-        if edits.is_empty() {
-            return Ok(None);
-        }
-        let mut changes = HashMap::new();
-        changes.insert(uri, edits);
-        Ok(Some(WorkspaceEdit {
-            changes: Some(changes),
-            ..WorkspaceEdit::default()
-        }))
+        Ok(plan_rename(&analysis, target, &params.new_name))
     }
 
     async fn semantic_tokens_full(
@@ -2057,6 +2311,8 @@ mod tests {
             pack_schema: None,
             symbols: Vec::new(),
             tokens: Vec::new(),
+            project_sources: Vec::new(),
+            project_symbols: Vec::new(),
         }
     }
 
@@ -2118,7 +2374,7 @@ mod tests {
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier2RayQuery, HardwareCaps::all());
         assert!(!diags.has_errors(), "{diags:?}");
-        let symbols = index_hir_symbols(&hir, &file);
+        let symbols = index_hir_symbols(&hir, &file, std::slice::from_ref(&file));
         let access = source.rfind("value.value").unwrap() as u32;
         let receiver = symbol_at_offset(&symbols, access).unwrap();
         let member = symbol_at_offset(&symbols, access + 6).unwrap();
@@ -2136,6 +2392,59 @@ mod tests {
         );
         assert!(!is_valid_vsl_ident("fn"));
         assert!(is_valid_vsl_ident("new_name"));
+    }
+
+    #[test]
+    fn resolves_cross_module_calls_imports_and_renames_without_name_collisions() {
+        let folder = "file:///nonexistent-vsl-cross-module";
+        let lib_uri: Uri = format!("{folder}/lib.vsl").parse().unwrap();
+        let main_uri: Uri = format!("{folder}/main.vsl").parse().unwrap();
+        let other_uri: Uri = format!("{folder}/other.vsl").parse().unwrap();
+        let lib = "module pack::lib; pub fn helper(x: u32) -> u32 { x + 1u }";
+        let main = "module pack::main; import pack::lib::{helper}; @stage(compute(1,1,1)) fn run() { let v = helper(1u); }";
+        let other = "module pack::other; pub fn helper(x: u32) -> u32 { x + 2u }";
+        let docs = [(&lib_uri, lib), (&main_uri, main), (&other_uri, other)]
+            .into_iter()
+            .map(|(uri, text)| {
+                (
+                    normalize_uri_key(uri.as_str()),
+                    OpenDocument {
+                        uri: uri.clone(),
+                        text: text.to_owned(),
+                        version: 1,
+                    },
+                )
+            })
+            .collect();
+        let (analysis, diagnostics) = analyze_document(&main_uri, main, &docs);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "{diagnostics:?}"
+        );
+        let target =
+            symbol_at_offset(&analysis.symbols, main.rfind("helper").unwrap() as u32).unwrap();
+        let location = analysis.location(target.def_span).unwrap();
+        assert_eq!(location.uri, lib_uri);
+        let import =
+            symbol_at_offset(&analysis.symbols, main.find("helper").unwrap() as u32).unwrap();
+        assert_eq!(import.def_span, target.def_span);
+        let refs: Vec<_> = analysis
+            .project_symbols
+            .iter()
+            .filter(|s| s.def_span == target.def_span)
+            .collect();
+        assert_eq!(refs.len(), 3);
+        let changes = plan_rename(&analysis, target, "increment")
+            .unwrap()
+            .changes
+            .unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[&lib_uri].len(), 1);
+        assert_eq!(changes[&main_uri].len(), 2);
+        assert!(!changes.contains_key(&other_uri));
+        assert!(plan_rename(&analysis, target, "run").is_none());
     }
 
     #[test]
@@ -2221,7 +2530,7 @@ pub fn double_weight(s: Sample) -> f32 {
         let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier2RayQuery, HardwareCaps::all());
         assert!(!diags.has_errors(), "{:?}", diags.as_slice());
 
-        let symbols = index_hir_symbols(&hir, &file);
+        let symbols = index_hir_symbols(&hir, &file, std::slice::from_ref(&file));
         let def_w = symbols
             .iter()
             .find(|s| s.name == "w" && s.is_definition)

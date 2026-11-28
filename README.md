@@ -19,7 +19,7 @@ Rust compiler workspace for the VSL 2.0 shader language, SPIR-V 1.6 backend, GLS
 | `vsl-ir` | Typed structured SSA IR (`IrType`, `Inst`, `StructuredStmt`, `IrLocalVar`, `IrWorkgroupVar`, `IrParam`, `IrStageIoVar`, GPU intrinsics) and deterministic pass pipeline (`SroaPass`, `Mem2RegPass`, `SelectiveInlinePass`, `UnrollLoopsPass`, `LowerBdaOffsetsPass`, `ConstFoldPass`, `CopyPropPass`, `SimplifyAndGvnPass`, `LicmPass`, `DeadStoreElimPass`, `PropagateNonUniformPass`, `DeadCodeEliminationPass`). |
 | `vsl-spirv` | Flat-arena SPIR-V 1.6 emitter using `spirv 0.4` constants (no `rspirv`/`naga`): strict in-order block emission, `O(1)` constant lookup (`IndexSet<u32>`), `Block`-decorated UBO/SSBO/BDA structs, `OpFunction`/`OpFunctionParameter`/`OpFunctionCall`, `PhysicalStorageBuffer64` + `Vulkan` memory model, `SPV_KHR_ray_query`, 64-bit/float/SSBO/workgroup/image atomics + `OpMemoryBarrier`, subgroup/quad ops, `GLSL.std.450` + bit/derivative ops, vertex/fragment I/O + `OpDemoteToHelperInvocation`, `OpSpecConstantOp`, and `LocalSizeId`. |
 | `vsl-pack` | Sandboxed `pack.vsl` evaluator (`MAX_EVAL_STEPS = 100_000`, `MAX_LOOP_ITERS = 256`, zero IO), `Compute`/`Raster`/`Transfer` pass nodes (`transfer_pass`, `mip_pass`), `PassDispatch` (`ForTarget`, `Explicit`, `Indirect`), topological DAG scheduler (`SchedulePlan`), `validate_pass_bindings_against_shader` descriptor cross-validation, and `pack.toml` v2 desugarer. |
-| `vsl-glsl` | GLSL 460 oracle emitter with generic struct/`impl` monomorphization and Set 2 `sampler2D bindless[4096]` ABI, plus `hook_bridge` (`emit_raster_gbuffer_hook_slot_with_schema`) for `vertex_displace`/`surface`/`gbuffer_pack`. |
+| `vsl-glsl` | GLSL 460 oracle emitter with concrete free-function, generic struct and `impl` monomorphization, selected entry-point emission and Set 2 `sampler2D bindless[4096]` ABI, plus `hook_bridge` (`emit_raster_gbuffer_hook_slot_with_schema`) for `vertex_displace`/`surface`/`gbuffer_pack`. |
 | `vsl-driver` | Compilation orchestrator: per-module `ModuleExports` symbol table (`pub` visibility, `struct`/`const`/`fn`/`trait`/`impl`, `E0502`/`E0503`), typed HIR-to-IR lowering with diagnostics (`E0520`–`E0529`), `mc::*` built-in lowering (`reconstruct_world_pos`, `view_dir`, `sample_sky`, typed `param`, `spec`, `resources::*`), native `@hook` chain dispatch with Porter-Duff alpha-over compositing for `@hook(clouds)`, L1 in-memory + L2 in-memory/disk BLAKE3 cache, and parallel entry-point compilation (`std::thread::scope`). |
 | `vsl-cli` | `vslc` binary with `check`, `reflect`, `pack-eval`, `build-pack`, `emit-spv`, and `emit-glsl` subcommands. |
 | `vsl-lsp` | Language server (`vsl-lsp`) over stdio with Windows-safe URI normalization, bounded `AnalysisCache`, workspace multi-file analysis and `pack.vsl` schema re-validation via `vsl-driver`/`vsl-hir`, context-aware completion with prefix replacement `text_edit`, HIR-backed hover, `goto_definition`, `references`, `rename`, and `semantic_tokens_full`. |
@@ -81,6 +81,14 @@ cargo run -p vsl-cli -- build-pack examples/sunlit_vanilla --tier 2 --preset ult
 cargo run -p vsl-lsp
 ```
 
+### Project analysis and validation
+
+The driver exposes linked HIR through `ProjectCompileOutput::hir_modules`, keyed by original source file IDs. Imported declarations retain their defining spans. In-memory HIR cache keys include source identity so identical file contents or a renamed dependency cannot reuse another file's spans. The disk artifact cache remains content-addressed.
+
+The language server resolves same-directory project imports against the linked HIR and uses open editor buffers ahead of disk contents. Go-to-definition and references use original file IDs. Cross-module rename supports indexed free functions, including explicit import names, and recompiles the proposed edited snapshot before returning edits. Type and method rename across modules is intentionally refused until all type and overload references can be indexed; ambiguous renames are rejected conservatively.
+
+Run `bash examples/compiler_validation/validate.sh` for the non-RT compiler suite (both native SPIR-V and selected-entry GLSL, Vulkan 1.3 and 1.4). All generic fixtures are mandatory. See [compiler validation](examples/compiler_validation/README.md) for coverage and specialization limits, and [RT compiler](docs/rt-compiler.md) for ray tracing usage and verification.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
@@ -90,7 +98,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 VSL supports the following shader stages and hardware extension foundations across HIR, SSA IR, and SPIR-V 1.6 emission:
 
 - **Stages**: `compute`, `vertex`, `fragment`, Ray Tracing Pipeline (`raygen`, `closest_hit`, `any_hit`, `miss`, `intersection`, `callable`), Mesh Pipeline (`task`, `mesh`), and Legacy Geometry (`tess_control`, `tess_eval`, `geometry`).
-- **RT Extensions**: Shader Execution Reordering (`VK_NV_shader_invocation_reorder` / `VK_EXT_ray_tracing_invocation_reorder` `HitObject`), Opacity Micromaps (`VK_EXT_opacity_micromap`), and Ray Position Fetch (`VK_KHR_ray_tracing_position_fetch`).
+- **RT Extensions**: Shader Execution Reordering (`VK_NV_ray_tracing_invocation_reorder` / `VK_EXT_ray_tracing_invocation_reorder`, `HitObject`), Opacity Micromaps (`VK_KHR_opacity_micromap` / `VK_EXT_opacity_micromap`), and Ray Position Fetch (`VK_KHR_ray_tracing_position_fetch`).
 - **Matrix / Tensor Cores**: Cooperative Matrix (`VK_KHR_cooperative_matrix` / Coop Matrix 2 types & ops).
 - **Advanced Rasterization**: `SubpassInput` / `VK_KHR_dynamic_rendering_local_read`, `Texture2DMS`, `SampleId`/`SamplePosition`/`SampleMask`, `OpDemoteToHelperInvocation`, VRS (`VK_KHR_fragment_shading_rate`), Fragment Interlock (`VK_EXT_fragment_shader_interlock`), Multiview (`ViewIndex`), `ClipDistance`/`CullDistance`, `FragDepth`, and `EarlyFragmentTests`.
 - **Compiler Base**: Full subgroup operations (ballot, broadcast, shuffle/relative, arithmetic, bitwise/logical, clustered, quad), explicit per-call `Sampler` binding, and 1D / texel-buffer textures (`Texture1D`, `RWImage1D`, `BufferView`, `RWBufferView`).

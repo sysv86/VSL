@@ -60,9 +60,24 @@ impl ModuleExports {
                 Item::Function(f) => {
                     exports.all_declared.insert(f.name.name.clone());
                     let is_entry_or_hook = f.attrs.iter().any(|a| {
-                        a.entries
-                            .iter()
-                            .any(|e| e.name.name == "stage" || e.name.name == "hook")
+                        a.entries.iter().any(|e| {
+                            matches!(
+                                e.name.name.as_str(),
+                                "stage"
+                                    | "hook"
+                                    | "raygen"
+                                    | "closest_hit"
+                                    | "any_hit"
+                                    | "miss"
+                                    | "intersection"
+                                    | "callable"
+                                    | "task"
+                                    | "mesh"
+                                    | "tess_control"
+                                    | "tess_eval"
+                                    | "geometry"
+                            )
+                        })
                     });
                     if !is_entry_or_hook {
                         exports.all_items.insert(f.name.name.clone(), item.clone());
@@ -664,9 +679,22 @@ fn collect_referenced_idents_in_expr(expr: &Expr, out: &mut IndexSet<SmolStr>) {
                 }
             }
         }
-        Expr::StructLit { path, fields, .. } => {
+        Expr::StructLit {
+            path,
+            turbofish,
+            fields,
+            ..
+        } => {
             if let Some(last) = path.segments.last() {
                 out.insert(last.name.clone());
+            }
+            for arg in turbofish {
+                match arg {
+                    TypeArg::Type(t) => collect_referenced_idents_in_type(t, out),
+                    TypeArg::NamedExpr { value, .. } => {
+                        collect_referenced_idents_in_expr(value, out);
+                    }
+                }
             }
             for (_, fexpr) in fields {
                 collect_referenced_idents_in_expr(fexpr, out);

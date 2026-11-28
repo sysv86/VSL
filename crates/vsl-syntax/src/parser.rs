@@ -1302,6 +1302,13 @@ impl Parser {
                     self.bump();
                     self.bump();
                     let args = self.parse_type_args();
+                    if args.is_empty() {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E0109",
+                            "explicit generic arguments cannot be empty",
+                            self.current_span(),
+                        ));
+                    }
                     if let Some(end) = self.expect_gt() {
                         span = span.merge(end);
                     }
@@ -1309,10 +1316,6 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
-                // Allow turbofish on generic struct literals such as
-                // `Reservoir::<LightSample> { ... }`. `Expr::StructLit` keeps its existing
-                // fields for downstream compatibility with `vsl-hir`, which destructures
-                // `Expr::StructLit { path, fields, span }` without `..`.
                 if self.allow_struct_lit && self.peek() == Some(&Token::LBrace) {
                     self.bump(); // `{`
                     let mut fields = Vec::new();
@@ -1332,6 +1335,7 @@ impl Parser {
                     let end = self.expect(&Token::RBrace, "`}`").unwrap_or(span);
                     return Some(Expr::StructLit {
                         path,
+                        turbofish,
                         fields,
                         span: span.merge(end),
                     });
@@ -2027,8 +2031,8 @@ mod tests {
     #[test]
     fn parses_generic_struct_literal_with_turbofish() {
         let src = r"
-            pub fn make_res(s: LightSample) -> Reservoir<LightSample> {
-                Reservoir::<LightSample> { sample: s }
+            pub fn make_res(s: Wrapper<LightSample>) -> Reservoir<Wrapper<LightSample>> {
+                Reservoir::<Wrapper<LightSample>> { sample: s }
             }
         ";
         let parsed = parse_source(FileId(0), src);
@@ -2038,10 +2042,22 @@ mod tests {
             panic!("expected function item");
         };
         let body = func.body.as_ref().expect("function body");
-        let Some(Expr::StructLit { path, fields, .. }) = body.tail_expr.as_deref() else {
+        let Some(Expr::StructLit {
+            path,
+            turbofish,
+            fields,
+            ..
+        }) = body.tail_expr.as_deref()
+        else {
             panic!("expected struct literal tail expression");
         };
         assert_eq!(path.joined(), "Reservoir");
+        assert!(matches!(turbofish.as_slice(),
+            [TypeArg::Type(TypeExpr::Named { path, args, .. })]
+                if path.joined() == "Wrapper"
+                    && matches!(args.as_slice(), [TypeArg::Type(TypeExpr::Named { path, .. })] if path.joined() == "LightSample")));
         assert_eq!(fields.len(), 1);
+        let bad = parse_source(FileId(0), "fn bad() { let x = S::<> { value: 1u }; }");
+        assert!(bad.has_errors());
     }
 }

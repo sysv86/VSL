@@ -1246,6 +1246,154 @@ mod tests {
     }
 
     #[test]
+    fn monomorphizes_free_generic_calls_and_nested_instantiations() {
+        let glsl = selected_glsl(
+            r"
+            fn identity<T>(value: T) -> T { value }
+            fn twice<T>(value: T) -> T { identity::<T>(identity(value)) }
+            fn second<A, B>(first: A, second: B) -> B { second }
+            fn unused<T>(value: T) -> T { value }
+            @stage(compute(1,1,1))
+            fn generic_main(
+                #[binding(set=0,binding=0)] result: RWBuffer<vec4>,
+                #[builtin(global_invocation_id)] gid: uvec3,
+            ) {
+                let index = twice::<u32>(gid.x);
+                let rgb = twice(vec3(0.25, 0.5, 0.75));
+                let alpha = second::<u32, f32>(index, 1.0);
+                let other = identity(index);
+                result[other] = vec4(rgb, alpha);
+            }
+        ",
+            "generic_main",
+        )
+        .unwrap();
+        for expected in [
+            "uint vsl_mono_8_identity_4_uint(in uint value)",
+            "vec3 vsl_mono_8_identity_4_vec3(in vec3 value)",
+            "uint vsl_mono_5_twice_4_uint(in uint value)",
+            "vec3 vsl_mono_5_twice_4_vec3(in vec3 value)",
+            "float vsl_mono_6_second_4_uint_5_float(in uint first, in float second)",
+            "vec3 rgb = vsl_mono_5_twice_4_vec3(",
+        ] {
+            assert_eq!(
+                glsl.matches(expected).count(),
+                if expected.contains("rgb =") { 1 } else { 2 },
+                "{glsl}"
+            );
+        }
+        assert!(!glsl.contains("unused("), "{glsl}");
+        assert!(!glsl.contains("T identity("), "{glsl}");
+        validate_glsl_if_available("free_generic_nested", &glsl, false);
+    }
+
+    #[test]
+    fn monomorphizes_free_generic_array_and_struct_signatures() {
+        let glsl = selected_glsl(
+            r"
+            struct Box<T> { value: T }
+            struct Tag<T> { value: u32 }
+            fn first<T>(values: [T; 2]) -> T { values[0u] }
+            fn unbox<T>(value: Box<T>) -> T { value.value }
+            fn wrap<T>(value: T) -> Box<T> { Box::<T> { value: value } }
+            @stage(compute(1,1,1))
+            fn generic_main(#[binding(set=0,binding=0)] result: RWBuffer<u32>) {
+                let array: [u32; 2] = [2u, 3u];
+                let boxed: Box<u32> = wrap(first(array));
+                let tag = Tag::<f32> { value: 7u };
+                result[0u] = unbox(boxed) + tag.value;
+            }
+        ",
+            "generic_main",
+        )
+        .unwrap();
+        assert!(
+            glsl.contains("uint vsl_mono_5_first_4_uint(in uint values[2])"),
+            "{glsl}"
+        );
+        assert!(
+            glsl.contains("Box__uint vsl_mono_4_wrap_4_uint(in uint value)"),
+            "{glsl}"
+        );
+        assert!(
+            glsl.contains("uint vsl_mono_5_unbox_4_uint(in Box__uint value)"),
+            "{glsl}"
+        );
+        assert!(glsl.contains("Tag__float tag = Tag__float(7u)"), "{glsl}");
+        validate_glsl_if_available("free_generic_aggregates", &glsl, false);
+    }
+
+    #[test]
+    fn monomorphizes_free_generic_trait_bounded_calls() {
+        let glsl = selected_glsl(
+            r"
+            trait Score { fn score(self) -> f32; }
+            struct Sample { weight: f32 }
+            impl Score for Sample { fn score(self) -> f32 { self.weight } }
+            fn read_score<T: Score>(value: T) -> f32 { value.score() }
+            @stage(compute(1,1,1))
+            fn generic_main(#[binding(set=0,binding=0)] result: RWBuffer<f32>) {
+                let value = Sample { weight: 2.0 };
+                result[0u] = read_score(value);
+            }
+        ",
+            "generic_main",
+        )
+        .unwrap();
+        assert!(
+            glsl.contains("float vsl_mono_10_read_5fscore_6_Sample("),
+            "{glsl}"
+        );
+        assert!(glsl.contains("return Sample_score(value);"), "{glsl}");
+        validate_glsl_if_available("free_generic_bound", &glsl, false);
+    }
+
+    #[test]
+    fn rejects_unsupported_free_generic_calls_without_emitting_raw_templates() {
+        for (source, expected) in [
+            (
+                "fn id<T>(value: T) -> T { value } @stage(compute(1,1,1)) fn bad() { id::<u32, f32>(1u); }",
+                "expects 1 type arguments",
+            ),
+            (
+                "fn id<T>(value: T) -> T { value } @stage(compute(1,1,1)) fn bad() { id::<u32>(1.0); }",
+                "expects uint, got float",
+            ),
+            (
+                "fn pair<T>(a: T, b: T) -> T { a } @stage(compute(1,1,1)) fn bad() { pair(1u, 1.0); }",
+                "conflicting types",
+            ),
+            (
+                "fn make<T>() -> T { let value: T; value } @stage(compute(1,1,1)) fn bad() { make(); }",
+                "cannot infer",
+            ),
+            (
+                "fn id<T>(value: T) -> T { value } @stage(compute(1,1,1)) fn bad() { let unknown = missing(); id(unknown); }",
+                "cannot infer",
+            ),
+            (
+                "fn id<T>(value: T) -> T { value } @stage(compute(1,1,1)) fn bad() { id::<RayQuery>(1u); }",
+                "unsupported or unresolved generic type",
+            ),
+            (
+                "fn recurse<T>(value: T) -> T { recurse(value) } @stage(compute(1,1,1)) fn bad() { recurse(1u); }",
+                "recursive generic",
+            ),
+            (
+                "fn pair<A, B>(a: A, b: B) -> A { a } @stage(compute(1,1,1)) fn bad() { pair(b = 1.0, a = 1u); }",
+                "declaration order",
+            ),
+            (
+                "fn id<T>(value: T) -> T { value } @stage(compute(1,1,1)) fn bad() { id::<unknown = 1>(1u); }",
+                "requires type arguments",
+            ),
+        ] {
+            let error = selected_glsl(source, "bad").expect_err(source);
+            assert!(error.contains(expected), "{source}: {error}");
+        }
+    }
+
+    #[test]
     fn monomorphizes_generic_struct_and_impl_methods_without_default_target() {
         let src = r"
             pub trait ResampleTarget {

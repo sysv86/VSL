@@ -15,6 +15,12 @@ use vsl_syntax::ast::{
     TypeExpr, UnaryOp, WorkgroupVarDecl,
 };
 
+mod free_generics;
+use free_generics::{
+    FreeGenerics, emit_free_specializations, emit_generic_call, known_expr_type,
+    resolve_generic_call,
+};
+
 /// Maximum Set 0 binding reserved for per-pass targets before optional fallback sampler slots.
 const MAX_PASS_TARGET_BINDING: u32 = 14;
 
@@ -141,8 +147,11 @@ pub(crate) struct EmitCtx {
     pub struct_layouts: IndexMap<SmolStr, LayoutMode>,
     pub push_constant_instances: IndexMap<SmolStr, String>,
     pub generic_structs: IndexMap<SmolStr, GenericStructMeta>,
+    generic_struct_keys: IndexMap<String, MonomorphKey>,
     pub fn_returns: IndexMap<SmolStr, String>,
     pub generic_subst: IndexMap<SmolStr, String>,
+    free_generics: FreeGenerics,
+    uncertain_locals: IndexSet<SmolStr>,
     pub pack_param_types: IndexMap<SmolStr, String>,
     pub imported_mc_world: bool,
     pub shadowed_world: bool,
@@ -167,8 +176,11 @@ impl EmitCtx {
             struct_layouts: IndexMap::new(),
             push_constant_instances: IndexMap::new(),
             generic_structs: IndexMap::new(),
+            generic_struct_keys: IndexMap::new(),
             fn_returns: IndexMap::new(),
             generic_subst: IndexMap::new(),
+            free_generics: FreeGenerics::default(),
+            uncertain_locals: IndexSet::new(),
             pack_param_types: IndexMap::new(),
             imported_mc_world: false,
             shadowed_world: false,
@@ -339,6 +351,8 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
                             }
                         }
                         let mangled = SmolStr::new(key.mangled_name());
+                        ctx.generic_struct_keys
+                            .insert(mangled.to_string(), key.clone());
                         ctx.struct_fields.insert(mangled.clone(), fields);
                         ctx.struct_field_dims.insert(mangled.clone(), dims);
                         ctx.struct_layouts.insert(mangled, layout_mode);
@@ -346,8 +360,7 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
                 }
             }
             Item::Function(f) => {
-                ctx.fn_returns
-                    .insert(f.name.name.clone(), fn_return_glsl_type(f));
+                register_free_function(f, &mut ctx);
                 if extract_entry_stage(&f.attrs).is_some() {
                     for p in &f.params {
                         if has_attr(&p.attrs, "push_constant")
@@ -363,6 +376,11 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
             Item::Impl(imp) => {
                 if imp.generics.is_empty() {
                     let empty = IndexMap::new();
+                    if let Some(trait_path) = &imp.trait_path {
+                        ctx.free_generics
+                            .trait_impls
+                            .insert((trait_path.joined(), type_to_glsl(&imp.target).0));
+                    }
                     let target_name = impl_target_name_with_subst(&imp.target, &empty);
                     for m in &imp.methods {
                         let mangled = SmolStr::new(format!("{target_name}_{}", m.name.name));
@@ -431,7 +449,7 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
     // 1. Constants.
     for item in &unit.items {
         if let Item::Const(c) = item {
-            emit_const_decl(c, &ctx, &mut out);
+            emit_const_decl(c, &mut ctx, &mut out);
         }
     }
 
@@ -493,6 +511,8 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
         }
     }
 
+    let generic_prototype_offset = out.len();
+
     // 5. Trait interfaces and `impl` methods (concrete impls before monomorphized generic impls
     //    so trait method definitions precede monomorphized callers in GLSL).
     for item in &unit.items {
@@ -517,11 +537,14 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
 
     // 6. Functions and `@stage(compute(x, y, z))` entry points.
     for item in &unit.items {
-        if let Item::Function(f) = item {
+        if let Item::Function(f) = item
+            && f.generics.is_empty()
+        {
             emit_fn_item(f, &mut ctx, &mut out);
         }
     }
 
+    append_free_specializations(&mut ctx, &scan, generic_prototype_offset, &mut out);
     if !ctx.errors.is_empty() {
         let mut diagnostics = String::new();
         for error in &ctx.errors {
@@ -849,16 +872,55 @@ fn emit_ray_query_support(scan: &FeatureScan, ctx: &mut EmitCtx, out: &mut Strin
     }
 }
 
+pub(crate) fn register_free_function(func: &FnDecl, ctx: &mut EmitCtx) {
+    if func.generics.is_empty() {
+        ctx.fn_returns
+            .insert(func.name.name.clone(), fn_return_glsl_type(func));
+    } else if extract_entry_stage(&func.attrs).is_some() || has_attr(&func.attrs, "hook") {
+        ctx.errors.push(format!(
+            "Generic shader entry {} is unsupported",
+            func.name.name
+        ));
+    } else if ctx
+        .free_generics
+        .templates
+        .insert(func.name.name.clone(), func.clone())
+        .is_some()
+    {
+        ctx.errors
+            .push(format!("Duplicate generic function {}", func.name.name));
+    }
+}
+
+pub(crate) fn append_free_specializations(
+    ctx: &mut EmitCtx,
+    scan: &FeatureScan,
+    prototype_offset: usize,
+    out: &mut String,
+) {
+    let (prototypes, bodies) = emit_free_specializations(ctx, scan);
+    out.insert_str(prototype_offset, &prototypes);
+    out.push_str(&bodies);
+}
+
 pub(crate) fn emit_fn_decl_with_ctx(
     func: &FnDecl,
     self_ty: Option<&str>,
     ctx: &mut EmitCtx,
     out: &mut String,
 ) {
+    if !func.generics.is_empty() {
+        ctx.errors.push(format!(
+            "Generic GLSL function {} requires concrete specialization",
+            func.name.name
+        ));
+        return;
+    }
     if ctx.opts.route_params_to_vs_motion {
         emit_ray_query_support(&scan_fn_decl_without_param_inference(func), ctx, out);
     }
     let saved_locals = ctx.local_types.clone();
+    let saved_uncertain = ctx.uncertain_locals.clone();
     let saved_shadowed_world = ctx.shadowed_world;
 
     for param in &func.params {
@@ -876,6 +938,7 @@ pub(crate) fn emit_fn_decl_with_ctx(
                 },
             )
         };
+        ctx.uncertain_locals.shift_remove(&param.name.name);
         ctx.local_types.insert(param.name.name.clone(), ty_str);
     }
 
@@ -892,6 +955,7 @@ pub(crate) fn emit_fn_decl_with_ctx(
     out.push_str("}\n");
 
     ctx.local_types = saved_locals;
+    ctx.uncertain_locals = saved_uncertain;
     ctx.shadowed_world = saved_shadowed_world;
 }
 
@@ -1118,9 +1182,21 @@ fn emit_impl_block(
     }
 }
 
-pub(crate) fn emit_const_decl(decl: &ConstDecl, ctx: &EmitCtx, out: &mut String) {
+pub(crate) fn emit_const_decl(decl: &ConstDecl, ctx: &mut EmitCtx, out: &mut String) {
     let (ty_str, arr_suffix) = type_to_glsl(&decl.ty);
-    let val_str = emit_expr_const(&decl.value, ctx);
+    let mut scratch = ctx.clone();
+    let mut prelude = String::new();
+    let val_str = emit_expr_with_hoist(&decl.value, 0, &mut scratch, &mut prelude);
+    if scratch.errors.len() > ctx.errors.len() {
+        let error_count = ctx.errors.len();
+        ctx.errors.extend(scratch.errors.drain(error_count..));
+    }
+    if scratch.free_generics.has_pending() || !prelude.is_empty() {
+        ctx.errors.push(format!(
+            "Non-constant GLSL initializer for {}",
+            decl.name.name
+        ));
+    }
     let name = escape_glsl_ident(&decl.name.name);
     let _ = writeln!(out, "const {ty_str} {name}{arr_suffix} = {val_str};\n");
 }
@@ -1473,6 +1549,7 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
             return;
         }
         let saved_locals = ctx.local_types.clone();
+        let saved_uncertain = ctx.uncertain_locals.clone();
         let saved_shadowed_world = ctx.shadowed_world;
 
         let mut builtin_inits: Vec<(String, String, Option<&'static str>)> = Vec::new();
@@ -1595,6 +1672,7 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
         out.push_str("}\n\n");
 
         ctx.local_types = saved_locals;
+        ctx.uncertain_locals = saved_uncertain;
         ctx.shadowed_world = saved_shadowed_world;
     } else {
         emit_fn_decl_with_ctx(func, None, ctx, out);
@@ -1712,6 +1790,7 @@ fn emit_block_contents(
     out: &mut String,
 ) {
     let saved_locals = ctx.local_types.clone();
+    let saved_uncertain = ctx.uncertain_locals.clone();
     let saved_rt_interfaces = ctx.rt_interfaces.clone();
     let saved_shadowed_world = ctx.shadowed_world;
     for stmt in &block.stmts {
@@ -1763,6 +1842,7 @@ fn emit_block_contents(
         }
     }
     ctx.local_types = saved_locals;
+    ctx.uncertain_locals = saved_uncertain;
     ctx.rt_interfaces = saved_rt_interfaces;
     ctx.shadowed_world = saved_shadowed_world;
 }
@@ -1874,6 +1954,7 @@ fn emit_branch_assign(
     out: &mut String,
 ) {
     let saved_locals = ctx.local_types.clone();
+    let saved_uncertain = ctx.uncertain_locals.clone();
     let saved_rt_interfaces = ctx.rt_interfaces.clone();
     let saved_shadowed_world = ctx.shadowed_world;
     for stmt in &block.stmts {
@@ -1887,6 +1968,7 @@ fn emit_branch_assign(
         let _ = writeln!(out, "{target} = {val_str};");
     }
     ctx.local_types = saved_locals;
+    ctx.uncertain_locals = saved_uncertain;
     ctx.rt_interfaces = saved_rt_interfaces;
     ctx.shadowed_world = saved_shadowed_world;
 }
@@ -1901,10 +1983,15 @@ fn emit_builtin_writebacks(ctx: &EmitCtx, indent: usize, out: &mut String) {
 fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
     match stmt {
         Stmt::Let { name, ty, init, .. } => {
+            let known = init.as_ref().and_then(|e| known_expr_type(e, ctx));
+            let uncertain = ty.is_none() && known.is_none();
             let (mut ty_str, arr_suffix) = if let Some(t) = ty {
                 type_to_glsl_with_subst(t, &ctx.generic_subst)
             } else if let Some(e) = init {
-                (infer_glsl_type(e, ctx), String::new())
+                (
+                    known.unwrap_or_else(|| infer_glsl_type(e, ctx)),
+                    String::new(),
+                )
             } else {
                 ("float".to_owned(), String::new())
             };
@@ -1940,6 +2027,11 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
                 );
                 ctx.rt_interfaces.shift_remove(&name.name);
                 ctx.local_types.insert(name.name.clone(), local_ty);
+                if uncertain {
+                    ctx.uncertain_locals.insert(name.name.clone());
+                } else {
+                    ctx.uncertain_locals.shift_remove(&name.name);
+                }
                 if name.name == "world" {
                     ctx.shadowed_world = true;
                 }
@@ -1958,6 +2050,11 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
             }
             ctx.rt_interfaces.shift_remove(&name.name);
             ctx.local_types.insert(name.name.clone(), local_ty);
+            if uncertain {
+                ctx.uncertain_locals.insert(name.name.clone());
+            } else {
+                ctx.uncertain_locals.shift_remove(&name.name);
+            }
             if name.name == "world" {
                 ctx.shadowed_world = true;
             }
@@ -2012,6 +2109,7 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
             ..
         } => {
             let saved_locals = ctx.local_types.clone();
+            let saved_uncertain = ctx.uncertain_locals.clone();
             let saved_rt_interfaces = ctx.rt_interfaces.clone();
             let saved_shadowed_world = ctx.shadowed_world;
             let var_name = if binding.name == "_" {
@@ -2058,6 +2156,7 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
                 ctx.shadowed_world = true;
             }
             ctx.rt_interfaces.shift_remove(&binding.name);
+            ctx.uncertain_locals.shift_remove(&binding.name);
             out.push_str(&pre);
             write_indent(indent, out);
             if has_attr(attrs, "unroll") {
@@ -2068,6 +2167,7 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
             write_indent(indent, out);
             out.push_str("}\n");
             ctx.local_types = saved_locals;
+            ctx.uncertain_locals = saved_uncertain;
             ctx.rt_interfaces = saved_rt_interfaces;
             ctx.shadowed_world = saved_shadowed_world;
         }
@@ -2289,8 +2389,18 @@ fn emit_expr_with_hoist(
                 .collect();
             format!("{{{}}}", items.join(", "))
         }
-        Expr::StructLit { path, fields, .. } => {
-            let struct_name = resolve_struct_lit_name(path, fields, ctx);
+        Expr::StructLit {
+            path,
+            turbofish,
+            fields,
+            ..
+        } => {
+            let struct_name = resolve_struct_lit_name(path, turbofish, fields, ctx);
+            if !turbofish.is_empty() && !ctx.struct_fields.contains_key(struct_name.as_str()) {
+                ctx.errors.push(format!(
+                    "Unsupported or unresolved explicit GLSL struct literal {struct_name}"
+                ));
+            }
             let decl_keys: Option<Vec<SmolStr>> = ctx
                 .struct_fields
                 .get(struct_name.as_str())
@@ -2474,8 +2584,30 @@ fn emit_call_expr_with_hoist(
     ctx: &mut EmitCtx,
     pre_stmts: &mut String,
 ) -> String {
-    if let Expr::Path { path, .. } = callee {
+    if let Expr::Path {
+        path, turbofish, ..
+    } = callee
+    {
         let joined = path.joined();
+        if let Some(result) = emit_generic_call(&joined, turbofish, args, indent, ctx, pre_stmts) {
+            return result;
+        }
+        if !turbofish.is_empty()
+            && !matches!(
+                joined.as_str(),
+                "atomic_add"
+                    | "atomic_cas"
+                    | "atomic_min"
+                    | "atomic_max"
+                    | "atomic_and"
+                    | "atomic_or"
+                    | "atomic_xor"
+                    | "atomic_exchange"
+            )
+        {
+            ctx.errors
+                .push(format!("Unsupported type arguments on GLSL call {joined}"));
+        }
 
         // Lower `mc::debug_write("channel", coord, color)` into `imageStore(vsl_debug_<channel>, ...)`.
         if joined == "mc::debug_write" && args.len() >= 3 {
@@ -3091,6 +3223,12 @@ fn type_to_glsl_with_subst(
                 } else {
                     String::new()
                 };
+                if let Some((base, _)) = subst_ty.split_once('[') {
+                    return (
+                        base.to_owned(),
+                        format!("{suffix}{}", &subst_ty[base.len()..]),
+                    );
+                }
                 return (subst_ty.clone(), suffix);
             }
             if let Some(bda) = parse_bda_type_with_subst(&joined, args, generic_subst) {
@@ -3210,11 +3348,37 @@ fn swizzle_result_type(base_ty: &str, field: &str) -> Option<String> {
     }
 }
 
-fn resolve_struct_lit_name(path: &Path, fields: &[(Ident, Expr)], ctx: &EmitCtx) -> String {
+fn resolve_struct_lit_name(
+    path: &Path,
+    turbofish: &[TypeArg],
+    fields: &[(Ident, Expr)],
+    ctx: &EmitCtx,
+) -> String {
     let base = path.joined().replace("::", "_");
     let Some(meta) = ctx.generic_structs.get(base.as_str()) else {
-        return base;
+        return if turbofish.is_empty() {
+            base
+        } else {
+            "vsl_invalid_struct_type".to_owned()
+        };
     };
+    if !turbofish.is_empty() {
+        if turbofish.len() != meta.generic_param_count {
+            return "vsl_invalid_struct_type".to_owned();
+        }
+        let mut args = Vec::new();
+        for arg in turbofish {
+            let TypeArg::Type(ty) = arg else {
+                return "vsl_invalid_struct_type".to_owned();
+            };
+            let (base, suffix) = type_to_glsl_with_subst(ty, &ctx.generic_subst);
+            if !suffix.is_empty() {
+                return "vsl_invalid_struct_type".to_owned();
+            }
+            args.push(base);
+        }
+        return mangle_generic_name(&base, &args);
+    }
     let mut resolved: Vec<Option<String>> = vec![None; meta.generic_param_count];
     for (field_name, field_idx) in &meta.param_fields {
         if let Some((_, val_expr)) = fields.iter().find(|(id, _)| &id.name == field_name) {
@@ -3288,7 +3452,12 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
             }
             "float".to_owned()
         }
-        Expr::StructLit { path, fields, .. } => resolve_struct_lit_name(path, fields, ctx),
+        Expr::StructLit {
+            path,
+            turbofish,
+            fields,
+            ..
+        } => resolve_struct_lit_name(path, turbofish, fields, ctx),
         Expr::Field {
             receiver, field, ..
         } => {
@@ -3384,8 +3553,15 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
             }
         }
         Expr::Call { callee, args, .. } => {
-            if let Expr::Path { path, .. } = callee.as_ref() {
+            if let Expr::Path {
+                path, turbofish, ..
+            } = callee.as_ref()
+            {
                 let name = path.joined();
+                if let Some(f) = ctx.free_generics.templates.get(name.as_str()) {
+                    return resolve_generic_call(f, turbofish, args, ctx)
+                        .map_or_else(|_| "vsl_invalid_generic_type".to_owned(), |(_, ret)| ret);
+                }
                 if matches!(name.as_str(), "param" | "mc::param" | "pack::param")
                     && let Some(first) = args.first()
                 {
@@ -3625,6 +3801,8 @@ fn map_call_name(name: &str) -> String {
         "u32" => "uint".to_owned(),
         "i32" => "int".to_owned(),
         "f32" => "float".to_owned(),
+        "f16" => "float16_t".to_owned(),
+        "f64" => "double".to_owned(),
         "u64" => "uint64_t".to_owned(),
         "i64" => "int64_t".to_owned(),
         other => other.replace("::", "_"),
@@ -4071,9 +4249,21 @@ pub(crate) fn scan_fn_into(f: &FnDecl, scan: &mut FeatureScan) {
     scan_fn_into_with_options(f, EmitOptions::default(), scan);
 }
 
+const UNRESOLVED_GENERIC_TYPE: &str = "vslUnresolvedGenericType";
+
 fn scan_fn_into_with_options(f: &FnDecl, opts: EmitOptions, scan: &mut FeatureScan) {
-    let empty = IndexMap::new();
-    scan_fn_into_with_subst(f, &empty, opts, scan);
+    let subst = f
+        .generics
+        .iter()
+        .enumerate()
+        .map(|(index, g)| {
+            (
+                g.name.name.clone(),
+                format!("{UNRESOLVED_GENERIC_TYPE}{index}"),
+            )
+        })
+        .collect();
+    scan_fn_into_with_subst(f, &subst, opts, scan);
 }
 
 fn scan_fn_into_with_subst(
@@ -4188,7 +4378,9 @@ fn scan_type_with_subst(ty: &TypeExpr, subst: &IndexMap<SmolStr, String>, scan: 
         TypeExpr::Array { element, .. } => scan_type_with_subst(element, subst, scan),
         TypeExpr::Named { path, args, .. } => {
             let joined = path.joined();
-            if let Some(bda) = parse_bda_type_with_subst(&joined, args, subst) {
+            if let Some(bda) = parse_bda_type_with_subst(&joined, args, subst)
+                && !bda.elem_glsl.contains(UNRESOLVED_GENERIC_TYPE)
+            {
                 scan.extensions.insert("GL_EXT_buffer_reference");
                 scan.extensions.insert("GL_EXT_buffer_reference2");
                 scan.extensions
@@ -4327,7 +4519,14 @@ fn scan_expr_with_subst(
                     .insert("GL_EXT_shader_explicit_arithmetic_types_float16");
             }
         }
-        Expr::Path { path, .. } => {
+        Expr::Path {
+            path, turbofish, ..
+        } => {
+            for arg in turbofish {
+                if let TypeArg::Type(ty) = arg {
+                    scan_type_with_subst(ty, subst, scan);
+                }
+            }
             let joined = path.joined();
             if joined == "nonuniform" {
                 scan.extensions.insert("GL_EXT_nonuniform_qualifier");
@@ -4350,7 +4549,14 @@ fn scan_expr_with_subst(
                 scan_expr_with_subst(e, subst, opts, scan);
             }
         }
-        Expr::StructLit { fields, .. } => {
+        Expr::StructLit {
+            turbofish, fields, ..
+        } => {
+            for arg in turbofish {
+                if let TypeArg::Type(ty) = arg {
+                    scan_type_with_subst(ty, subst, scan);
+                }
+            }
             for (_, v) in fields {
                 scan_expr_with_subst(v, subst, opts, scan);
             }
@@ -4882,11 +5088,31 @@ fn infer_simple_concrete_expr_type(
     local_types: &IndexMap<SmolStr, String>,
 ) -> Option<String> {
     match expr {
-        Expr::StructLit { path, fields, .. } => {
+        Expr::StructLit {
+            path,
+            turbofish,
+            fields,
+            ..
+        } => {
             let base = path.joined().replace("::", "_");
             if let Some(s_decl) = generic_structs.get(base.as_str()) {
-                let args =
-                    infer_generic_struct_lit_args(s_decl, fields, generic_structs, local_types)?;
+                let args = if turbofish.is_empty() {
+                    infer_generic_struct_lit_args(s_decl, fields, generic_structs, local_types)?
+                } else {
+                    if turbofish.len() != s_decl.generics.len() {
+                        return None;
+                    }
+                    turbofish
+                        .iter()
+                        .map(|arg| {
+                            let TypeArg::Type(ty) = arg else {
+                                return None;
+                            };
+                            let (base, suffix) = type_to_glsl(ty);
+                            suffix.is_empty().then_some(base)
+                        })
+                        .collect::<Option<Vec<_>>>()?
+                };
                 return Some(mangle_generic_name(&base, &args));
             }
             Some(base)
@@ -4948,7 +5174,17 @@ fn collect_instantiations_in_expr(
     out: &mut IndexSet<MonomorphKey>,
 ) {
     match expr {
-        Expr::StructLit { path, fields, .. } => {
+        Expr::StructLit {
+            path,
+            turbofish,
+            fields,
+            ..
+        } => {
+            for arg in turbofish {
+                if let TypeArg::Type(ty) = arg {
+                    collect_instantiations_in_type(ty, generic_structs, active_generics, out);
+                }
+            }
             for (_, v) in fields {
                 collect_instantiations_in_expr(
                     v,
@@ -4960,8 +5196,25 @@ fn collect_instantiations_in_expr(
             }
             let base = path.joined().replace("::", "_");
             if let Some(s_decl) = generic_structs.get(base.as_str())
-                && let Some(type_args) =
+                && let Some(type_args) = if turbofish.is_empty() {
                     infer_generic_struct_lit_args(s_decl, fields, generic_structs, local_types)
+                } else if turbofish.len() == s_decl.generics.len() {
+                    turbofish
+                        .iter()
+                        .map(|arg| {
+                            let TypeArg::Type(ty) = arg else {
+                                return None;
+                            };
+                            if type_contains_generic_param(ty, active_generics) {
+                                return None;
+                            }
+                            let (base, suffix) = type_to_glsl(ty);
+                            suffix.is_empty().then_some(base)
+                        })
+                        .collect()
+                } else {
+                    None
+                }
                 && !type_args
                     .iter()
                     .any(|t| active_generics.contains(t.as_str()))

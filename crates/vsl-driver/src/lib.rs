@@ -228,6 +228,9 @@ pub struct ProjectCompileOutput {
     pub units: Vec<CompiledShaderUnit>,
     pub hook_glsl_slots: Vec<(HookStage, String)>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Linked HIR indexed by the original module's source file.
+    /// Imported declarations retain their defining file IDs.
+    pub hir_modules: IndexMap<FileId, HirModule>,
 }
 
 impl ProjectCompileOutput {
@@ -299,6 +302,18 @@ impl VslCompiler {
         self.l2_cache.len()
     }
 
+    fn intern_source(&mut self, name: String, source: &str) -> FileId {
+        if let Some(existing) = self
+            .sources
+            .files()
+            .iter()
+            .find(|f| f.name == name && f.text == source)
+        {
+            return existing.id;
+        }
+        self.sources.add_file(name, source)
+    }
+
     /// Parses, lowers to HIR (with early tier/cap pruning and single-source-of-truth reflection),
     /// lowers entry points and native hooks to typed structured SSA IR -> SPIR-V 1.6 (in parallel
     /// across entry points using `std::thread::scope`), lowers raster G-Buffer hooks through the
@@ -310,7 +325,7 @@ impl VslCompiler {
         options: &CompileOptions,
     ) -> ShaderCompileOutput {
         let l1_hash = L1ModuleHash(*blake3::hash(source.as_bytes()).as_bytes());
-        let file = self.sources.add_file(file_name, source);
+        let file = self.intern_source(file_name.into(), source);
         let parsed = parse_source(file, source);
         self.compile_shader_with_parsed(file, parsed, l1_hash, options)
     }
@@ -341,7 +356,7 @@ impl VslCompiler {
         let mut known_modules: IndexSet<SmolStr> = IndexSet::with_capacity(files.len());
 
         for (idx, (file_name, source)) in files.iter().enumerate() {
-            let file_id = self.sources.add_file(file_name.clone(), source.clone());
+            let file_id = self.intern_source(file_name.clone(), source);
             let parsed = parse_source(file_id, source);
             let mod_name = parsed.unit.module_decl.as_ref().map_or_else(
                 || SmolStr::new(format!("anon_{idx}")),
@@ -352,6 +367,7 @@ impl VslCompiler {
         }
 
         let mut graph = ModuleGraph::new();
+        let source_context = hash_source_context(parsed_modules.iter().map(|(_, id, _, _)| *id));
         let mut by_module: IndexMap<SmolStr, (FileId, ParseResult, String)> =
             IndexMap::with_capacity(parsed_modules.len());
         let mut diagnostics = Vec::new();
@@ -397,6 +413,7 @@ impl VslCompiler {
                     units: Vec::new(),
                     hook_glsl_slots: Vec::new(),
                     diagnostics,
+                    hir_modules: IndexMap::new(),
                 };
             }
         };
@@ -418,11 +435,13 @@ impl VslCompiler {
                     units: Vec::new(),
                     hook_glsl_slots: Vec::new(),
                     diagnostics,
+                    hir_modules: IndexMap::new(),
                 };
             }
         };
 
         let mut units = Vec::new();
+        let mut hir_modules = IndexMap::new();
         let mut hook_glsl_slots = Vec::new();
         let mut exports_by_module: IndexMap<SmolStr, ModuleExports> = IndexMap::new();
         let mut native_hooks_by_stage: IndexMap<
@@ -461,6 +480,7 @@ impl VslCompiler {
                     l1_hash,
                     options,
                     !has_import_errors,
+                    source_context,
                 );
 
                 for (_, func) in out.hir.functions.iter() {
@@ -479,6 +499,7 @@ impl VslCompiler {
                 diagnostics.extend(out.diagnostics);
                 units.extend(out.units);
                 hook_glsl_slots.extend(out.hook_glsl_slots);
+                hir_modules.insert(file_id, out.hir);
             }
         }
 
@@ -519,6 +540,7 @@ impl VslCompiler {
             units,
             hook_glsl_slots,
             diagnostics,
+            hir_modules,
         }
     }
 
@@ -529,7 +551,14 @@ impl VslCompiler {
         l1_hash: L1ModuleHash,
         options: &CompileOptions,
     ) -> ShaderCompileOutput {
-        self.compile_shader_with_parsed_inner(file, parsed, l1_hash, options, true)
+        self.compile_shader_with_parsed_inner(
+            file,
+            parsed,
+            l1_hash,
+            options,
+            true,
+            hash_source_context([file]),
+        )
     }
 
     fn compile_shader_with_parsed_inner(
@@ -539,6 +568,7 @@ impl VslCompiler {
         l1_hash: L1ModuleHash,
         options: &CompileOptions,
         allow_l1_cache: bool,
+        source_context: [u8; 32],
     ) -> ShaderCompileOutput {
         let mut diagnostics = parsed.diagnostics;
         let has_parse_errors = diagnostics.iter().any(Diagnostic::is_error);
@@ -547,6 +577,8 @@ impl VslCompiler {
         pack_schema_hash[31] ^= options.abi.as_u8();
         let l1_key = L1CacheKey {
             hash: l1_hash,
+            source_context,
+            file,
             tier: options.tier,
             active_caps: options.active_caps,
             abi: options.abi,
@@ -1002,6 +1034,16 @@ fn compile_single_entry_unit(
     (unit, lowered.diagnostics)
 }
 
+fn hash_source_context(files: impl IntoIterator<Item = FileId>) -> [u8; 32] {
+    let mut ids: Vec<_> = files.into_iter().collect();
+    ids.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for id in ids {
+        hasher.update(&id.0.to_le_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
 fn build_summary_from_hir(hir: &HirModule) -> ValidationSummary {
     let mut summary = ValidationSummary::default();
     for (_, st) in hir.structs.iter() {
@@ -1289,6 +1331,94 @@ mod tests {
         assert_eq!(out.units[0].stage, ShaderStage::Compute);
         assert_eq!(out.units[0].workgroup_size, Some([8, 8, 1]));
         validate_spirv_with_spirv_val("hook_sky", &out.units[0].spirv);
+    }
+
+    #[test]
+    fn cached_hir_preserves_source_identity_across_files_and_project_reordering() {
+        let mut compiler = VslCompiler::new();
+        let opts = CompileOptions::default();
+        let source = "fn value() -> u32 { 1u }";
+        let first = compiler.compile_shader_source("first.vsl", source, &opts);
+        let second = compiler.compile_shader_source("second.vsl", source, &opts);
+        assert_ne!(first.file, second.file);
+        assert_eq!(
+            first.hir.find_function("value").unwrap().span.file,
+            first.file
+        );
+        assert_eq!(
+            second.hir.find_function("value").unwrap().span.file,
+            second.file
+        );
+        let repeated = compiler.compile_shader_source("second.vsl", source, &opts);
+        assert_eq!(repeated.file, second.file);
+        assert_eq!(compiler.l1_cache_len(), 2);
+
+        let lib = (
+            "lib.vsl".to_owned(),
+            "module pack::lib; pub fn helper() -> u32 { 1u }".to_owned(),
+        );
+        let main = ("main.vsl".to_owned(), "module pack::main; import pack::lib::{helper}; @stage(compute(1,1,1)) fn run() { let n = helper(); }".to_owned());
+        let initial = compiler.compile_project(&[lib.clone(), main.clone()], &opts);
+        assert!(!initial.has_errors(), "{:?}", initial.diagnostics);
+        let cached_count = compiler.l1_cache_len();
+        let reordered = compiler.compile_project(&[main.clone(), lib.clone()], &opts);
+        assert!(!reordered.has_errors(), "{:?}", reordered.diagnostics);
+        assert_eq!(compiler.l1_cache_len(), cached_count);
+        for (&file, hir) in &reordered.hir_modules {
+            if hir.module_name == "pack::main" {
+                assert_eq!(hir.find_function("run").unwrap().span.file, file);
+                let helper_file = hir.find_function("helper").unwrap().span.file;
+                assert_eq!(compiler.sources.get(helper_file).unwrap().name, "lib.vsl");
+            }
+        }
+        let renamed = compiler.compile_project(&[main, ("renamed.vsl".to_owned(), lib.1)], &opts);
+        assert!(!renamed.has_errors(), "{:?}", renamed.diagnostics);
+        let hir = renamed
+            .hir_modules
+            .values()
+            .find(|h| h.module_name == "pack::main")
+            .unwrap();
+        let helper_file = hir.find_function("helper").unwrap().span.file;
+        assert_eq!(
+            compiler.sources.get(helper_file).unwrap().name,
+            "renamed.vsl"
+        );
+    }
+
+    #[test]
+    fn imports_preserve_generic_literal_type_dependencies_and_exclude_entry_points() {
+        let mut compiler = VslCompiler::new();
+        let lib = (
+            "lib.vsl".to_owned(),
+            r"
+            module pack::lib;
+            struct Tag { value: u32 }
+            struct Box<T> { value: u32 }
+            pub fn helper() -> u32 { let value = Box::<Tag> { value: 7u }; value.value }
+            @raygen pub fn launch() {}
+        "
+            .to_owned(),
+        );
+        let main = ("main.vsl".to_owned(), "module pack::main; import pack::lib::{helper}; @stage(compute(1,1,1)) fn run() { let n = helper(); }".to_owned());
+        let result = compiler.compile_project(
+            &[lib.clone(), main],
+            &CompileOptions::for_tier(RenderTier::Tier3PathTracing),
+        );
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        let invalid = (
+            "bad.vsl".to_owned(),
+            "module pack::bad; import pack::lib::{launch}; @stage(compute(1,1,1)) fn run() {}"
+                .to_owned(),
+        );
+        let result = compiler.compile_project(
+            &[lib, invalid],
+            &CompileOptions::for_tier(RenderTier::Tier3PathTracing),
+        );
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "E0502"),
+            "{:?}",
+            result.diagnostics
+        );
     }
 
     #[test]

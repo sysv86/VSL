@@ -7840,7 +7840,12 @@ impl BodyScanner<'_, '_> {
                     pack_field_ty,
                 )
             }
-            Expr::StructLit { path, fields, span } => {
+            Expr::StructLit {
+                path,
+                turbofish,
+                fields,
+                span,
+            } => {
                 let mut hir_fields = Vec::with_capacity(fields.len());
                 for (fname, fval) in fields {
                     let (v, _) = self.lower_expr(fval, false);
@@ -7858,7 +7863,33 @@ impl BodyScanner<'_, '_> {
                             .get(struct_name.as_str())
                             .copied()
                     });
-                if let Some(base_ty) = resolved_ty
+                if !turbofish.is_empty() {
+                    if self.ctx.struct_ids.contains_key(&struct_name) {
+                        let mut type_ctx = self.ctx.type_ctx();
+                        resolved_ty = try_monomorphize_struct(
+                            &struct_name,
+                            turbofish,
+                            &mut type_ctx,
+                            self.generic_params,
+                            self.type_subst,
+                            *span,
+                        );
+                    } else {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0274",
+                            format!(
+                                "cannot apply generic type arguments to struct `{struct_name}`"
+                            ),
+                            *span,
+                        ));
+                        resolved_ty = None;
+                    }
+                    if let Some(ty) = resolved_ty
+                        && let Type::Struct { name, .. } = self.ctx.module.types.get(ty)
+                    {
+                        struct_name = name.clone();
+                    }
+                } else if let Some(base_ty) = resolved_ty
                     && let Some(&sid) = self.ctx.struct_ids.get(&struct_name)
                     && !self.ctx.module.structs[sid].generic_params.is_empty()
                 {
@@ -9477,6 +9508,16 @@ fn try_monomorphize_struct(
     type_subst: &IndexMap<SmolStr, TypeId>,
     use_span: Span,
 ) -> Option<TypeId> {
+    if args.iter().any(|arg| !matches!(arg, TypeArg::Type(_))) {
+        if let Some(diags) = ctx.diags.as_deref_mut() {
+            diags.push(Diagnostic::error(
+                "E0274",
+                format!("struct `{base_name}` requires positional generic type arguments"),
+                use_span,
+            ));
+        }
+        return None;
+    }
     let type_args: Vec<&TypeExpr> = args
         .iter()
         .filter_map(|arg| match arg {
@@ -12241,6 +12282,93 @@ mod tests {
             (
                 "fn bad() { let x: [u32; 4294967296]; }",
                 "array length must be an integer literal representable as u32",
+            ),
+        ] {
+            let parsed = parse_source(FileId(0), source);
+            assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+            let (_, diags) = lower_unit(
+                &parsed.unit,
+                RenderTier::Tier3PathTracing,
+                HardwareCaps::all(),
+            );
+            assert!(
+                diags
+                    .as_slice()
+                    .iter()
+                    .any(|d| d.message.contains(expected)),
+                "{source}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_struct_literal_arguments_through_monomorphization() {
+        let source = r"
+            struct Box<T> { value: T }
+            struct Pair<A, B> { first: A, second: B }
+            struct Tag<T> { value: u32 }
+            fn make<T>(value: T) -> Box<T> { Box::<T> { value: value } }
+            fn nested() -> Box<Pair<u32, f32>> {
+                Box::<Pair<u32, f32>> { value: Pair { first: 1u, second: 2.0 } }
+            }
+            fn explicit_only() -> Tag<f32> { Tag::<f32> { value: 1u } }
+            fn instantiate() -> Box<u32> { make(2u) }
+        ";
+        let parsed = parse_source(FileId(0), source);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (hir, diags) = lower_unit(
+            &parsed.unit,
+            RenderTier::Tier3PathTracing,
+            HardwareCaps::all(),
+        );
+        assert!(!diags.has_errors(), "{diags:?}");
+        for (func, expected) in [
+            ("nested", "Box<Pair<u32, f32>>"),
+            ("explicit_only", "Tag<f32>"),
+            ("make<u32>", "Box<u32>"),
+        ] {
+            let value = hir
+                .find_function(func)
+                .unwrap()
+                .body_hir
+                .as_ref()
+                .unwrap()
+                .tail_expr
+                .as_ref()
+                .unwrap();
+            assert!(
+                matches!(&value.kind, HirExprKind::StructLit { struct_name, .. } if struct_name == expected)
+            );
+            assert_eq!(
+                value.ty,
+                hir.find_function(func).unwrap().return_ty.unwrap()
+            );
+            assert!(hir.find_struct(expected).is_some());
+        }
+        for (source, expected) in [
+            (
+                "struct Box<T> { value: T } fn bad() { let x = Box::<u32> { value: 1.0 }; }",
+                "mismatched type for field",
+            ),
+            (
+                "struct Box<T> { value: T } fn bad() { let x = Box::<u32, f32> { value: 1u }; }",
+                "expects 1 generic type argument",
+            ),
+            (
+                "struct Box<T> { value: T } fn bad() { let x = Box::<u32, ignored = 1> { value: 1u }; }",
+                "requires positional generic type arguments",
+            ),
+            (
+                "struct S { value: u32 } fn bad() { let x = S::<u32> { value: 1u }; }",
+                "expects 0 generic type argument",
+            ),
+            (
+                "struct Box<T> { value: T } fn bad() { let x = Box::<Unknown> { value: 1u }; }",
+                "unknown type",
+            ),
+            (
+                "struct Box<T> { value: T } fn bad() { let x = Box::<Box<u32>> { value: Box::<f32> { value: 1.0 } }; }",
+                "mismatched type for field",
             ),
         ] {
             let parsed = parse_source(FileId(0), source);

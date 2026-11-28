@@ -11,7 +11,7 @@ Requires the workspace Rust toolchain, Bash, Python 3, glslang and SPIRV-Tools. 
 
 | Fixture | Coverage | GLSL baseline |
 | --- | --- | --- |
-| `generics.vsl` | Free generic function instantiated for `u32` and `vec3`, ordinary helper call | Not run: generic free functions are not monomorphized by the GLSL emitter |
+| `generics.vsl` | Free generic function instantiated for `u32` and `vec3`, ordinary helper call | Validated |
 | `mutable.vsl` | Mutable scalar, mutable array and indexed buffer writes | Validated |
 | `resources.vsl` | Explicit nonzero descriptor set, sparse bindings, sampled texel fetch, storage image and push constants | Validated |
 | `control.vsl` | Stepped range, branch, while, switch, conditional expression | Validated |
@@ -22,11 +22,11 @@ Requires the workspace Rust toolchain, Bash, Python 3, glslang and SPIRV-Tools. 
 | `regressions/loop_continue.vsl` | Stepped loop with `continue`, while-loop header phis | Validated |
 | `pack/` | Producer/consumer graph, preset and override evaluation, inferred RAW barrier, project compilation and binding validation | Validated (both entries) |
 
-The standalone fixtures use `--abi standalone`; the pack uses the engine ABI intentionally. The script checks native SPIR-V for Vulkan 1.3 and 1.4, verifies that reflected SPIR-V words exactly match emitted files, compiles supported selected-entry GLSL for both environments, and checks the pack's schedule and barrier JSON. The suite requires 12 native entries and 11 GLSL entries in both environments. All required entries passed on November 28, 2026, with the rebuilt debug CLI. The sole explicitly excluded GLSL path is the free generic function fixture; it is printed as not run and is not counted as a success. To require all twelve GLSL entries (including the currently unsupported generic path), run:
+The standalone fixtures use `--abi standalone`; the pack uses the engine ABI intentionally. The script checks native SPIR-V for Vulkan 1.3 and 1.4, verifies that reflected SPIR-V words exactly match emitted files, compiles supported selected-entry GLSL for both environments, and checks the pack's schedule and barrier JSON. The suite requires all 12 native and all 12 GLSL entries in both environments, with no generic-function skip. All required entries passed on November 28, 2026, with the rebuilt debug CLI.
 
-```sh
-STRICT_GLSL=1 bash examples/compiler_validation/validate.sh
-```
+The GLSL emitter specializes free generic functions for concrete value types (including fixed-size arrays and already declared concrete struct instances), deduplicates identical specializations, and resolves nested calls and explicit type arguments. Scoped GLSL tests additionally cover nested generic calls, multiple type parameters, concrete trait bounds, and explicit generic struct literals. Unresolved types, unsupported resource/BDA specializations, recursion, and unsupported argument ordering produce diagnostics instead of raw GLSL templates. This AST-based specialization is not a claim of complete native HIR/IR equivalence.
+
+Hardware smoke result: the release-compiled `generics.vsl` entry and its GLSL-generated SPIR-V both executed one workgroup on an NVIDIA GeForce RTX 3050 Laptop GPU. All eight output vectors matched the expected `(0.25, 0.5, 0.75, 0.625)` exactly. This used an external Vulkan host harness, not `validate.sh`; the other non-RT fixtures are not claimed to have been dispatched on hardware.
 
 These are compiler-only examples. For actual execution the host must supply buffers with sufficient elements, matching descriptors, push constants, image extents compatible with the dispatch, and correct synchronization. Pack scheduling produces graph dependencies, not Vulkan resource allocation or command buffers.
 

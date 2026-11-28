@@ -327,6 +327,7 @@ pub enum Expr {
     },
     StructLit {
         path: Path,
+        turbofish: Vec<TypeArg>,
         fields: Vec<(Ident, Expr)>,
         span: Span,
     },

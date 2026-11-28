@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate native and supported GLSL paths without running GPU workloads.
+# Validate native and GLSL paths without running GPU workloads.
 set -euo pipefail
 ulimit -c 0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -37,7 +37,7 @@ validate_glsl() {
     glsl_count=$((glsl_count + 1))
 }
 validate_module() {
-    local module=$1 expected=$2 glsl=$3
+    local module=$1 expected=$2
     local source="examples/compiler_validation/$module.vsl"
     local dir="$out/$module"
     mkdir -p "$dir"
@@ -65,22 +65,18 @@ PY
     while IFS=$'\t' read -r entry stage; do
         validate_spv "$dir/$entry.spv"
         native_count=$((native_count + 1))
-        if [[ $glsl == yes || ${STRICT_GLSL:-0} == 1 ]]; then
-            validate_glsl "$source" "$entry" "$stage" standalone "$dir"
-        else
-            printf 'GLSL NOT RUN for %s/%s (free generic function monomorphization is unsupported; STRICT_GLSL=1 to require it)\n' "$module" "$entry"
-        fi
+        validate_glsl "$source" "$entry" "$stage" standalone "$dir"
     done < "$dir/entries.txt"
 }
-validate_module generics generic_values no
-validate_module mutable mutable_values yes
-validate_module resources filter_image yes
-validate_module control control_flow yes
-validate_module graphics vertex_main,fragment_main yes
-validate_module regressions/scalar_inout mutable_values yes
-validate_module regressions/aggregate_inout mutable_values yes
-validate_module regressions/push_constant_params filter_image yes
-validate_module regressions/loop_continue control_flow yes
+validate_module generics generic_values
+validate_module mutable mutable_values
+validate_module resources filter_image
+validate_module control control_flow
+validate_module graphics vertex_main,fragment_main
+validate_module regressions/scalar_inout mutable_values
+validate_module regressions/aggregate_inout mutable_values
+validate_module regressions/push_constant_params filter_image
+validate_module regressions/loop_continue control_flow
 
 pack=examples/compiler_validation/pack
 "$vslc" pack-eval "$pack/pack.vsl" --tier 2 --json > "$out/pack-default.json"
@@ -115,12 +111,8 @@ if [[ $native_count != 12 ]]; then
     printf 'Expected 12 native entries, validated %s\n' "$native_count" >&2
     exit 1
 fi
-expected_glsl=11
-if [[ ${STRICT_GLSL:-0} == 1 ]]; then
-    expected_glsl=12
-fi
-if [[ $glsl_count != "$expected_glsl" ]]; then
-    printf 'Expected %s GLSL entries, validated %s\n' "$expected_glsl" "$glsl_count" >&2
+if [[ $glsl_count != 12 ]]; then
+    printf 'Expected 12 GLSL entries, validated %s\n' "$glsl_count" >&2
     exit 1
 fi
 printf 'Validated %s native and %s GLSL entries on both Vulkan environments; pack schedule/presets checked. Artifacts: %s\n' "$native_count" "$glsl_count" "$out"

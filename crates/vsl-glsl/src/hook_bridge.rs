@@ -1,7 +1,8 @@
 use crate::emit::{
-    BindlessAbi, EmitCtx, EmitOptions, LayoutMode, emit_concrete_struct_decl, emit_const_decl,
-    emit_fn_decl_with_ctx, escape_glsl_ident, fn_return_glsl_type, format_param_list, has_attr,
-    scan_expr, scan_fn_decl, scan_fn_decl_without_param_inference, scan_fn_into, scan_type,
+    BindlessAbi, EmitCtx, EmitOptions, LayoutMode, append_free_specializations,
+    emit_concrete_struct_decl, emit_const_decl, emit_fn_decl_with_ctx, escape_glsl_ident,
+    fn_return_glsl_type, format_param_list, has_attr, register_free_function, scan_expr,
+    scan_fn_decl, scan_fn_decl_without_param_inference, scan_fn_into, scan_type,
     seed_mc_builtin_types, type_to_glsl,
 };
 use indexmap::{IndexMap, IndexSet};
@@ -220,25 +221,38 @@ fn emit_raster_gbuffer_hook_slot_inner(
                 .insert(s.name.name.clone(), LayoutMode::Std430);
         }
         for helper in &deps.funcs {
-            ctx.fn_returns
-                .insert(helper.name.name.clone(), fn_return_glsl_type(helper));
+            register_free_function(helper, &mut ctx);
         }
         ctx.fn_returns
             .insert(func.name.name.clone(), fn_return_glsl_type(func));
 
         for c in &deps.consts {
-            emit_const_decl(c, &ctx, &mut out);
+            emit_const_decl(c, &mut ctx, &mut out);
         }
         for s in &deps.structs {
             emit_concrete_struct_decl(s, &s.name.name, &ctx, &mut out);
         }
+    }
+    let generic_prototype_offset = out.len();
+    if let Some(ref deps) = deps {
         for helper in &deps.funcs {
-            emit_fn_decl_with_ctx(helper, None, &mut ctx, &mut out);
-            out.push('\n');
+            if helper.generics.is_empty() {
+                let ret = fn_return_glsl_type(helper);
+                let name = escape_glsl_ident(&helper.name.name);
+                let params = format_param_list(&helper.params);
+                let _ = writeln!(out, "{ret} {name}({params});");
+            }
+        }
+        for helper in &deps.funcs {
+            if helper.generics.is_empty() {
+                emit_fn_decl_with_ctx(helper, None, &mut ctx, &mut out);
+                out.push('\n');
+            }
         }
     }
 
     emit_fn_decl_with_ctx(func, None, &mut ctx, &mut out);
+    append_free_specializations(&mut ctx, &scan, generic_prototype_offset, &mut out);
     if !ctx.errors.is_empty() {
         return Err(ctx.errors.join("; "));
     }
@@ -424,12 +438,29 @@ fn collect_block_refs(block: &Block, out: &mut Vec<SmolStr>) {
 
 fn collect_expr_refs(expr: &Expr, out: &mut Vec<SmolStr>) {
     match expr {
-        Expr::Path { path, .. } => {
+        Expr::Path {
+            path, turbofish, ..
+        } => {
             if path.segments.len() == 1 {
                 out.push(path.segments[0].name.clone());
             }
+            for arg in turbofish {
+                if let TypeArg::Type(ty) = arg {
+                    collect_type_refs(ty, out);
+                }
+            }
         }
-        Expr::StructLit { path, fields, .. } => {
+        Expr::StructLit {
+            path,
+            turbofish,
+            fields,
+            ..
+        } => {
+            for arg in turbofish {
+                if let TypeArg::Type(ty) = arg {
+                    collect_type_refs(ty, out);
+                }
+            }
             if path.segments.len() == 1 {
                 out.push(path.segments[0].name.clone());
             }
