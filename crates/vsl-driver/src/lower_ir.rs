@@ -16,8 +16,9 @@ use vsl_hir::{
 use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, GlslStd450Op, InstData, InstId, IrDescriptorVar,
     IrFunction, IrInterpolation, IrLocalVar, IrModule, IrParam, IrPushConstantBlock,
-    IrPushConstantField, IrStageIoVar, IrStorageClass, IrStructFieldLayout, IrStructLayout, IrType,
-    IrWorkgroupVar, MemoryAccess, ScalarIrTy, StructuredStmt,
+    IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
+    IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,
+    IrType, IrWorkgroupVar, MemoryAccess, ScalarIrTy, StructuredStmt,
 };
 use vsl_mc::{
     BuiltinStructDesc, DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS,
@@ -766,6 +767,116 @@ fn parse_stage_io_attrs(attrs: &[Attribute]) -> (Option<u32>, IrInterpolation) {
     (location, interpolation)
 }
 
+fn has_param_attr(attrs: &[Attribute], name: &str) -> bool {
+    attrs
+        .iter()
+        .any(|a| a.entries.iter().any(|e| e.name.name.as_str() == name))
+}
+
+fn parse_stage_var_attr(attrs: &[Attribute]) -> Option<(IrStorageClass, Option<u32>)> {
+    for attr in attrs {
+        for entry in &attr.entries {
+            let loc = entry.args.first().and_then(|e| {
+                if let Expr::IntLit { value, .. } = e {
+                    value.parse::<u32>().ok()
+                } else {
+                    None
+                }
+            });
+            match entry.name.name.as_str() {
+                "ray_payload" => return Some((IrStorageClass::RayPayloadKhr, Some(loc.unwrap_or(0)))),
+                "incoming_ray_payload" => {
+                    return Some((IrStorageClass::IncomingRayPayloadKhr, Some(loc.unwrap_or(0))));
+                }
+                "hit_attribute" => return Some((IrStorageClass::HitAttributeKhr, None)),
+                "callable_data" => {
+                    return Some((IrStorageClass::CallableDataKhr, Some(loc.unwrap_or(0))));
+                }
+                "incoming_callable_data" => {
+                    return Some((IrStorageClass::IncomingCallableDataKhr, Some(loc.unwrap_or(0))));
+                }
+                "shader_record" | "shader_record_buffer" => {
+                    return Some((IrStorageClass::ShaderRecordBufferKhr, None));
+                }
+                "task_payload" => return Some((IrStorageClass::TaskPayloadWorkgroupExt, None)),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn parse_stage_exec_meta(attrs: &[Attribute]) -> IrStageExecMeta {
+    let mut meta = IrStageExecMeta::default();
+    for attr in attrs {
+        for entry in &attr.entries {
+            let first_u32 = entry.args.first().and_then(|e| {
+                if let Expr::IntLit { value, .. } = e {
+                    value.parse::<u32>().ok()
+                } else {
+                    None
+                }
+            });
+            let first_ident = entry.args.first().and_then(|e| {
+                if let Expr::Path { path, .. } = e {
+                    Some(path.joined())
+                } else {
+                    None
+                }
+            });
+            match entry.name.name.as_str() {
+                "max_vertices" | "output_vertices" => meta.max_vertices = first_u32,
+                "max_primitives" | "output_primitives" => meta.max_primitives = first_u32,
+                "invocations" => meta.invocations = first_u32,
+                "output_topology" => {
+                    meta.output_topology = first_ident.as_deref().and_then(|s| match s {
+                        "points" => Some(IrTopology::Points),
+                        "lines" => Some(IrTopology::Lines),
+                        "triangles" => Some(IrTopology::Triangles),
+                        "line_strip" => Some(IrTopology::LineStrip),
+                        "triangle_strip" => Some(IrTopology::TriangleStrip),
+                        _ => None,
+                    });
+                }
+                "input_topology" => {
+                    meta.input_topology = first_ident.as_deref().and_then(|s| match s {
+                        "points" => Some(IrTopology::Points),
+                        "lines" => Some(IrTopology::Lines),
+                        "triangles" => Some(IrTopology::Triangles),
+                        _ => None,
+                    });
+                }
+                "tess_domain" => {
+                    meta.tess_domain = first_ident.as_deref().and_then(|s| match s {
+                        "triangles" => Some(IrTessDomain::Triangles),
+                        "quads" => Some(IrTessDomain::Quads),
+                        "isolines" => Some(IrTessDomain::Isolines),
+                        _ => None,
+                    });
+                }
+                "tess_spacing" => {
+                    meta.tess_spacing = first_ident.as_deref().and_then(|s| match s {
+                        "equal" => Some(IrTessSpacing::Equal),
+                        "fractional_even" => Some(IrTessSpacing::FractionalEven),
+                        "fractional_odd" => Some(IrTessSpacing::FractionalOdd),
+                        _ => None,
+                    });
+                }
+                "tess_order" => {
+                    meta.tess_order = first_ident.as_deref().and_then(|s| match s {
+                        "cw" => Some(IrTessOrder::Cw),
+                        "ccw" => Some(IrTessOrder::Ccw),
+                        _ => None,
+                    });
+                }
+                "point_mode" => meta.point_mode = true,
+                _ => {}
+            }
+        }
+    }
+    meta
+}
+
 fn parse_builtin_kind(name: &str) -> Option<BuiltinKind> {
     match name {
         "global_invocation_id" => Some(BuiltinKind::GlobalInvocationId),
@@ -781,6 +892,31 @@ fn parse_builtin_kind(name: &str) -> Option<BuiltinKind> {
         "position" => Some(BuiltinKind::Position),
         "frag_depth" => Some(BuiltinKind::FragDepth),
         "front_facing" => Some(BuiltinKind::FrontFacing),
+        "launch_id" => Some(BuiltinKind::LaunchIdKhr),
+        "launch_size" => Some(BuiltinKind::LaunchSizeKhr),
+        "world_ray_origin" => Some(BuiltinKind::WorldRayOriginKhr),
+        "world_ray_direction" => Some(BuiltinKind::WorldRayDirectionKhr),
+        "object_ray_origin" => Some(BuiltinKind::ObjectRayOriginKhr),
+        "object_ray_direction" => Some(BuiltinKind::ObjectRayDirectionKhr),
+        "ray_tmin" => Some(BuiltinKind::RayTminKhr),
+        "ray_tmax" => Some(BuiltinKind::RayTmaxKhr),
+        "instance_custom_index" => Some(BuiltinKind::InstanceCustomIndexKhr),
+        "object_to_world" => Some(BuiltinKind::ObjectToWorldKhr),
+        "world_to_object" => Some(BuiltinKind::WorldToObjectKhr),
+        "hit_kind" => Some(BuiltinKind::HitKindKhr),
+        "incoming_ray_flags" => Some(BuiltinKind::IncomingRayFlagsKhr),
+        "ray_geometry_index" => Some(BuiltinKind::RayGeometryIndexKhr),
+        "primitive_point_indices" => Some(BuiltinKind::PrimitivePointIndicesExt),
+        "primitive_line_indices" => Some(BuiltinKind::PrimitiveLineIndicesExt),
+        "primitive_triangle_indices" => Some(BuiltinKind::PrimitiveTriangleIndicesExt),
+        "cull_primitive" => Some(BuiltinKind::CullPrimitiveExt),
+        "invocation_id" => Some(BuiltinKind::InvocationId),
+        "patch_vertices" => Some(BuiltinKind::PatchVertices),
+        "tess_level_outer" => Some(BuiltinKind::TessLevelOuter),
+        "tess_level_inner" => Some(BuiltinKind::TessLevelInner),
+        "tess_coord" => Some(BuiltinKind::TessCoord),
+        "primitive_id" => Some(BuiltinKind::PrimitiveId),
+        "layer" => Some(BuiltinKind::Layer),
         _ => None,
     }
 }
@@ -857,6 +993,7 @@ struct LowerCtx<'a, 'd> {
     workgroup_indices: IndexMap<SmolStr, u32>,
     builtin_params: IndexMap<SmolStr, BuiltinKind>,
     stage_io_outputs: IndexMap<SmolStr, u32>,
+    stage_var_indices: IndexMap<SmolStr, u32>,
     push_constant_param: Option<SmolStr>,
     push_constant_fields: IndexMap<SmolStr, u32>,
     ray_query_handles: IndexMap<SmolStr, u32>,
@@ -890,6 +1027,10 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         let mut workgroup_indices = IndexMap::new();
         let mut builtin_params = IndexMap::new();
         let mut stage_io_outputs = IndexMap::new();
+        let mut stage_var_indices = IndexMap::new();
+        if let Some(afn) = ast_fn {
+            ir_fn.stage_exec_meta = parse_stage_exec_meta(&afn.attrs);
+        }
         let mut push_constant_param = None;
         let mut push_constant_fields = IndexMap::new();
 
@@ -947,8 +1088,33 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 continue;
             }
 
-            // Vertex/Fragment stage I/O parameters (`#[location(N)]`, `#[flat]`, `#[noperspective]`, `#[centroid]`).
-            if matches!(stage, Some(ShaderStage::Vertex | ShaderStage::Fragment))
+            // RT/Task stage variables (`#[ray_payload]`, `#[hit_attribute]`, `#[callable_data]`, `#[shader_record]`, `#[task_payload]`).
+            if let Some(ast_param) = ast_fn.and_then(|f| f.params.get(param_pos))
+                && let Some((storage, location)) = parse_stage_var_attr(&ast_param.attrs)
+            {
+                let ir_ty = param
+                    .ty
+                    .map_or(IrType::Void, |id| IrType::from_hir_type(&hir.types, id));
+                let var_index = ir_fn.stage_vars.len() as u32;
+                ir_fn.stage_vars.push(IrStageVar {
+                    name: param.name.clone(),
+                    storage,
+                    location,
+                    ty: ir_ty.clone(),
+                });
+                stage_var_indices.insert(param.name.clone(), var_index);
+                let loaded = ir_fn.emit_typed(ir_ty.clone(), InstData::LoadStageVar { var_index });
+                entry_preamble.push(StructuredStmt::Eval(loaded));
+                ssa_locals.insert(param.name.clone(), loaded);
+                if matches!(param.mode, ParamMode::Out | ParamMode::InOut) {
+                    let slot = alloc_local_var(ir_fn, param.name.clone(), ir_ty.clone());
+                    local_var_slots.insert(param.name.clone(), (slot, ir_ty));
+                }
+                continue;
+            }
+
+            // Stage I/O parameters (`#[location(N)]`, `#[flat]`, `#[noperspective]`, `#[centroid]`, `#[per_primitive]`).
+            if stage.is_some_and(ShaderStage::uses_stage_io)
                 && let Some(ast_param) = ast_fn.and_then(|f| f.params.get(param_pos))
                 && let (Some(location), interpolation) = parse_stage_io_attrs(&ast_param.attrs)
             {
@@ -956,6 +1122,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     .ty
                     .map_or(IrType::Void, |id| IrType::from_hir_type(&hir.types, id));
                 let is_output = matches!(param.mode, ParamMode::Out | ParamMode::InOut);
+                let per_primitive = has_param_attr(&ast_param.attrs, "per_primitive");
                 let var_index = ir_fn.stage_io.len() as u32;
                 ir_fn.stage_io.push(IrStageIoVar {
                     name: param.name.clone(),
@@ -963,6 +1130,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     is_output,
                     ty: ir_ty.clone(),
                     interpolation,
+                    per_primitive,
                 });
                 if is_output {
                     stage_io_outputs.insert(param.name.clone(), var_index);
@@ -1131,6 +1299,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             workgroup_indices,
             builtin_params,
             stage_io_outputs,
+            stage_var_indices,
             push_constant_param,
             push_constant_fields,
             ray_query_handles: IndexMap::new(),
@@ -2383,6 +2552,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let store = self.ir_fn.emit_typed(
                     IrType::Void,
                     InstData::StoreStageOutput { var_index, value },
+                );
+                out.push(StructuredStmt::Eval(store));
+            }
+            if let Some(&var_index) = self.stage_var_indices.get(path) {
+                let store = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::StoreStageVar { var_index, value },
                 );
                 out.push(StructuredStmt::Eval(store));
             }
@@ -4236,6 +4412,148 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let id = self
                     .ir_fn
                     .emit_typed(IrType::Void, InstData::DemoteToHelperInvocation);
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "trace_ray" => {
+                let tlas_desc = args
+                    .first()
+                    .and_then(|a| {
+                        if let HirExprKind::Path { path, .. } = &a.value.kind {
+                            self.descriptor_indices.get(path.as_str()).copied()
+                        } else {
+                            None
+                        }
+                    })
+                    .or(self.tlas_descriptor_index)
+                    .unwrap_or(0);
+                let ray_flags = self.require_arg(args, 1, joined, span, out)?;
+                let cull_mask = self.require_arg(args, 2, joined, span, out)?;
+                let sbt_offset = self.require_arg(args, 3, joined, span, out)?;
+                let sbt_stride = self.require_arg(args, 4, joined, span, out)?;
+                let miss_index = self.require_arg(args, 5, joined, span, out)?;
+                let origin = self.require_arg(args, 6, joined, span, out)?;
+                let t_min = self.require_arg(args, 7, joined, span, out)?;
+                let direction = self.require_arg(args, 8, joined, span, out)?;
+                let t_max = self.require_arg(args, 9, joined, span, out)?;
+                let payload_var_index = args
+                    .get(10)
+                    .and_then(|a| {
+                        if let HirExprKind::Path { path, .. } = &a.value.kind {
+                            self.stage_var_indices.get(path.as_str()).copied()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let id = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::TraceRayKhr {
+                        tlas_descriptor_index: tlas_desc,
+                        ray_flags,
+                        cull_mask,
+                        sbt_offset,
+                        sbt_stride,
+                        miss_index,
+                        origin,
+                        t_min,
+                        direction,
+                        t_max,
+                        payload_var_index,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "ignore_intersection" => {
+                let id = self
+                    .ir_fn
+                    .emit_typed(IrType::Void, InstData::IgnoreIntersectionKhr);
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "terminate_ray" => {
+                let id = self
+                    .ir_fn
+                    .emit_typed(IrType::Void, InstData::TerminateRayKhr);
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "report_intersection" => {
+                let hit_t = self.require_arg(args, 0, joined, span, out)?;
+                let hit_kind = self.require_arg(args, 1, joined, span, out)?;
+                let id = self.ir_fn.emit_typed(
+                    IrType::Scalar(ScalarIrTy::Bool),
+                    InstData::ReportIntersectionKhr { hit_t, hit_kind },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "execute_callable" => {
+                let sbt_index = self.require_arg(args, 0, joined, span, out)?;
+                let callable_var_index = args
+                    .get(1)
+                    .and_then(|a| {
+                        if let HirExprKind::Path { path, .. } = &a.value.kind {
+                            self.stage_var_indices.get(path.as_str()).copied()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let id = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::ExecuteCallableKhr {
+                        sbt_index,
+                        callable_var_index,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "emit_mesh_tasks" => {
+                let group_x = self.require_arg(args, 0, joined, span, out)?;
+                let group_y = self.require_arg(args, 1, joined, span, out)?;
+                let group_z = self.require_arg(args, 2, joined, span, out)?;
+                let payload_var_index = args.get(3).and_then(|a| {
+                    if let HirExprKind::Path { path, .. } = &a.value.kind {
+                        self.stage_var_indices.get(path.as_str()).copied()
+                    } else {
+                        None
+                    }
+                });
+                let id = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::EmitMeshTasksExt {
+                        group_x,
+                        group_y,
+                        group_z,
+                        payload_var_index,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "set_mesh_outputs" => {
+                let vertex_count = self.require_arg(args, 0, joined, span, out)?;
+                let primitive_count = self.require_arg(args, 1, joined, span, out)?;
+                let id = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::SetMeshOutputsExt {
+                        vertex_count,
+                        primitive_count,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "emit_vertex" => {
+                let id = self.ir_fn.emit_typed(IrType::Void, InstData::EmitVertex);
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "end_primitive" => {
+                let id = self.ir_fn.emit_typed(IrType::Void, InstData::EndPrimitive);
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }

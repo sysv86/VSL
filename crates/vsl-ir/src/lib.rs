@@ -12,6 +12,7 @@ pub use passes::{
 pub use ssa::{
     AtomicOrder, AtomicScope, BuiltinKind, GlslStd450Op, Inst, InstData, InstId, IrDescriptorVar,
     IrFunction, IrInterpolation, IrLocalVar, IrModule, IrParam, IrPushConstantBlock,
-    IrPushConstantField, IrStageIoVar, IrStorageClass, IrStructFieldLayout, IrStructLayout, IrType,
-    IrWorkgroupVar, MemoryAccess, ScalarIrTy, SpecConstantOpKind, StructuredStmt,
+    IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
+    IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,
+    IrType, IrWorkgroupVar, MemoryAccess, ScalarIrTy, SpecConstantOpKind, StructuredStmt,
 };

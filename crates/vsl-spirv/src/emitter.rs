@@ -2,7 +2,8 @@ use indexmap::{IndexMap, IndexSet};
 use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, GlslStd450Op, InstData, InstId, IrDescriptorVar,
     IrFunction, IrInterpolation, IrModule, IrPushConstantBlock, IrStorageClass, IrStructLayout,
-    IrType, IrWorkgroupVar, ScalarIrTy, SpecConstantOpKind, StructuredStmt,
+    IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology, IrType, IrWorkgroupVar, ScalarIrTy,
+    SpecConstantOpKind, StructuredStmt,
 };
 use vsl_mc::{
     DescriptorAccess, DescriptorKind, HardwareCaps, ImageFormat, SampleScalar, ShaderStage,
@@ -121,6 +122,12 @@ struct EmittedStageIoVar {
     is_output: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EmittedStageVar {
+    var_id: u32,
+    val_ty: u32,
+}
+
 /// Metadata for a function-local `StorageClass::Function` variable.
 #[derive(Debug, Clone)]
 struct EmittedLocalVar {
@@ -222,7 +229,10 @@ impl SpirvEmitter {
     }
 
     pub fn emit_capability(&mut self, cap: spirv::Capability) {
-        let raw = cap as u32;
+        self.emit_capability_raw(cap as u32);
+    }
+
+    pub fn emit_capability_raw(&mut self, raw: u32) {
         if self.capabilities_seen.insert(raw) {
             push_inst(&mut self.capabilities, spirv::Op::Capability, &[raw]);
         }
@@ -267,9 +277,19 @@ impl SpirvEmitter {
         name: &str,
         interface_ids: &[u32],
     ) {
+        self.emit_entry_point_raw(model as u32, func_id, name, interface_ids);
+    }
+
+    pub fn emit_entry_point_raw(
+        &mut self,
+        model: u32,
+        func_id: u32,
+        name: &str,
+        interface_ids: &[u32],
+    ) {
         let name_words = encode_literal_string(name);
         let mut operands = Vec::with_capacity(2 + name_words.len() + interface_ids.len());
-        operands.push(model as u32);
+        operands.push(model);
         operands.push(func_id);
         operands.extend_from_slice(&name_words);
         operands.extend_from_slice(interface_ids);
@@ -282,9 +302,18 @@ impl SpirvEmitter {
         mode: spirv::ExecutionMode,
         literals: &[u32],
     ) {
+        self.emit_execution_mode_raw(entry_id, mode as u32, literals);
+    }
+
+    pub fn emit_execution_mode_raw(
+        &mut self,
+        entry_id: u32,
+        mode: u32,
+        literals: &[u32],
+    ) {
         let mut operands = Vec::with_capacity(2 + literals.len());
         operands.push(entry_id);
-        operands.push(mode as u32);
+        operands.push(mode);
         operands.extend_from_slice(literals);
         push_inst(
             &mut self.execution_modes,
@@ -336,9 +365,13 @@ impl SpirvEmitter {
         decoration: spirv::Decoration,
         literals: &[u32],
     ) {
+        self.emit_decorate_raw(target_id, decoration as u32, literals);
+    }
+
+    pub fn emit_decorate_raw(&mut self, target_id: u32, decoration: u32, literals: &[u32]) {
         let mut operands = Vec::with_capacity(2 + literals.len());
         operands.push(target_id);
-        operands.push(decoration as u32);
+        operands.push(decoration);
         operands.extend_from_slice(literals);
         push_inst(&mut self.decorations, spirv::Op::Decorate, &operands);
     }
@@ -701,7 +734,11 @@ impl SpirvEmitter {
         storage_class: spirv::StorageClass,
         pointee_ty: u32,
     ) -> u32 {
-        let key = TypeKey::Pointer(storage_class as u32, pointee_ty);
+        self.emit_type_pointer_raw(storage_class as u32, pointee_ty)
+    }
+
+    pub fn emit_type_pointer_raw(&mut self, storage_class: u32, pointee_ty: u32) -> u32 {
+        let key = TypeKey::Pointer(storage_class, pointee_ty);
         if let Some(&id) = self.type_cache.get(&key) {
             return id;
         }
@@ -709,7 +746,7 @@ impl SpirvEmitter {
         push_inst(
             &mut self.types_globals,
             spirv::Op::TypePointer,
-            &[id, storage_class as u32, pointee_ty],
+            &[id, storage_class, pointee_ty],
         );
         self.type_cache.insert(key, id);
         id
@@ -932,11 +969,15 @@ impl SpirvEmitter {
     }
 
     pub fn emit_variable(&mut self, ptr_ty: u32, storage_class: spirv::StorageClass) -> u32 {
+        self.emit_variable_raw(ptr_ty, storage_class as u32)
+    }
+
+    pub fn emit_variable_raw(&mut self, ptr_ty: u32, storage_class: u32) -> u32 {
         let id = self.alloc_id();
         push_inst(
             &mut self.types_globals,
             spirv::Op::Variable,
-            &[ptr_ty, id, storage_class as u32],
+            &[ptr_ty, id, storage_class],
         );
         id
     }
@@ -958,6 +999,10 @@ impl SpirvEmitter {
     /// Appends an instruction directly to the functions section.
     pub fn emit_fn_inst(&mut self, op: spirv::Op, operands: &[u32]) {
         push_inst(&mut self.functions, op, operands);
+    }
+
+    pub fn emit_fn_inst_raw(&mut self, opcode: u16, operands: &[u32]) {
+        push_raw_inst(&mut self.functions, opcode, operands);
     }
 
     /// Assembles the final SPIR-V 1.6 word stream including the 5-word binary header.
@@ -1010,6 +1055,13 @@ const fn map_ir_storage_class(sc: IrStorageClass) -> spirv::StorageClass {
         IrStorageClass::StorageBuffer => spirv::StorageClass::StorageBuffer,
         IrStorageClass::PhysicalStorageBuffer => spirv::StorageClass::PhysicalStorageBuffer,
         IrStorageClass::Image => spirv::StorageClass::Image,
+        IrStorageClass::RayPayloadKhr => spirv::StorageClass::RayPayloadKHR,
+        IrStorageClass::IncomingRayPayloadKhr => spirv::StorageClass::IncomingRayPayloadKHR,
+        IrStorageClass::HitAttributeKhr => spirv::StorageClass::HitAttributeKHR,
+        IrStorageClass::CallableDataKhr => spirv::StorageClass::CallableDataKHR,
+        IrStorageClass::IncomingCallableDataKhr => spirv::StorageClass::IncomingCallableDataKHR,
+        IrStorageClass::ShaderRecordBufferKhr => spirv::StorageClass::ShaderRecordBufferKHR,
+        IrStorageClass::TaskPayloadWorkgroupExt => spirv::StorageClass::TaskPayloadWorkgroupEXT,
     }
 }
 
@@ -1497,7 +1549,47 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
         emitter.emit_capability(spirv::Capability::AtomicFloat32MinMaxEXT);
         emitter.emit_extension("SPV_EXT_shader_atomic_float_min_max");
     }
-    if uses_accel_struct || uses_ray_query || caps.contains(HardwareCaps::RAY_QUERY) {
+    let uses_rt_pipeline = caps.contains(HardwareCaps::RAY_TRACING_PIPELINE)
+        || module
+            .functions
+            .iter()
+            .any(|f| f.stage.is_some_and(ShaderStage::is_ray_tracing));
+    let uses_mesh_pipeline = caps.contains(HardwareCaps::MESH_SHADER)
+        || module
+            .functions
+            .iter()
+            .any(|f| f.stage.is_some_and(ShaderStage::is_mesh_pipeline));
+    let uses_tessellation = caps.contains(HardwareCaps::TESSELLATION)
+        || module.functions.iter().any(|f| {
+            matches!(
+                f.stage,
+                Some(ShaderStage::TessControl | ShaderStage::TessEval)
+            )
+        });
+    let uses_geometry = caps.contains(HardwareCaps::GEOMETRY_SHADER)
+        || module
+            .functions
+            .iter()
+            .any(|f| f.stage == Some(ShaderStage::Geometry));
+
+    if uses_rt_pipeline {
+        emitter.emit_capability_raw(4479); // RayTracingKHR
+        emitter.emit_extension("SPV_KHR_ray_tracing");
+    }
+    if uses_mesh_pipeline {
+        emitter.emit_capability_raw(5283); // MeshShadingEXT
+        emitter.emit_extension("SPV_EXT_mesh_shader");
+    }
+    if uses_tessellation {
+        emitter.emit_capability(spirv::Capability::Tessellation);
+    }
+    if uses_geometry {
+        emitter.emit_capability(spirv::Capability::Geometry);
+    }
+    if uses_ray_query
+        || caps.contains(HardwareCaps::RAY_QUERY)
+        || (uses_accel_struct && !uses_rt_pipeline)
+    {
         emitter.emit_capability(spirv::Capability::RayQueryKHR);
         emitter.emit_extension("SPV_KHR_ray_query");
     }
@@ -1588,7 +1680,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
     let mut builtin_vars_map: IndexMap<(BuiltinKind, bool), EmittedBuiltinVar> = IndexMap::new();
     let mut func_direct_globals: IndexMap<String, Vec<u32>> = IndexMap::new();
     let mut func_callees: IndexMap<String, Vec<String>> = IndexMap::new();
-    let mut pending_entry_points: Vec<(spirv::ExecutionModel, u32, String)> = Vec::new();
+    let mut pending_entry_points: Vec<(u32, u32, String)> = Vec::new();
 
     // Emit non-entry helper functions first, then entry points.
     let ordered_indices: Vec<usize> = module
@@ -1678,7 +1770,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
             func_descriptors.push(desc_var);
         }
 
-        if func.stage == Some(ShaderStage::Compute) || func.stage.is_none() {
+        if func.stage.is_none() || func.stage.is_some_and(ShaderStage::allows_workgroup_vars) {
             for wg in &func.workgroup_vars {
                 let wg_key = WorkgroupVarKey {
                     name: wg.name.to_string(),
@@ -1723,6 +1815,9 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                     emitter.emit_decorate(var_id, spirv::Decoration::Centroid, &[]);
                 }
             }
+            if io.per_primitive {
+                emitter.emit_decorate_raw(var_id, 5271, &[]); // PerPrimitiveEXT
+            }
             if interface_seen.insert(var_id) {
                 interface_ids.push(var_id);
             }
@@ -1731,6 +1826,31 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                 val_ty,
                 is_output: io.is_output,
             });
+        }
+
+        let mut func_stage_vars: Vec<EmittedStageVar> = Vec::with_capacity(func.stage_vars.len());
+        for sv in &func.stage_vars {
+            let sc_raw = map_ir_storage_class_raw(sv.storage);
+            let val_ty = if sv.storage == IrStorageClass::ShaderRecordBufferKhr {
+                match &sv.ty {
+                    IrType::Struct(layout) => emitter.emit_struct_type(layout, true, true),
+                    other => emitter.emit_ir_type_with_layout(other, true),
+                }
+            } else {
+                emitter.emit_ir_type(&sv.ty)
+            };
+            let ptr_ty = emitter.emit_type_pointer_raw(sc_raw, val_ty);
+            let var_id = emitter.emit_variable_raw(ptr_ty, sc_raw);
+            if !sv.name.is_empty() {
+                emitter.emit_name(var_id, sv.name.as_str());
+            }
+            if let Some(loc) = sv.location {
+                emitter.emit_decorate(var_id, spirv::Decoration::Location, &[loc]);
+            }
+            if interface_seen.insert(var_id) {
+                interface_ids.push(var_id);
+            }
+            func_stage_vars.push(EmittedStageVar { var_id, val_ty });
         }
 
         let mut func_push_constant: Option<EmittedPushConstant> = None;
@@ -1876,6 +1996,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
             &func_descriptors,
             &func_workgroup_vars,
             &func_stage_io,
+            &func_stage_vars,
             &func_builtins,
             func_push_constant.as_ref(),
             default_sampler_var,
@@ -1896,16 +2017,98 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
         func_callees.insert(func.name.to_string(), callees);
 
         if let Some(stage) = func.stage {
-            let exec_model = match stage {
-                ShaderStage::Compute => spirv::ExecutionModel::GLCompute,
-                ShaderStage::Vertex => spirv::ExecutionModel::Vertex,
-                ShaderStage::Fragment => spirv::ExecutionModel::Fragment,
+            let exec_model_raw: u32 = match stage {
+                ShaderStage::Compute => spirv::ExecutionModel::GLCompute as u32,
+                ShaderStage::Vertex => spirv::ExecutionModel::Vertex as u32,
+                ShaderStage::Fragment => spirv::ExecutionModel::Fragment as u32,
+                ShaderStage::RayGen => 5313,       // RayGenerationKHR
+                ShaderStage::Intersection => 5314, // IntersectionKHR
+                ShaderStage::AnyHit => 5315,       // AnyHitKHR
+                ShaderStage::ClosestHit => 5316,   // ClosestHitKHR
+                ShaderStage::Miss => 5317,         // MissKHR
+                ShaderStage::Callable => 5318,     // CallableKHR
+                ShaderStage::Task => 5364,         // TaskEXT
+                ShaderStage::Mesh => 5365,         // MeshEXT
+                ShaderStage::TessControl => spirv::ExecutionModel::TessellationControl as u32,
+                ShaderStage::TessEval => spirv::ExecutionModel::TessellationEvaluation as u32,
+                ShaderStage::Geometry => spirv::ExecutionModel::Geometry as u32,
             };
-            pending_entry_points.push((exec_model, fn_id, func.name.to_string()));
+            pending_entry_points.push((exec_model_raw, fn_id, func.name.to_string()));
             if stage == ShaderStage::Fragment {
                 emitter.emit_execution_mode(fn_id, spirv::ExecutionMode::OriginUpperLeft, &[]);
                 if writes_frag_depth {
                     emitter.emit_execution_mode(fn_id, spirv::ExecutionMode::DepthReplacing, &[]);
+                }
+            }
+            let meta = &func.stage_exec_meta;
+            if stage == ShaderStage::Mesh {
+                if let Some(v) = meta.max_vertices {
+                    emitter.emit_execution_mode_raw(fn_id, 26, &[v]); // OutputVertices
+                }
+                if let Some(p) = meta.max_primitives {
+                    emitter.emit_execution_mode_raw(fn_id, 5270, &[p]); // OutputPrimitivesEXT
+                }
+                if let Some(topo) = meta.output_topology {
+                    let mode_raw = match topo {
+                        IrTopology::Points => 27, // OutputPoints
+                        IrTopology::Lines | IrTopology::LineStrip => 5269, // OutputLinesEXT
+                        IrTopology::Triangles | IrTopology::TriangleStrip => 5298, // OutputTrianglesEXT
+                    };
+                    emitter.emit_execution_mode_raw(fn_id, mode_raw, &[]);
+                }
+            } else if stage == ShaderStage::Geometry {
+                if let Some(inv) = meta.invocations {
+                    emitter.emit_execution_mode_raw(fn_id, 0, &[inv]); // Invocations
+                }
+                if let Some(v) = meta.max_vertices {
+                    emitter.emit_execution_mode_raw(fn_id, 26, &[v]); // OutputVertices
+                }
+                if let Some(in_topo) = meta.input_topology {
+                    let mode_raw = match in_topo {
+                        IrTopology::Points => 19, // InputPoints
+                        IrTopology::Lines | IrTopology::LineStrip => 20, // InputLines
+                        IrTopology::Triangles | IrTopology::TriangleStrip => 22, // Triangles
+                    };
+                    emitter.emit_execution_mode_raw(fn_id, mode_raw, &[]);
+                }
+                if let Some(out_topo) = meta.output_topology {
+                    let mode_raw = match out_topo {
+                        IrTopology::Points => 27, // OutputPoints
+                        IrTopology::Lines | IrTopology::LineStrip => 28, // OutputLineStrip
+                        IrTopology::Triangles | IrTopology::TriangleStrip => 29, // OutputTriangleStrip
+                    };
+                    emitter.emit_execution_mode_raw(fn_id, mode_raw, &[]);
+                }
+            } else if stage == ShaderStage::TessControl {
+                if let Some(v) = meta.max_vertices {
+                    emitter.emit_execution_mode_raw(fn_id, 26, &[v]); // OutputVertices
+                }
+            } else if stage == ShaderStage::TessEval {
+                if let Some(dom) = meta.tess_domain {
+                    let mode_raw = match dom {
+                        IrTessDomain::Triangles => 22,
+                        IrTessDomain::Quads => 24,
+                        IrTessDomain::Isolines => 25,
+                    };
+                    emitter.emit_execution_mode_raw(fn_id, mode_raw, &[]);
+                }
+                if let Some(sp) = meta.tess_spacing {
+                    let mode_raw = match sp {
+                        IrTessSpacing::Equal => 1,
+                        IrTessSpacing::FractionalEven => 2,
+                        IrTessSpacing::FractionalOdd => 3,
+                    };
+                    emitter.emit_execution_mode_raw(fn_id, mode_raw, &[]);
+                }
+                if let Some(ord) = meta.tess_order {
+                    let mode_raw = match ord {
+                        IrTessOrder::Cw => 4,
+                        IrTessOrder::Ccw => 5,
+                    };
+                    emitter.emit_execution_mode_raw(fn_id, mode_raw, &[]);
+                }
+                if meta.point_mode {
+                    emitter.emit_execution_mode_raw(fn_id, 10, &[]); // PointMode
                 }
             }
             if let Some([sx, sy, sz]) = func.local_size_spec_ids {
@@ -1967,7 +2170,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                 }
             }
         }
-        emitter.emit_entry_point(exec_model, fn_id, &entry_name, &resolved_interface);
+        emitter.emit_entry_point_raw(exec_model, fn_id, &entry_name, &resolved_interface);
     }
 
     emitter.finish()
@@ -2218,56 +2421,56 @@ fn emit_builtin_var(
             emitter.emit_type_vector(u32_ty, 3),
             u32_ty,
             Some(3),
-            spirv::BuiltIn::GlobalInvocationId,
+            spirv::BuiltIn::GlobalInvocationId as u32,
             "gl_GlobalInvocationID",
         ),
         BuiltinKind::LocalInvocationId => (
             emitter.emit_type_vector(u32_ty, 3),
             u32_ty,
             Some(3),
-            spirv::BuiltIn::LocalInvocationId,
+            spirv::BuiltIn::LocalInvocationId as u32,
             "gl_LocalInvocationID",
         ),
         BuiltinKind::LocalInvocationIndex => (
             u32_ty,
             u32_ty,
             None,
-            spirv::BuiltIn::LocalInvocationIndex,
+            spirv::BuiltIn::LocalInvocationIndex as u32,
             "gl_LocalInvocationIndex",
         ),
         BuiltinKind::WorkgroupId => (
             emitter.emit_type_vector(u32_ty, 3),
             u32_ty,
             Some(3),
-            spirv::BuiltIn::WorkgroupId,
+            spirv::BuiltIn::WorkgroupId as u32,
             "gl_WorkGroupID",
         ),
         BuiltinKind::NumWorkgroups => (
             emitter.emit_type_vector(u32_ty, 3),
             u32_ty,
             Some(3),
-            spirv::BuiltIn::NumWorkgroups,
+            spirv::BuiltIn::NumWorkgroups as u32,
             "gl_NumWorkGroups",
         ),
         BuiltinKind::VertexIndex => (
             u32_ty,
             u32_ty,
             None,
-            spirv::BuiltIn::VertexIndex,
+            spirv::BuiltIn::VertexIndex as u32,
             "gl_VertexIndex",
         ),
         BuiltinKind::InstanceIndex => (
             u32_ty,
             u32_ty,
             None,
-            spirv::BuiltIn::InstanceIndex,
+            spirv::BuiltIn::InstanceIndex as u32,
             "gl_InstanceIndex",
         ),
         BuiltinKind::FragCoord => (
             emitter.emit_type_vector(f32_ty, 4),
             f32_ty,
             Some(4),
-            spirv::BuiltIn::FragCoord,
+            spirv::BuiltIn::FragCoord as u32,
             "gl_FragCoord",
         ),
         BuiltinKind::SubgroupLocalInvocationId => {
@@ -2276,7 +2479,7 @@ fn emit_builtin_var(
                 u32_ty,
                 u32_ty,
                 None,
-                spirv::BuiltIn::SubgroupLocalInvocationId,
+                spirv::BuiltIn::SubgroupLocalInvocationId as u32,
                 "gl_SubgroupInvocationID",
             )
         }
@@ -2286,7 +2489,7 @@ fn emit_builtin_var(
                 u32_ty,
                 u32_ty,
                 None,
-                spirv::BuiltIn::SubgroupSize,
+                spirv::BuiltIn::SubgroupSize as u32,
                 "gl_SubgroupSize",
             )
         }
@@ -2294,23 +2497,122 @@ fn emit_builtin_var(
             emitter.emit_type_vector(f32_ty, 4),
             f32_ty,
             Some(4),
-            spirv::BuiltIn::Position,
+            spirv::BuiltIn::Position as u32,
             "gl_Position",
         ),
         BuiltinKind::FragDepth => (
             f32_ty,
             f32_ty,
             None,
-            spirv::BuiltIn::FragDepth,
+            spirv::BuiltIn::FragDepth as u32,
             "gl_FragDepth",
         ),
         BuiltinKind::FrontFacing => (
             bool_ty,
             bool_ty,
             None,
-            spirv::BuiltIn::FrontFacing,
+            spirv::BuiltIn::FrontFacing as u32,
             "gl_FrontFacing",
         ),
+        BuiltinKind::LaunchIdKhr => (
+            emitter.emit_type_vector(u32_ty, 3),
+            u32_ty,
+            Some(3),
+            5319,
+            "gl_LaunchIDEXT",
+        ),
+        BuiltinKind::LaunchSizeKhr => (
+            emitter.emit_type_vector(u32_ty, 3),
+            u32_ty,
+            Some(3),
+            5320,
+            "gl_LaunchSizeEXT",
+        ),
+        BuiltinKind::WorldRayOriginKhr => (
+            emitter.emit_type_vector(f32_ty, 3),
+            f32_ty,
+            Some(3),
+            5321,
+            "gl_WorldRayOriginEXT",
+        ),
+        BuiltinKind::WorldRayDirectionKhr => (
+            emitter.emit_type_vector(f32_ty, 3),
+            f32_ty,
+            Some(3),
+            5322,
+            "gl_WorldRayDirectionEXT",
+        ),
+        BuiltinKind::ObjectRayOriginKhr => (
+            emitter.emit_type_vector(f32_ty, 3),
+            f32_ty,
+            Some(3),
+            5323,
+            "gl_ObjectRayOriginEXT",
+        ),
+        BuiltinKind::ObjectRayDirectionKhr => (
+            emitter.emit_type_vector(f32_ty, 3),
+            f32_ty,
+            Some(3),
+            5324,
+            "gl_ObjectRayDirectionEXT",
+        ),
+        BuiltinKind::RayTminKhr => (f32_ty, f32_ty, None, 5325, "gl_RayTminEXT"),
+        BuiltinKind::RayTmaxKhr => (f32_ty, f32_ty, None, 5326, "gl_RayTmaxEXT"),
+        BuiltinKind::InstanceCustomIndexKhr => {
+            (u32_ty, u32_ty, None, 5327, "gl_InstanceCustomIndexEXT")
+        }
+        BuiltinKind::ObjectToWorldKhr => {
+            let col_ty = emitter.emit_type_vector(f32_ty, 3);
+            let mat_ty = emitter.emit_type_matrix(col_ty, 4);
+            (mat_ty, f32_ty, None, 5330, "gl_ObjectToWorldEXT")
+        }
+        BuiltinKind::WorldToObjectKhr => {
+            let col_ty = emitter.emit_type_vector(f32_ty, 3);
+            let mat_ty = emitter.emit_type_matrix(col_ty, 4);
+            (mat_ty, f32_ty, None, 5331, "gl_WorldToObjectEXT")
+        }
+        BuiltinKind::HitKindKhr => (u32_ty, u32_ty, None, 5333, "gl_HitKindEXT"),
+        BuiltinKind::IncomingRayFlagsKhr => (u32_ty, u32_ty, None, 5351, "gl_IncomingRayFlagsEXT"),
+        BuiltinKind::RayGeometryIndexKhr => (u32_ty, u32_ty, None, 5352, "gl_RayGeometryIndexEXT"),
+        BuiltinKind::PrimitivePointIndicesExt => {
+            (u32_ty, u32_ty, None, 5294, "gl_PrimitivePointIndicesEXT")
+        }
+        BuiltinKind::PrimitiveLineIndicesExt => (
+            emitter.emit_type_vector(u32_ty, 2),
+            u32_ty,
+            Some(2),
+            5295,
+            "gl_PrimitiveLineIndicesEXT",
+        ),
+        BuiltinKind::PrimitiveTriangleIndicesExt => (
+            emitter.emit_type_vector(u32_ty, 3),
+            u32_ty,
+            Some(3),
+            5296,
+            "gl_PrimitiveTriangleIndicesEXT",
+        ),
+        BuiltinKind::CullPrimitiveExt => (bool_ty, bool_ty, None, 5299, "gl_CullPrimitiveEXT"),
+        BuiltinKind::InvocationId => (u32_ty, u32_ty, None, 8, "gl_InvocationID"),
+        BuiltinKind::PatchVertices => (u32_ty, u32_ty, None, 14, "gl_PatchVerticesIn"),
+        BuiltinKind::TessLevelOuter => {
+            let len_const = emitter.emit_constant_32(u32_ty, 4);
+            let arr_ty = emitter.emit_type_array(f32_ty, len_const);
+            (arr_ty, f32_ty, None, 11, "gl_TessLevelOuter")
+        }
+        BuiltinKind::TessLevelInner => {
+            let len_const = emitter.emit_constant_32(u32_ty, 2);
+            let arr_ty = emitter.emit_type_array(f32_ty, len_const);
+            (arr_ty, f32_ty, None, 12, "gl_TessLevelInner")
+        }
+        BuiltinKind::TessCoord => (
+            emitter.emit_type_vector(f32_ty, 3),
+            f32_ty,
+            Some(3),
+            13,
+            "gl_TessCoord",
+        ),
+        BuiltinKind::PrimitiveId => (u32_ty, u32_ty, None, 7, "gl_PrimitiveID"),
+        BuiltinKind::Layer => (u32_ty, u32_ty, None, 9, "gl_Layer"),
     };
     let sc = if is_output {
         spirv::StorageClass::Output
@@ -2320,7 +2622,7 @@ fn emit_builtin_var(
     let ptr_ty = emitter.emit_type_pointer(sc, value_ty);
     let var_id = emitter.emit_variable(ptr_ty, sc);
     emitter.emit_name(var_id, name);
-    emitter.emit_decorate(var_id, spirv::Decoration::BuiltIn, &[spv_builtin as u32]);
+    emitter.emit_decorate(var_id, spirv::Decoration::BuiltIn, &[spv_builtin]);
     EmittedBuiltinVar {
         var_id,
         value_ty,
@@ -2418,6 +2720,7 @@ struct FnLowerCtx<'a> {
     descriptors: &'a [EmittedDescriptor],
     workgroup_vars: &'a [EmittedWorkgroupVar],
     stage_io_vars: &'a [EmittedStageIoVar],
+    stage_vars: &'a [EmittedStageVar],
     local_vars: Vec<EmittedLocalVar>,
     /// `(param_spv_id, param_spv_ty, is_ptr_param, value_ir_ty)` for formal parameters.
     param_ids: Vec<(u32, u32, bool, IrType)>,
@@ -6106,6 +6409,178 @@ impl FnLowerCtx<'_> {
                     (raw, vec_ty)
                 }
             }
+            InstData::TraceRayKhr {
+                tlas_descriptor_index,
+                ray_flags,
+                cull_mask,
+                sbt_offset,
+                sbt_stride,
+                miss_index,
+                origin,
+                t_min,
+                direction,
+                t_max,
+                payload_var_index,
+            } => {
+                let u32_ty = self.u32_ty();
+                let f32_ty = self.f32_ty();
+                let raw_flags = self.ensure_inst(ray_flags);
+                let flags_ty = self.inst_types.get(&ray_flags).copied().unwrap_or(u32_ty);
+                let flags_u32 = self.coerce_to_ty(raw_flags, flags_ty, u32_ty);
+                let raw_mask = self.ensure_inst(cull_mask);
+                let mask_ty = self.inst_types.get(&cull_mask).copied().unwrap_or(u32_ty);
+                let mask_u32 = self.coerce_to_ty(raw_mask, mask_ty, u32_ty);
+                let raw_sbt_off = self.ensure_inst(sbt_offset);
+                let sbt_off_ty = self.inst_types.get(&sbt_offset).copied().unwrap_or(u32_ty);
+                let sbt_off_u32 = self.coerce_to_ty(raw_sbt_off, sbt_off_ty, u32_ty);
+                let raw_sbt_stride = self.ensure_inst(sbt_stride);
+                let sbt_stride_ty = self.inst_types.get(&sbt_stride).copied().unwrap_or(u32_ty);
+                let sbt_stride_u32 = self.coerce_to_ty(raw_sbt_stride, sbt_stride_ty, u32_ty);
+                let raw_miss = self.ensure_inst(miss_index);
+                let miss_ty = self.inst_types.get(&miss_index).copied().unwrap_or(u32_ty);
+                let miss_u32 = self.coerce_to_ty(raw_miss, miss_ty, u32_ty);
+                let raw_origin = self.ensure_inst(origin);
+                let origin_ty = self.inst_types.get(&origin).copied().unwrap_or(f32_ty);
+                let origin_v3 = self.emit_vec3_f32(raw_origin, origin_ty);
+                let raw_tmin = self.ensure_inst(t_min);
+                let tmin_ty = self.inst_types.get(&t_min).copied().unwrap_or(f32_ty);
+                let tmin_f32 = self.coerce_to_ty(raw_tmin, tmin_ty, f32_ty);
+                let raw_dir = self.ensure_inst(direction);
+                let dir_ty = self.inst_types.get(&direction).copied().unwrap_or(f32_ty);
+                let dir_v3 = self.emit_vec3_f32(raw_dir, dir_ty);
+                let raw_tmax = self.ensure_inst(t_max);
+                let tmax_ty = self.inst_types.get(&t_max).copied().unwrap_or(f32_ty);
+                let tmax_f32 = self.coerce_to_ty(raw_tmax, tmax_ty, f32_ty);
+                if let Some(desc) = self.descriptors.get(tlas_descriptor_index as usize)
+                    && desc.kind == DescriptorKind::AccelerationStructure
+                    && let Some(payload) = self.stage_vars.get(payload_var_index as usize)
+                {
+                    let tlas_val = self.emitter.alloc_id();
+                    self.emitter
+                        .emit_fn_inst(spirv::Op::Load, &[desc.element_ty, tlas_val, desc.var_id]);
+                    self.emitter.emit_fn_inst_raw(
+                        4445, // OpTraceRayKHR
+                        &[
+                            tlas_val,
+                            flags_u32,
+                            mask_u32,
+                            sbt_off_u32,
+                            sbt_stride_u32,
+                            miss_u32,
+                            origin_v3,
+                            tmin_f32,
+                            dir_v3,
+                            tmax_f32,
+                            payload.var_id,
+                        ],
+                    );
+                }
+                (0, self.void_ty)
+            }
+            InstData::IgnoreIntersectionKhr => {
+                self.emitter.emit_fn_inst_raw(4448, &[]); // OpIgnoreIntersectionKHR
+                (0, self.void_ty)
+            }
+            InstData::TerminateRayKhr => {
+                self.emitter.emit_fn_inst_raw(4449, &[]); // OpTerminateRayKHR
+                (0, self.void_ty)
+            }
+            InstData::ReportIntersectionKhr { hit_t, hit_kind } => {
+                let bool_ty = self.bool_ty();
+                let f32_ty = self.f32_ty();
+                let u32_ty = self.u32_ty();
+                let raw_t = self.ensure_inst(hit_t);
+                let t_ty = self.inst_types.get(&hit_t).copied().unwrap_or(f32_ty);
+                let t_f32 = self.coerce_to_ty(raw_t, t_ty, f32_ty);
+                let raw_k = self.ensure_inst(hit_kind);
+                let k_ty = self.inst_types.get(&hit_kind).copied().unwrap_or(u32_ty);
+                let k_u32 = self.coerce_to_ty(raw_k, k_ty, u32_ty);
+                let res = self.emitter.alloc_id();
+                self.emitter
+                    .emit_fn_inst_raw(5334, &[bool_ty, res, t_f32, k_u32]); // OpReportIntersectionKHR
+                (res, bool_ty)
+            }
+            InstData::ExecuteCallableKhr {
+                sbt_index,
+                callable_var_index,
+            } => {
+                let u32_ty = self.u32_ty();
+                let raw_idx = self.ensure_inst(sbt_index);
+                let idx_ty = self.inst_types.get(&sbt_index).copied().unwrap_or(u32_ty);
+                let idx_u32 = self.coerce_to_ty(raw_idx, idx_ty, u32_ty);
+                if let Some(cvar) = self.stage_vars.get(callable_var_index as usize) {
+                    self.emitter.emit_fn_inst_raw(4446, &[idx_u32, cvar.var_id]); // OpExecuteCallableKHR
+                }
+                (0, self.void_ty)
+            }
+            InstData::EmitMeshTasksExt {
+                group_x,
+                group_y,
+                group_z,
+                payload_var_index,
+            } => {
+                let u32_ty = self.u32_ty();
+                let rx = self.ensure_inst(group_x);
+                let tx = self.inst_types.get(&group_x).copied().unwrap_or(u32_ty);
+                let gx = self.coerce_to_ty(rx, tx, u32_ty);
+                let ry = self.ensure_inst(group_y);
+                let ty = self.inst_types.get(&group_y).copied().unwrap_or(u32_ty);
+                let gy = self.coerce_to_ty(ry, ty, u32_ty);
+                let rz = self.ensure_inst(group_z);
+                let tz = self.inst_types.get(&group_z).copied().unwrap_or(u32_ty);
+                let gz = self.coerce_to_ty(rz, tz, u32_ty);
+                let mut ops = vec![gx, gy, gz];
+                if let Some(pidx) = payload_var_index
+                    && let Some(pvar) = self.stage_vars.get(pidx as usize)
+                {
+                    ops.push(pvar.var_id);
+                }
+                self.emitter.emit_fn_inst_raw(5294, &ops); // OpEmitMeshTasksEXT
+                (0, self.void_ty)
+            }
+            InstData::SetMeshOutputsExt {
+                vertex_count,
+                primitive_count,
+            } => {
+                let u32_ty = self.u32_ty();
+                let rv = self.ensure_inst(vertex_count);
+                let tv = self.inst_types.get(&vertex_count).copied().unwrap_or(u32_ty);
+                let vc = self.coerce_to_ty(rv, tv, u32_ty);
+                let rp = self.ensure_inst(primitive_count);
+                let tp = self.inst_types.get(&primitive_count).copied().unwrap_or(u32_ty);
+                let pc = self.coerce_to_ty(rp, tp, u32_ty);
+                self.emitter.emit_fn_inst_raw(5295, &[vc, pc]); // OpSetMeshOutputsEXT
+                (0, self.void_ty)
+            }
+            InstData::EmitVertex => {
+                self.emitter.emit_fn_inst_raw(218, &[]); // OpEmitVertex
+                (0, self.void_ty)
+            }
+            InstData::EndPrimitive => {
+                self.emitter.emit_fn_inst_raw(219, &[]); // OpEndPrimitive
+                (0, self.void_ty)
+            }
+            InstData::LoadStageVar { var_index } => {
+                if let Some(sv) = self.stage_vars.get(var_index as usize) {
+                    let res = self.emitter.alloc_id();
+                    self.emitter
+                        .emit_fn_inst(spirv::Op::Load, &[sv.val_ty, res, sv.var_id]);
+                    (res, sv.val_ty)
+                } else {
+                    let u32_ty = self.u32_ty();
+                    (self.emit_zero_const(u32_ty), u32_ty)
+                }
+            }
+            InstData::StoreStageVar { var_index, value } => {
+                let raw_val = self.ensure_inst(value);
+                if let Some(sv) = self.stage_vars.get(var_index as usize) {
+                    let val_ty = self.inst_types.get(&value).copied().unwrap_or(sv.val_ty);
+                    let coerced = self.coerce_to_ty(raw_val, val_ty, sv.val_ty);
+                    self.emitter
+                        .emit_fn_inst(spirv::Op::Store, &[sv.var_id, coerced]);
+                }
+                (0, self.void_ty)
+            }
             InstData::Nop => (0, self.void_ty),
         };
 
@@ -7534,6 +8009,14 @@ impl FnLowerCtx<'_> {
             match stmt {
                 StructuredStmt::Eval(id) => {
                     let _ = self.ensure_inst(*id);
+                    if matches!(
+                        self.func.insts[*id].data,
+                        InstData::IgnoreIntersectionKhr
+                            | InstData::TerminateRayKhr
+                            | InstData::EmitMeshTasksExt { .. }
+                    ) {
+                        return true;
+                    }
                 }
                 StructuredStmt::If {
                     cond,
@@ -7979,6 +8462,7 @@ fn emit_function_body(
     descriptors: &[EmittedDescriptor],
     workgroup_vars: &[EmittedWorkgroupVar],
     stage_io_vars: &[EmittedStageIoVar],
+    stage_vars: &[EmittedStageVar],
     builtins: &IndexMap<(BuiltinKind, bool), EmittedBuiltinVar>,
     push_constant: Option<&EmittedPushConstant>,
     default_sampler_var: Option<u32>,
@@ -8083,6 +8567,7 @@ fn emit_function_body(
         descriptors,
         workgroup_vars,
         stage_io_vars,
+        stage_vars,
         local_vars,
         param_ids,
         builtins,
@@ -8136,10 +8621,32 @@ const fn is_const_inst_data(data: &InstData) -> bool {
 }
 
 fn push_inst(buf: &mut Vec<u32>, op: spirv::Op, operands: &[u32]) {
+    push_raw_inst(buf, op as u16, operands);
+}
+
+fn push_raw_inst(buf: &mut Vec<u32>, opcode: u16, operands: &[u32]) {
     let word_count = (1 + operands.len()) as u32;
-    let opcode_word = (word_count << 16) | (op as u32);
+    let opcode_word = (word_count << 16) | u32::from(opcode);
     buf.push(opcode_word);
     buf.extend_from_slice(operands);
+}
+
+fn map_ir_storage_class_raw(sc: IrStorageClass) -> u32 {
+    match sc {
+        IrStorageClass::Function => spirv::StorageClass::Function as u32,
+        IrStorageClass::Workgroup => spirv::StorageClass::Workgroup as u32,
+        IrStorageClass::Uniform => spirv::StorageClass::Uniform as u32,
+        IrStorageClass::StorageBuffer => spirv::StorageClass::StorageBuffer as u32,
+        IrStorageClass::PhysicalStorageBuffer => spirv::StorageClass::PhysicalStorageBuffer as u32,
+        IrStorageClass::Image => spirv::StorageClass::Image as u32,
+        IrStorageClass::RayPayloadKhr => 5338,
+        IrStorageClass::IncomingRayPayloadKhr => 5342,
+        IrStorageClass::HitAttributeKhr => 5339,
+        IrStorageClass::CallableDataKhr => 5328,
+        IrStorageClass::IncomingCallableDataKhr => 5329,
+        IrStorageClass::ShaderRecordBufferKhr => 5343,
+        IrStorageClass::TaskPayloadWorkgroupExt => 5402,
+    }
 }
 
 fn encode_literal_string(s: &str) -> Vec<u32> {
@@ -10811,6 +11318,7 @@ mod tests {
                 len: 2,
             },
             interpolation: IrInterpolation::Smooth,
+            per_primitive: false,
         });
         let f0 = vert.emit(None, InstData::const_f32(0.0));
         let f1 = vert.emit(None, InstData::const_f32(1.0));
@@ -10841,6 +11349,7 @@ mod tests {
             is_output: false,
             ty: IrType::Scalar(ScalarIrTy::U32),
             interpolation: IrInterpolation::Flat,
+            per_primitive: false,
         });
         frag.stage_io.push(IrStageIoVar {
             name: "out_color".into(),
@@ -10851,6 +11360,7 @@ mod tests {
                 len: 4,
             },
             interpolation: IrInterpolation::Smooth,
+            per_primitive: false,
         });
         let flat_in = frag.emit(None, InstData::LoadStageInput { var_index: 0 });
         let ff = frag.emit(

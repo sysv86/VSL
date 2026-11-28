@@ -65,10 +65,17 @@ impl CompileOptions {
     pub fn for_tier(tier: RenderTier) -> Self {
         let active_caps = match tier {
             RenderTier::Tier0Raster | RenderTier::Tier1ComputeGi => HardwareCaps::INT64_ATOMICS,
-            RenderTier::Tier2RayQuery | RenderTier::Tier3PathTracing => {
+            RenderTier::Tier2RayQuery => {
                 HardwareCaps::INT64_ATOMICS
                     | HardwareCaps::RAY_QUERY
                     | HardwareCaps::MAXIMAL_RECONVERGENCE
+            }
+            RenderTier::Tier3PathTracing => {
+                HardwareCaps::INT64_ATOMICS
+                    | HardwareCaps::RAY_QUERY
+                    | HardwareCaps::MAXIMAL_RECONVERGENCE
+                    | HardwareCaps::RAY_TRACING_PIPELINE
+                    | HardwareCaps::MESH_SHADER
             }
         };
         Self {

@@ -495,6 +495,17 @@ impl IrPass for ConstFoldPass {
                     | InstData::RayQueryCommittedWorldToObject(_)
                     | InstData::RayQueryCommittedFrontFace(_)
                     | InstData::RayQueryCommittedBarycentrics(_)
+                    | InstData::TraceRayKhr { .. }
+                    | InstData::IgnoreIntersectionKhr
+                    | InstData::TerminateRayKhr
+                    | InstData::ReportIntersectionKhr { .. }
+                    | InstData::ExecuteCallableKhr { .. }
+                    | InstData::EmitMeshTasksExt { .. }
+                    | InstData::SetMeshOutputsExt { .. }
+                    | InstData::EmitVertex
+                    | InstData::EndPrimitive
+                    | InstData::LoadStageVar { .. }
+                    | InstData::StoreStageVar { .. }
                     | InstData::Nop => None,
                 };
                 if let Some(new_data) = folded {
@@ -2434,6 +2445,71 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             vec: remap_id(*vec, remap),
             index: *index,
         },
+        InstData::TraceRayKhr {
+            tlas_descriptor_index,
+            ray_flags,
+            cull_mask,
+            sbt_offset,
+            sbt_stride,
+            miss_index,
+            origin,
+            t_min,
+            direction,
+            t_max,
+            payload_var_index,
+        } => InstData::TraceRayKhr {
+            tlas_descriptor_index: *tlas_descriptor_index,
+            ray_flags: remap_id(*ray_flags, remap),
+            cull_mask: remap_id(*cull_mask, remap),
+            sbt_offset: remap_id(*sbt_offset, remap),
+            sbt_stride: remap_id(*sbt_stride, remap),
+            miss_index: remap_id(*miss_index, remap),
+            origin: remap_id(*origin, remap),
+            t_min: remap_id(*t_min, remap),
+            direction: remap_id(*direction, remap),
+            t_max: remap_id(*t_max, remap),
+            payload_var_index: *payload_var_index,
+        },
+        InstData::IgnoreIntersectionKhr => InstData::IgnoreIntersectionKhr,
+        InstData::TerminateRayKhr => InstData::TerminateRayKhr,
+        InstData::ReportIntersectionKhr { hit_t, hit_kind } => InstData::ReportIntersectionKhr {
+            hit_t: remap_id(*hit_t, remap),
+            hit_kind: remap_id(*hit_kind, remap),
+        },
+        InstData::ExecuteCallableKhr {
+            sbt_index,
+            callable_var_index,
+        } => InstData::ExecuteCallableKhr {
+            sbt_index: remap_id(*sbt_index, remap),
+            callable_var_index: *callable_var_index,
+        },
+        InstData::EmitMeshTasksExt {
+            group_x,
+            group_y,
+            group_z,
+            payload_var_index,
+        } => InstData::EmitMeshTasksExt {
+            group_x: remap_id(*group_x, remap),
+            group_y: remap_id(*group_y, remap),
+            group_z: remap_id(*group_z, remap),
+            payload_var_index: *payload_var_index,
+        },
+        InstData::SetMeshOutputsExt {
+            vertex_count,
+            primitive_count,
+        } => InstData::SetMeshOutputsExt {
+            vertex_count: remap_id(*vertex_count, remap),
+            primitive_count: remap_id(*primitive_count, remap),
+        },
+        InstData::EmitVertex => InstData::EmitVertex,
+        InstData::EndPrimitive => InstData::EndPrimitive,
+        InstData::LoadStageVar { var_index } => InstData::LoadStageVar {
+            var_index: *var_index,
+        },
+        InstData::StoreStageVar { var_index, value } => InstData::StoreStageVar {
+            var_index: *var_index,
+            value: remap_id(*value, remap),
+        },
         InstData::Nop => InstData::Nop,
     }
 }
@@ -2994,6 +3070,17 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::RayQueryCommittedWorldToObject(_)
                     | InstData::RayQueryCommittedFrontFace(_)
                     | InstData::RayQueryCommittedBarycentrics(_)
+                    | InstData::TraceRayKhr { .. }
+                    | InstData::IgnoreIntersectionKhr
+                    | InstData::TerminateRayKhr
+                    | InstData::ReportIntersectionKhr { .. }
+                    | InstData::ExecuteCallableKhr { .. }
+                    | InstData::EmitMeshTasksExt { .. }
+                    | InstData::SetMeshOutputsExt { .. }
+                    | InstData::EmitVertex
+                    | InstData::EndPrimitive
+                    | InstData::LoadStageVar { .. }
+                    | InstData::StoreStageVar { .. }
                     | InstData::Nop => false,
                 };
                 if tainted {
@@ -4756,6 +4843,7 @@ fn is_licm_hoistable(func: &IrFunction, id: InstId) -> bool {
             | InstData::RayQueryCommittedWorldToObject(_)
             | InstData::RayQueryCommittedFrontFace(_)
             | InstData::RayQueryCommittedBarycentrics(_)
+            | InstData::LoadStageVar { .. }
     )
 }
 
@@ -5456,6 +5544,14 @@ fn remap_inlined_resource_indices(data: &mut InstData, res: &InlineResourceRemap
         } => {
             *ray_query_id += res.rq_offset;
             if let Some(&mapped) = res.desc_remap.get(*tlas_descriptor_index as usize) {
+                *tlas_descriptor_index = mapped;
+            }
+        }
+        InstData::TraceRayKhr {
+            tlas_descriptor_index,
+            ..
+        } => {
+            if let Some(&mapped) = res.desc_map.get(tlas_descriptor_index) {
                 *tlas_descriptor_index = mapped;
             }
         }

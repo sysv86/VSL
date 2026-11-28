@@ -44,6 +44,34 @@ pub enum BuiltinKind {
     Position,
     FragDepth,
     FrontFacing,
+    // VK_KHR_ray_tracing_pipeline builtins
+    LaunchIdKhr,
+    LaunchSizeKhr,
+    WorldRayOriginKhr,
+    WorldRayDirectionKhr,
+    ObjectRayOriginKhr,
+    ObjectRayDirectionKhr,
+    RayTminKhr,
+    RayTmaxKhr,
+    InstanceCustomIndexKhr,
+    ObjectToWorldKhr,
+    WorldToObjectKhr,
+    HitKindKhr,
+    IncomingRayFlagsKhr,
+    RayGeometryIndexKhr,
+    // VK_EXT_mesh_shader builtins
+    PrimitivePointIndicesExt,
+    PrimitiveLineIndicesExt,
+    PrimitiveTriangleIndicesExt,
+    CullPrimitiveExt,
+    // Legacy geometry / tessellation builtins
+    InvocationId,
+    PatchVertices,
+    TessLevelOuter,
+    TessLevelInner,
+    TessCoord,
+    PrimitiveId,
+    Layer,
 }
 
 /// Memory qualifiers lowered onto SPIR-V BDA pointer loads/stores.
@@ -64,6 +92,13 @@ pub enum IrStorageClass {
     StorageBuffer,
     PhysicalStorageBuffer,
     Image,
+    RayPayloadKhr,
+    IncomingRayPayloadKhr,
+    HitAttributeKhr,
+    CallableDataKhr,
+    IncomingCallableDataKhr,
+    ShaderRecordBufferKhr,
+    TaskPayloadWorkgroupExt,
 }
 
 /// Scalar element type for typed IR values, push constants, BDA, and specialization constants.
@@ -445,7 +480,7 @@ pub enum IrInterpolation {
     Centroid,
 }
 
-/// Raster stage input/output variable declaration (`StorageClass::Input` / `Output`).
+/// Raster / Mesh / Tessellation / Geometry stage input/output variable declaration (`StorageClass::Input` / `Output`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IrStageIoVar {
     pub name: SmolStr,
@@ -453,6 +488,68 @@ pub struct IrStageIoVar {
     pub is_output: bool,
     pub ty: IrType,
     pub interpolation: IrInterpolation,
+    #[serde(default)]
+    pub per_primitive: bool,
+}
+
+/// Non-descriptor stage interface variable (RT payload, hit attribute, callable data, SBT record, or task payload).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrStageVar {
+    pub name: SmolStr,
+    pub storage: IrStorageClass,
+    pub location: Option<u32>,
+    pub ty: IrType,
+}
+
+/// Primitive topology for Mesh and Geometry stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrTopology {
+    Points,
+    Lines,
+    Triangles,
+    LineStrip,
+    TriangleStrip,
+}
+
+/// Tessellation domain mode (`ExecutionMode::Triangles` / `Quads` / `Isolines`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrTessDomain {
+    Triangles,
+    Quads,
+    Isolines,
+}
+
+/// Tessellation spacing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrTessSpacing {
+    Equal,
+    FractionalEven,
+    FractionalOdd,
+}
+
+/// Tessellation vertex winding order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrTessOrder {
+    Cw,
+    Ccw,
+}
+
+/// Stage execution-mode metadata for Mesh, Tessellation, and Geometry shaders.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrStageExecMeta {
+    pub max_vertices: Option<u32>,
+    pub max_primitives: Option<u32>,
+    pub output_topology: Option<IrTopology>,
+    pub input_topology: Option<IrTopology>,
+    pub invocations: Option<u32>,
+    pub tess_domain: Option<IrTessDomain>,
+    pub tess_spacing: Option<IrTessSpacing>,
+    pub tess_order: Option<IrTessOrder>,
+    pub point_mode: bool,
 }
 
 /// Descriptor variable declaration attached to an [`IrFunction`].
@@ -1067,6 +1164,59 @@ pub enum InstData {
         vec: InstId,
         index: u32,
     },
+    /// Traces a ray in `VK_KHR_ray_tracing_pipeline` (`OpTraceRayKHR`).
+    TraceRayKhr {
+        tlas_descriptor_index: u32,
+        ray_flags: InstId,
+        cull_mask: InstId,
+        sbt_offset: InstId,
+        sbt_stride: InstId,
+        miss_index: InstId,
+        origin: InstId,
+        t_min: InstId,
+        direction: InstId,
+        t_max: InstId,
+        payload_var_index: u32,
+    },
+    /// Ignores the current candidate intersection in `AnyHitKHR` (`OpIgnoreIntersectionKHR`).
+    IgnoreIntersectionKhr,
+    /// Terminates ray traversal from `AnyHitKHR` (`OpTerminateRayKHR`).
+    TerminateRayKhr,
+    /// Reports a procedural intersection from `IntersectionKHR` (`OpReportIntersectionKHR`).
+    ReportIntersectionKhr {
+        hit_t: InstId,
+        hit_kind: InstId,
+    },
+    /// Invokes a callable shader via SBT index (`OpExecuteCallableKHR`).
+    ExecuteCallableKhr {
+        sbt_index: InstId,
+        callable_var_index: u32,
+    },
+    /// Launches mesh shader workgroups from `TaskEXT` (`OpEmitMeshTasksEXT`).
+    EmitMeshTasksExt {
+        group_x: InstId,
+        group_y: InstId,
+        group_z: InstId,
+        payload_var_index: Option<u32>,
+    },
+    /// Declares output vertex and primitive counts in `MeshEXT` (`OpSetMeshOutputsEXT`).
+    SetMeshOutputsExt {
+        vertex_count: InstId,
+        primitive_count: InstId,
+    },
+    /// Emits a vertex in a `Geometry` shader (`OpEmitVertex`).
+    EmitVertex,
+    /// Completes the current primitive in a `Geometry` shader (`OpEndPrimitive`).
+    EndPrimitive,
+    /// Loads a stage variable (`RayPayloadKHR`, `HitAttributeKHR`, `CallableDataKHR`, `ShaderRecordBufferKHR`, `TaskPayloadWorkgroupEXT`).
+    LoadStageVar {
+        var_index: u32,
+    },
+    /// Stores a value into a stage variable.
+    StoreStageVar {
+        var_index: u32,
+        value: InstId,
+    },
     Nop,
 }
 
@@ -1331,7 +1481,47 @@ impl InstData {
             | Self::RayQueryCommittedWorldToObject(_)
             | Self::RayQueryCommittedFrontFace(_)
             | Self::RayQueryCommittedBarycentrics(_)
+            | Self::IgnoreIntersectionKhr
+            | Self::TerminateRayKhr
+            | Self::EmitVertex
+            | Self::EndPrimitive
+            | Self::LoadStageVar { .. }
             | Self::Nop => Vec::new(),
+            Self::TraceRayKhr {
+                ray_flags,
+                cull_mask,
+                sbt_offset,
+                sbt_stride,
+                miss_index,
+                origin,
+                t_min,
+                direction,
+                t_max,
+                ..
+            } => vec![
+                *ray_flags,
+                *cull_mask,
+                *sbt_offset,
+                *sbt_stride,
+                *miss_index,
+                *origin,
+                *t_min,
+                *direction,
+                *t_max,
+            ],
+            Self::ReportIntersectionKhr { hit_t, hit_kind } => vec![*hit_t, *hit_kind],
+            Self::ExecuteCallableKhr { sbt_index, .. } => vec![*sbt_index],
+            Self::EmitMeshTasksExt {
+                group_x,
+                group_y,
+                group_z,
+                ..
+            } => vec![*group_x, *group_y, *group_z],
+            Self::SetMeshOutputsExt {
+                vertex_count,
+                primitive_count,
+            } => vec![*vertex_count, *primitive_count],
+            Self::StoreStageVar { value, .. } => vec![*value],
         }
     }
 }
@@ -1362,7 +1552,8 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
         | InstData::SubgroupAll(_)
         | InstData::SubgroupElect
         | InstData::RayQueryProceed(_)
-        | InstData::RayQueryCommittedFrontFace(_) => IrType::Scalar(ScalarIrTy::Bool),
+        | InstData::RayQueryCommittedFrontFace(_)
+        | InstData::ReportIntersectionKhr { .. } => IrType::Scalar(ScalarIrTy::Bool),
         InstData::ConstI32(_) | InstData::CastToI32(_) => IrType::Scalar(ScalarIrTy::I32),
         InstData::ConstU32(_)
         | InstData::CastToU32(_)
@@ -1527,6 +1718,16 @@ impl Inst {
                 | InstData::RayQueryConfirmIntersection(_)
                 | InstData::RayQueryTerminate(_)
                 | InstData::RayQueryGenerateIntersection { .. }
+                | InstData::TraceRayKhr { .. }
+                | InstData::IgnoreIntersectionKhr
+                | InstData::TerminateRayKhr
+                | InstData::ReportIntersectionKhr { .. }
+                | InstData::ExecuteCallableKhr { .. }
+                | InstData::EmitMeshTasksExt { .. }
+                | InstData::SetMeshOutputsExt { .. }
+                | InstData::EmitVertex
+                | InstData::EndPrimitive
+                | InstData::StoreStageVar { .. }
         )
     }
 }
@@ -1578,6 +1779,8 @@ pub struct IrFunction {
     pub return_ty: IrType,
     pub local_vars: Vec<IrLocalVar>,
     pub stage_io: Vec<IrStageIoVar>,
+    pub stage_vars: Vec<IrStageVar>,
+    pub stage_exec_meta: IrStageExecMeta,
     pub descriptors: Vec<IrDescriptorVar>,
     pub workgroup_vars: Vec<IrWorkgroupVar>,
     pub push_constants: Option<IrPushConstantBlock>,
@@ -1601,6 +1804,8 @@ impl IrFunction {
             return_ty: IrType::Void,
             local_vars: Vec::new(),
             stage_io: Vec::new(),
+            stage_vars: Vec::new(),
+            stage_exec_meta: IrStageExecMeta::default(),
             descriptors: Vec::new(),
             workgroup_vars: Vec::new(),
             push_constants: None,

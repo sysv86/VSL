@@ -77,12 +77,16 @@ bitflags! {
     /// `synchronization2`, and `dynamic_rendering` by default, but NOT `shader_float16`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
     pub struct HardwareCaps: u32 {
-        const FLOAT16               = 1 << 0;
-        const INT64_ATOMICS         = 1 << 1;
-        const FLOAT_ATOMICS         = 1 << 2;
-        const RAY_QUERY             = 1 << 3;
-        const MAXIMAL_RECONVERGENCE = 1 << 4;
-        const QUAD_CONTROL          = 1 << 5;
+        const FLOAT16                     = 1 << 0;
+        const INT64_ATOMICS               = 1 << 1;
+        const FLOAT_ATOMICS               = 1 << 2;
+        const RAY_QUERY                   = 1 << 3;
+        const MAXIMAL_RECONVERGENCE       = 1 << 4;
+        const QUAD_CONTROL                = 1 << 5;
+        const RAY_TRACING_PIPELINE        = 1 << 6;
+        const MESH_SHADER                 = 1 << 7;
+        const TESSELLATION                = 1 << 8;
+        const GEOMETRY_SHADER             = 1 << 9;
     }
 }
 
@@ -95,6 +99,10 @@ impl HardwareCaps {
             "ray_query" => Some(Self::RAY_QUERY),
             "maximal_reconvergence" => Some(Self::MAXIMAL_RECONVERGENCE),
             "quad_control" => Some(Self::QUAD_CONTROL),
+            "ray_tracing_pipeline" | "ray_tracing" => Some(Self::RAY_TRACING_PIPELINE),
+            "mesh_shader" => Some(Self::MESH_SHADER),
+            "tessellation" => Some(Self::TESSELLATION),
+            "geometry_shader" | "geometry" => Some(Self::GEOMETRY_SHADER),
             _ => None,
         }
     }
@@ -119,13 +127,70 @@ pub enum SampleScalar {
     U32,
 }
 
-/// Shader entry-point execution stage supported by VSL 2.0 shader packs.
+/// Shader entry-point execution stage supported by VSL 2.0 (Vulkan 1.3/1.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShaderStage {
     Compute,
     Vertex,
     Fragment,
+    // VK_KHR_ray_tracing_pipeline stages
+    RayGen,
+    ClosestHit,
+    AnyHit,
+    Miss,
+    Intersection,
+    Callable,
+    // VK_EXT_mesh_shader stages
+    Task,
+    Mesh,
+    // Legacy geometry pipeline stages
+    TessControl,
+    TessEval,
+    Geometry,
+}
+
+impl ShaderStage {
+    /// Returns `true` for the six `VK_KHR_ray_tracing_pipeline` stages.
+    pub const fn is_ray_tracing(self) -> bool {
+        matches!(
+            self,
+            Self::RayGen
+                | Self::ClosestHit
+                | Self::AnyHit
+                | Self::Miss
+                | Self::Intersection
+                | Self::Callable
+        )
+    }
+
+    /// Returns `true` for `VK_EXT_mesh_shader` task and mesh stages.
+    pub const fn is_mesh_pipeline(self) -> bool {
+        matches!(self, Self::Task | Self::Mesh)
+    }
+
+    /// Returns `true` for legacy tessellation and geometry shader stages.
+    pub const fn is_legacy_geometry(self) -> bool {
+        matches!(self, Self::TessControl | Self::TessEval | Self::Geometry)
+    }
+
+    /// Returns `true` for stages that permit `StorageClass::Workgroup` shared variables.
+    pub const fn allows_workgroup_vars(self) -> bool {
+        matches!(self, Self::Compute | Self::Task | Self::Mesh)
+    }
+
+    /// Returns `true` for stages that use `#[location(N)]` stage I/O variables.
+    pub const fn uses_stage_io(self) -> bool {
+        matches!(
+            self,
+            Self::Vertex
+                | Self::Fragment
+                | Self::Mesh
+                | Self::TessControl
+                | Self::TessEval
+                | Self::Geometry
+        )
+    }
 }
 
 /// Storage image formats supported by `RWImage2D<Fmt>`, `RWImage2DArray<Fmt>`, and `RWImage3D<Fmt>`.

@@ -3621,10 +3621,9 @@ impl LowerCtx<'_> {
         let mut scan = BodyScan::default();
         let mut local_types: IndexMap<SmolStr, TypeId> = IndexMap::new();
         let body_hir = func.body.as_ref().map(|body| {
-            let is_non_compute_stage = matches!(
-                parsed_attrs.stage,
-                Some(ShaderStage::Vertex | ShaderStage::Fragment)
-            );
+            let is_non_compute_stage = parsed_attrs
+                .stage
+                .is_some_and(|s| !s.allows_workgroup_vars());
             let mut scanner = BodyScanner {
                 ctx: self,
                 generic_params: &fn_generics,
@@ -4302,10 +4301,8 @@ impl LowerCtx<'_> {
 
             let entry_stage = self.module.functions[entry_id].stage;
             let entry_span = self.module.functions[entry_id].span;
-            if matches!(
-                entry_stage,
-                Some(ShaderStage::Vertex | ShaderStage::Fragment)
-            ) && !merged_scan.debug_channels.is_empty()
+            if entry_stage.is_some_and(|s| s != ShaderStage::Compute)
+                && !merged_scan.debug_channels.is_empty()
             {
                 if !own_has_debug_write {
                     self.diags.push(Diagnostic::error(
@@ -4625,25 +4622,31 @@ fn parse_fn_attribute(
                 if let Some(arg) = entry.args.first() {
                     match arg {
                         Expr::Call { callee, args, span } => {
-                            if let Expr::Path { path, .. } = callee.as_ref()
-                                && path.joined() == "compute"
-                            {
-                                let x = parse_u32_lit(args.first().map(|a| &a.value));
-                                let y = parse_u32_lit(args.get(1).map(|a| &a.value));
-                                let z = parse_u32_lit(args.get(2).map(|a| &a.value));
-                                if let (Some(dx), Some(dy), Some(dz)) = (x, y, z)
-                                    && dx > 0
-                                    && dy > 0
-                                    && dz > 0
-                                {
-                                    out.stage = Some(ShaderStage::Compute);
-                                    out.workgroup_size = Some([dx, dy, dz]);
-                                } else {
-                                    diags.push(Diagnostic::error(
-                                        "E0234",
-                                        "`@stage(compute(x, y, z))` requires three positive integer workgroup dimensions",
-                                        *span,
-                                    ));
+                            if let Expr::Path { path, .. } = callee.as_ref() {
+                                let wg_stage = match path.joined().as_str() {
+                                    "compute" => Some(ShaderStage::Compute),
+                                    "task" => Some(ShaderStage::Task),
+                                    "mesh" => Some(ShaderStage::Mesh),
+                                    _ => None,
+                                };
+                                if let Some(stage_kind) = wg_stage {
+                                    let x = parse_u32_lit(args.first().map(|a| &a.value));
+                                    let y = parse_u32_lit(args.get(1).map(|a| &a.value));
+                                    let z = parse_u32_lit(args.get(2).map(|a| &a.value));
+                                    if let (Some(dx), Some(dy), Some(dz)) = (x, y, z)
+                                        && dx > 0
+                                        && dy > 0
+                                        && dz > 0
+                                    {
+                                        out.stage = Some(stage_kind);
+                                        out.workgroup_size = Some([dx, dy, dz]);
+                                    } else {
+                                        diags.push(Diagnostic::error(
+                                            "E0234",
+                                            "`@stage(compute/task/mesh(x, y, z))` requires three positive integer workgroup dimensions",
+                                            *span,
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -4656,6 +4659,50 @@ fn parse_fn_attribute(
                                 out.stage = Some(ShaderStage::Fragment);
                                 out.workgroup_size = None;
                             }
+                            "raygen" => {
+                                out.stage = Some(ShaderStage::RayGen);
+                                out.workgroup_size = None;
+                            }
+                            "closest_hit" => {
+                                out.stage = Some(ShaderStage::ClosestHit);
+                                out.workgroup_size = None;
+                            }
+                            "any_hit" => {
+                                out.stage = Some(ShaderStage::AnyHit);
+                                out.workgroup_size = None;
+                            }
+                            "miss" => {
+                                out.stage = Some(ShaderStage::Miss);
+                                out.workgroup_size = None;
+                            }
+                            "intersection" => {
+                                out.stage = Some(ShaderStage::Intersection);
+                                out.workgroup_size = None;
+                            }
+                            "callable" => {
+                                out.stage = Some(ShaderStage::Callable);
+                                out.workgroup_size = None;
+                            }
+                            "task" => {
+                                out.stage = Some(ShaderStage::Task);
+                                out.workgroup_size = Some([1, 1, 1]);
+                            }
+                            "mesh" => {
+                                out.stage = Some(ShaderStage::Mesh);
+                                out.workgroup_size = Some([1, 1, 1]);
+                            }
+                            "tess_control" => {
+                                out.stage = Some(ShaderStage::TessControl);
+                                out.workgroup_size = None;
+                            }
+                            "tess_eval" => {
+                                out.stage = Some(ShaderStage::TessEval);
+                                out.workgroup_size = None;
+                            }
+                            "geometry" => {
+                                out.stage = Some(ShaderStage::Geometry);
+                                out.workgroup_size = None;
+                            }
                             other => diags.push(Diagnostic::error(
                                 "E0231",
                                 format!("unsupported shader stage `{other}` in VSL 2.0"),
@@ -4664,6 +4711,88 @@ fn parse_fn_attribute(
                         },
                         _ => {}
                     }
+                }
+            }
+            "raygen" => {
+                out.stage = Some(ShaderStage::RayGen);
+                out.workgroup_size = None;
+            }
+            "closest_hit" => {
+                out.stage = Some(ShaderStage::ClosestHit);
+                out.workgroup_size = None;
+            }
+            "any_hit" => {
+                out.stage = Some(ShaderStage::AnyHit);
+                out.workgroup_size = None;
+            }
+            "miss" => {
+                out.stage = Some(ShaderStage::Miss);
+                out.workgroup_size = None;
+            }
+            "intersection" => {
+                out.stage = Some(ShaderStage::Intersection);
+                out.workgroup_size = None;
+            }
+            "callable" => {
+                out.stage = Some(ShaderStage::Callable);
+                out.workgroup_size = None;
+            }
+            "task" => {
+                out.stage = Some(ShaderStage::Task);
+                if entry.args.len() == 3
+                    && let (Some(dx), Some(dy), Some(dz)) = (
+                        parse_u32_lit(entry.args.first()),
+                        parse_u32_lit(entry.args.get(1)),
+                        parse_u32_lit(entry.args.get(2)),
+                    )
+                    && dx > 0
+                    && dy > 0
+                    && dz > 0
+                {
+                    out.workgroup_size = Some([dx, dy, dz]);
+                } else if out.workgroup_size.is_none() {
+                    out.workgroup_size = Some([1, 1, 1]);
+                }
+            }
+            "mesh" => {
+                out.stage = Some(ShaderStage::Mesh);
+                if entry.args.len() == 3
+                    && let (Some(dx), Some(dy), Some(dz)) = (
+                        parse_u32_lit(entry.args.first()),
+                        parse_u32_lit(entry.args.get(1)),
+                        parse_u32_lit(entry.args.get(2)),
+                    )
+                    && dx > 0
+                    && dy > 0
+                    && dz > 0
+                {
+                    out.workgroup_size = Some([dx, dy, dz]);
+                } else if out.workgroup_size.is_none() {
+                    out.workgroup_size = Some([1, 1, 1]);
+                }
+            }
+            "tess_control" => {
+                out.stage = Some(ShaderStage::TessControl);
+                out.workgroup_size = None;
+            }
+            "tess_eval" => {
+                out.stage = Some(ShaderStage::TessEval);
+                out.workgroup_size = None;
+            }
+            "geometry" => {
+                out.stage = Some(ShaderStage::Geometry);
+                out.workgroup_size = None;
+            }
+            "workgroup_size" => {
+                if let (Some(dx), Some(dy), Some(dz)) = (
+                    parse_u32_lit(entry.args.first()),
+                    parse_u32_lit(entry.args.get(1)),
+                    parse_u32_lit(entry.args.get(2)),
+                ) && dx > 0
+                    && dy > 0
+                    && dz > 0
+                {
+                    out.workgroup_size = Some([dx, dy, dz]);
                 }
             }
             "hook" if attr.is_at_decorator => {
@@ -7346,6 +7475,7 @@ fn infer_builtin_call_return_type(
     types: &mut TypeArena,
 ) -> Option<TypeId> {
     match name {
+        "report_intersection" => Some(types.alloc(Type::Scalar(ScalarKind::Bool))),
         "subgroup_ballot" => Some(types.alloc(Type::Vector {
             scalar: ScalarKind::U32,
             len: 4,
