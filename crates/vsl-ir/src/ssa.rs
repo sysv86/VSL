@@ -73,6 +73,14 @@ pub enum BuiltinKind {
     PrimitiveId,
     Layer,
     HitTriangleVertexPositionsKhr,
+    SampleId,
+    SamplePosition,
+    SampleMask,
+    PrimitiveShadingRateKhr,
+    ShadingRateKhr,
+    ViewIndex,
+    ClipDistance,
+    CullDistance,
 }
 
 /// Memory qualifiers lowered onto SPIR-V BDA pointer loads/stores.
@@ -310,6 +318,8 @@ impl IrType {
             | Type::Texture2DArray { .. }
             | Type::Texture3D { .. }
             | Type::TextureCube { .. }
+            | Type::Texture2DMS { .. }
+            | Type::SubpassInput { .. }
             | Type::RwImage2D(_)
             | Type::RwImage2DArray(_)
             | Type::RwImage3D(_)
@@ -599,7 +609,17 @@ pub enum IrTessOrder {
     Ccw,
 }
 
-/// Stage execution-mode metadata for Mesh, Tessellation, and Geometry shaders.
+/// Fragment shader interlock execution mode (`VK_EXT_fragment_shader_interlock`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrInterlockMode {
+    PixelOrdered,
+    PixelUnordered,
+    SampleOrdered,
+    SampleUnordered,
+}
+
+/// Stage execution-mode metadata for Mesh, Tessellation, Geometry, and Fragment shaders.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IrStageExecMeta {
     pub max_vertices: Option<u32>,
@@ -611,6 +631,10 @@ pub struct IrStageExecMeta {
     pub tess_spacing: Option<IrTessSpacing>,
     pub tess_order: Option<IrTessOrder>,
     pub point_mode: bool,
+    pub early_fragment_tests: bool,
+    pub interlock_mode: Option<IrInterlockMode>,
+    /// `(descriptor_index, input_attachment_index)` pairs for `SubpassData` / `VK_KHR_dynamic_rendering_local_read`.
+    pub input_attachment_indices: Vec<(u32, u32)>,
 }
 
 /// Descriptor variable declaration attached to an [`IrFunction`].
@@ -1346,6 +1370,21 @@ pub enum InstData {
     CoopMatrixLength {
         mat_ty: IrType,
     },
+    /// Subpass / dynamic rendering local read (`OpImageRead` on `Dim::SubpassData`).
+    SubpassLoad {
+        descriptor_index: u32,
+        sample: Option<InstId>,
+    },
+    /// Multisampled texture texel fetch (`OpImageFetch` with `Sample` operand).
+    ImageFetchMs {
+        descriptor_index: u32,
+        coord: InstId,
+        sample: InstId,
+    },
+    /// Begins a fragment shader interlock critical section (`OpBeginInvocationInterlockEXT`).
+    BeginInvocationInterlockExt,
+    /// Ends a fragment shader interlock critical section (`OpEndInvocationInterlockEXT`).
+    EndInvocationInterlockExt,
     Nop,
 }
 
@@ -1622,7 +1661,11 @@ impl InstData {
             | Self::HitObjectExecuteShader { .. }
             | Self::RayQueryTriangleVertexPositions { .. }
             | Self::CoopMatrixLength { .. }
+            | Self::BeginInvocationInterlockExt
+            | Self::EndInvocationInterlockExt
             | Self::Nop => Vec::new(),
+            Self::SubpassLoad { sample, .. } => sample.into_iter().copied().collect(),
+            Self::ImageFetchMs { coord, sample, .. } => vec![*coord, *sample],
             Self::CoopMatrixLoad { ptr, stride, .. } => {
                 let mut ops = vec![*ptr];
                 if let Some(s) = stride {
@@ -1931,6 +1974,8 @@ impl Inst {
                 | InstData::ReorderThreadWithHint { .. }
                 | InstData::ReorderThreadWithHitObject { .. }
                 | InstData::CoopMatrixStore { .. }
+                | InstData::BeginInvocationInterlockExt
+                | InstData::EndInvocationInterlockExt
         )
     }
 }

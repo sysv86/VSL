@@ -2,7 +2,8 @@ use indexmap::{IndexMap, IndexSet};
 use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixScalar, GlslStd450Op, InstData, InstId,
     IrDescriptorVar,
-    IrFunction, IrInterpolation, IrModule, IrPushConstantBlock, IrStorageClass, IrStructLayout,
+    IrFunction, IrInterlockMode, IrInterpolation, IrModule, IrPushConstantBlock, IrStorageClass,
+    IrStructLayout,
     IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology, IrType, IrWorkgroupVar, ScalarIrTy,
     SpecConstantOpKind, StructuredStmt,
 };
@@ -1500,7 +1501,9 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                                     );
                                 }
                             }
-                            DescriptorKind::Sampler | DescriptorKind::AccelerationStructure => {}
+                            DescriptorKind::Sampler
+                            | DescriptorKind::AccelerationStructure
+                            | DescriptorKind::InputAttachment => {}
                         }
                     }
                 }
@@ -1925,6 +1928,15 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
             }
             func_descriptors.push(desc_var);
         }
+        for &(desc_idx, att_idx) in &func.stage_exec_meta.input_attachment_indices {
+            if let Some(desc_var) = func_descriptors.get(desc_idx as usize) {
+                emitter.emit_decorate(
+                    desc_var.var_id,
+                    spirv::Decoration::InputAttachmentIndex,
+                    &[att_idx],
+                );
+            }
+        }
 
         if func.stage.is_none() || func.stage.is_some_and(ShaderStage::allows_workgroup_vars) {
             for wg in &func.workgroup_vars {
@@ -2195,6 +2207,24 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                 if writes_frag_depth {
                     emitter.emit_execution_mode(fn_id, spirv::ExecutionMode::DepthReplacing, &[]);
                 }
+                if func.stage_exec_meta.early_fragment_tests {
+                    emitter.emit_execution_mode(
+                        fn_id,
+                        spirv::ExecutionMode::EarlyFragmentTests,
+                        &[],
+                    );
+                }
+                if let Some(interlock) = func.stage_exec_meta.interlock_mode {
+                    emitter.emit_extension("SPV_EXT_fragment_shader_interlock");
+                    let (cap_raw, mode_raw) = match interlock {
+                        IrInterlockMode::PixelOrdered => (5378, 5366),
+                        IrInterlockMode::PixelUnordered => (5378, 5367),
+                        IrInterlockMode::SampleOrdered => (5379, 5368),
+                        IrInterlockMode::SampleUnordered => (5379, 5369),
+                    };
+                    emitter.emit_capability_raw(cap_raw);
+                    emitter.emit_execution_mode_raw(fn_id, mode_raw, &[]);
+                }
             }
             let meta = &func.stage_exec_meta;
             if stage == ShaderStage::Mesh {
@@ -2351,10 +2381,11 @@ fn map_image_format(fmt: Option<ImageFormat>) -> spirv::ImageFormat {
 /// Returns `(spv_dim, arrayed, coord_components, grad_components, query_size_components)`.
 fn map_texture_dim(dim: Option<TextureDim>) -> (spirv::Dim, u32, u32, u32, u32) {
     match dim.unwrap_or(TextureDim::Dim2D) {
-        TextureDim::Dim2D => (spirv::Dim::Dim2D, 0, 2, 2, 2),
+        TextureDim::Dim2D | TextureDim::Dim2DMS => (spirv::Dim::Dim2D, 0, 2, 2, 2),
         TextureDim::Dim2DArray => (spirv::Dim::Dim2D, 1, 3, 2, 3),
         TextureDim::Dim3D => (spirv::Dim::Dim3D, 0, 3, 3, 3),
         TextureDim::DimCube => (spirv::Dim::DimCube, 0, 3, 3, 2),
+        TextureDim::SubpassData => (spirv::Dim::SubpassData, 0, 2, 2, 2),
     }
 }
 
@@ -2422,13 +2453,33 @@ fn emit_descriptor_var(
         }
         DescriptorKind::SampledImage => {
             let sampled_ty = map_sample_scalar(emitter, desc.sample_scalar);
+            let ms = u32::from(desc.dim == Some(TextureDim::Dim2DMS));
             let img_ty = emitter.emit_type_image(
                 sampled_ty,
                 spv_dim,
                 depth_operand,
                 arrayed,
-                0,
+                ms,
                 1,
+                spirv::ImageFormat::Unknown,
+            );
+            (
+                spirv::StorageClass::UniformConstant,
+                img_ty,
+                img_ty,
+                sampled_ty,
+            )
+        }
+        DescriptorKind::InputAttachment => {
+            emitter.emit_capability(spirv::Capability::InputAttachment);
+            let sampled_ty = map_sample_scalar(emitter, desc.sample_scalar);
+            let img_ty = emitter.emit_type_image(
+                sampled_ty,
+                spirv::Dim::DimSubpassData,
+                0,
+                0,
+                0,
+                2,
                 spirv::ImageFormat::Unknown,
             );
             (
@@ -2774,6 +2825,51 @@ fn emit_builtin_var(
             let len_const = emitter.emit_constant_32(u32_ty, 3);
             let arr_ty = emitter.emit_type_array(v3_ty, len_const);
             (arr_ty, f32_ty, None, 5335, "gl_HitTriangleVertexPositionsEXT")
+        }
+        BuiltinKind::SampleId => {
+            emitter.emit_capability(spirv::Capability::SampleRateShading);
+            (u32_ty, u32_ty, None, 18, "gl_SampleID")
+        }
+        BuiltinKind::SamplePosition => {
+            emitter.emit_capability(spirv::Capability::SampleRateShading);
+            (
+                emitter.emit_type_vector(f32_ty, 2),
+                f32_ty,
+                Some(2),
+                19,
+                "gl_SamplePosition",
+            )
+        }
+        BuiltinKind::SampleMask => {
+            let len_const = emitter.emit_constant_32(u32_ty, 1);
+            let arr_ty = emitter.emit_type_array(u32_ty, len_const);
+            (arr_ty, u32_ty, None, 20, "gl_SampleMask")
+        }
+        BuiltinKind::PrimitiveShadingRateKhr => {
+            emitter.emit_capability_raw(4422); // FragmentShadingRateKHR
+            emitter.emit_extension("SPV_KHR_fragment_shading_rate");
+            (u32_ty, u32_ty, None, 4432, "gl_PrimitiveShadingRateEXT")
+        }
+        BuiltinKind::ShadingRateKhr => {
+            emitter.emit_capability_raw(4422); // FragmentShadingRateKHR
+            emitter.emit_extension("SPV_KHR_fragment_shading_rate");
+            (u32_ty, u32_ty, None, 4444, "gl_ShadingRateEXT")
+        }
+        BuiltinKind::ViewIndex => {
+            emitter.emit_capability_raw(4439); // MultiView
+            (u32_ty, u32_ty, None, 4440, "gl_ViewIndex")
+        }
+        BuiltinKind::ClipDistance => {
+            emitter.emit_capability(spirv::Capability::ClipDistance);
+            let len_const = emitter.emit_constant_32(u32_ty, 1);
+            let arr_ty = emitter.emit_type_array(f32_ty, len_const);
+            (arr_ty, f32_ty, None, 3, "gl_ClipDistance")
+        }
+        BuiltinKind::CullDistance => {
+            emitter.emit_capability(spirv::Capability::CullDistance);
+            let len_const = emitter.emit_constant_32(u32_ty, 1);
+            let arr_ty = emitter.emit_type_array(f32_ty, len_const);
+            (arr_ty, f32_ty, None, 4, "gl_CullDistance")
         }
     };
     let sc = if is_output {
@@ -7024,6 +7120,94 @@ impl FnLowerCtx<'_> {
                 self.emitter
                     .emit_fn_inst_raw(4460, &[u32_ty, res, spv_mat_ty]); // OpCooperativeMatrixLengthKHR
                 (res, u32_ty)
+            }
+            InstData::SubpassLoad {
+                descriptor_index,
+                sample,
+            } => {
+                let f32_ty = self.f32_ty();
+                let vec4_ty = self.emitter.emit_type_vector(f32_ty, 4);
+                if let Some(desc) = self.descriptors.get(descriptor_index as usize).cloned() {
+                    if let Some(img_id) = self.load_raw_image(&desc) {
+                        let i32_ty = self.i32_ty();
+                        let zero_i = self.emitter.emit_constant_32(i32_ty, 0);
+                        let ivec2_ty = self.emitter.emit_type_vector(i32_ty, 2);
+                        let zero_coord =
+                            self.emitter.emit_constant_composite(ivec2_ty, &[zero_i, zero_i]);
+                        let res_ty = self.emitter.emit_type_vector(desc.sampled_ty, 4);
+                        let res = self.emitter.alloc_id();
+                        if let Some(s) = sample {
+                            let s_id = self.get_val(s);
+                            self.emitter.emit_fn_inst(
+                                spirv::Op::ImageRead,
+                                &[res_ty, res, img_id, zero_coord, 0x40, s_id],
+                            );
+                        } else {
+                            self.emitter.emit_fn_inst(
+                                spirv::Op::ImageRead,
+                                &[res_ty, res, img_id, zero_coord],
+                            );
+                        }
+                        (res, res_ty)
+                    } else {
+                        let z = self.emitter.emit_constant_32(f32_ty, 0);
+                        (
+                            self.emitter.emit_constant_composite(vec4_ty, &[z, z, z, z]),
+                            vec4_ty,
+                        )
+                    }
+                } else {
+                    let z = self.emitter.emit_constant_32(f32_ty, 0);
+                    (
+                        self.emitter.emit_constant_composite(vec4_ty, &[z, z, z, z]),
+                        vec4_ty,
+                    )
+                }
+            }
+            InstData::ImageFetchMs {
+                descriptor_index,
+                coord,
+                sample,
+            } => {
+                let f32_ty = self.f32_ty();
+                let vec4_ty = self.emitter.emit_type_vector(f32_ty, 4);
+                let coord_id = self.get_val(coord);
+                let sample_id = self.get_val(sample);
+                if let Some(desc) = self.descriptors.get(descriptor_index as usize).cloned() {
+                    if let Some(img_id) = self.load_raw_image(&desc) {
+                        let res_ty = self.emitter.emit_type_vector(desc.sampled_ty, 4);
+                        let res = self.emitter.alloc_id();
+                        self.emitter.emit_fn_inst(
+                            spirv::Op::ImageFetch,
+                            &[res_ty, res, img_id, coord_id, 0x40, sample_id],
+                        );
+                        (res, res_ty)
+                    } else {
+                        let z = self.emitter.emit_constant_32(f32_ty, 0);
+                        (
+                            self.emitter.emit_constant_composite(vec4_ty, &[z, z, z, z]),
+                            vec4_ty,
+                        )
+                    }
+                } else {
+                    let z = self.emitter.emit_constant_32(f32_ty, 0);
+                    (
+                        self.emitter.emit_constant_composite(vec4_ty, &[z, z, z, z]),
+                        vec4_ty,
+                    )
+                }
+            }
+            InstData::BeginInvocationInterlockExt => {
+                self.emitter
+                    .emit_extension("SPV_EXT_fragment_shader_interlock");
+                self.emitter.emit_fn_inst_raw(5364, &[]); // OpBeginInvocationInterlockEXT
+                (0, self.void_ty)
+            }
+            InstData::EndInvocationInterlockExt => {
+                self.emitter
+                    .emit_extension("SPV_EXT_fragment_shader_interlock");
+                self.emitter.emit_fn_inst_raw(5365, &[]); // OpEndInvocationInterlockEXT
+                (0, self.void_ty)
             }
             InstData::Nop => (0, self.void_ty),
         };

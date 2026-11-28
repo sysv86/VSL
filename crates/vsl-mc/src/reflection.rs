@@ -13,6 +13,7 @@ pub enum DescriptorKind {
     CombinedImageSampler,
     Sampler,
     AccelerationStructure,
+    InputAttachment,
 }
 
 /// Memory access qualifiers for a reflected descriptor binding.

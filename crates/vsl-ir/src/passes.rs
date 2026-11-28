@@ -519,6 +519,10 @@ impl IrPass for ConstFoldPass {
                     | InstData::CoopMatrixStore { .. }
                     | InstData::CoopMatrixMulAdd { .. }
                     | InstData::CoopMatrixLength { .. }
+                    | InstData::SubpassLoad { .. }
+                    | InstData::ImageFetchMs { .. }
+                    | InstData::BeginInvocationInterlockExt
+                    | InstData::EndInvocationInterlockExt
                     | InstData::Nop => None,
                 };
                 if let Some(new_data) = folded {
@@ -2615,6 +2619,24 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         InstData::CoopMatrixLength { mat_ty } => InstData::CoopMatrixLength {
             mat_ty: mat_ty.clone(),
         },
+        InstData::SubpassLoad {
+            descriptor_index,
+            sample,
+        } => InstData::SubpassLoad {
+            descriptor_index: *descriptor_index,
+            sample: sample.map(|s| remap_id(s, remap)),
+        },
+        InstData::ImageFetchMs {
+            descriptor_index,
+            coord,
+            sample,
+        } => InstData::ImageFetchMs {
+            descriptor_index: *descriptor_index,
+            coord: remap_id(*coord, remap),
+            sample: remap_id(*sample, remap),
+        },
+        InstData::BeginInvocationInterlockExt => InstData::BeginInvocationInterlockExt,
+        InstData::EndInvocationInterlockExt => InstData::EndInvocationInterlockExt,
         InstData::Nop => InstData::Nop,
     }
 }
@@ -3199,6 +3221,10 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::CoopMatrixStore { .. }
                     | InstData::CoopMatrixMulAdd { .. }
                     | InstData::CoopMatrixLength { .. }
+                    | InstData::SubpassLoad { .. }
+                    | InstData::ImageFetchMs { .. }
+                    | InstData::BeginInvocationInterlockExt
+                    | InstData::EndInvocationInterlockExt
                     | InstData::Nop => false,
                 };
                 if tainted {
@@ -4967,6 +4993,8 @@ fn is_licm_hoistable(func: &IrFunction, id: InstId) -> bool {
             | InstData::HitObjectGetSbtRecordIndex(_)
             | InstData::RayQueryTriangleVertexPositions { .. }
             | InstData::CoopMatrixLoad { .. }
+            | InstData::SubpassLoad { .. }
+            | InstData::ImageFetchMs { .. }
     )
 }
 
@@ -5676,6 +5704,16 @@ fn remap_inlined_resource_indices(data: &mut InstData, res: &InlineResourceRemap
         } => {
             if let Some(&mapped) = res.desc_map.get(tlas_descriptor_index) {
                 *tlas_descriptor_index = mapped;
+            }
+        }
+        InstData::SubpassLoad {
+            descriptor_index, ..
+        }
+        | InstData::ImageFetchMs {
+            descriptor_index, ..
+        } => {
+            if let Some(&mapped) = res.desc_map.get(descriptor_index) {
+                *descriptor_index = mapped;
             }
         }
         InstData::HitObjectTraceRay {

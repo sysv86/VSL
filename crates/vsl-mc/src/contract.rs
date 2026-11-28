@@ -92,6 +92,11 @@ bitflags! {
         const OPACITY_MICROMAP              = 1 << 12;
         const RAY_TRACING_POSITION_FETCH    = 1 << 13;
         const COOPERATIVE_MATRIX            = 1 << 14;
+        const FRAGMENT_SHADING_RATE         = 1 << 15;
+        const FRAGMENT_SHADER_INTERLOCK     = 1 << 16;
+        const MULTIVIEW                     = 1 << 17;
+        const SAMPLE_RATE_SHADING           = 1 << 18;
+        const INPUT_ATTACHMENT              = 1 << 19;
     }
 }
 
@@ -121,6 +126,11 @@ impl HardwareCaps {
             "cooperative_matrix" | "coop_matrix" | "coop_matrix_2" => {
                 Some(Self::COOPERATIVE_MATRIX)
             }
+            "fragment_shading_rate" | "vrs" => Some(Self::FRAGMENT_SHADING_RATE),
+            "fragment_shader_interlock" | "interlock" => Some(Self::FRAGMENT_SHADER_INTERLOCK),
+            "multiview" => Some(Self::MULTIVIEW),
+            "sample_rate_shading" => Some(Self::SAMPLE_RATE_SHADING),
+            "input_attachment" | "dynamic_rendering_local_read" => Some(Self::INPUT_ATTACHMENT),
             _ => None,
         }
     }
@@ -134,6 +144,8 @@ pub enum TextureDim {
     Dim2DArray,
     Dim3D,
     DimCube,
+    Dim2DMS,
+    SubpassData,
 }
 
 /// Sampled scalar element type for `Texture*<T>` descriptors.

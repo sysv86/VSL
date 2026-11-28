@@ -1270,6 +1270,8 @@ fn is_image_param_type(types: &TypeArena, ty: TypeId) -> bool {
             | Type::Texture2DArray { .. }
             | Type::Texture3D { .. }
             | Type::TextureCube { .. }
+            | Type::Texture2DMS { .. }
+            | Type::SubpassInput { .. }
             | Type::RwImage2D(_)
             | Type::RwImage2DArray(_)
             | Type::RwImage3D(_)
@@ -4881,6 +4883,22 @@ fn classify_resource_type(ty: &Type, mode: ParamMode) -> Option<ClassifiedResour
             access: DescriptorAccess::ReadOnly,
             is_unsized: false,
         }),
+        Type::Texture2DMS { sample_scalar } => Some(ClassifiedResource {
+            kind: DescriptorKind::SampledImage,
+            dim: Some(TextureDim::Dim2DMS),
+            sample_scalar: scalar_to_sample_scalar(*sample_scalar),
+            image_format: None,
+            access: DescriptorAccess::ReadOnly,
+            is_unsized: false,
+        }),
+        Type::SubpassInput { sample_scalar, .. } => Some(ClassifiedResource {
+            kind: DescriptorKind::InputAttachment,
+            dim: Some(TextureDim::SubpassData),
+            sample_scalar: scalar_to_sample_scalar(*sample_scalar),
+            image_format: None,
+            access: DescriptorAccess::ReadOnly,
+            is_unsized: false,
+        }),
         Type::RwImage2D(fmt) => Some(ClassifiedResource {
             kind: DescriptorKind::StorageImage,
             dim: Some(TextureDim::Dim2D),
@@ -5082,6 +5100,8 @@ const fn is_opaque_handle_type(ty: &Type) -> bool {
             | Type::Texture2DArray { .. }
             | Type::Texture3D { .. }
             | Type::TextureCube { .. }
+            | Type::Texture2DMS { .. }
+            | Type::SubpassInput { .. }
             | Type::RwImage2D(_)
             | Type::RwImage2DArray(_)
             | Type::RwImage3D(_)
@@ -6869,10 +6889,18 @@ impl BodyScanner<'_, '_> {
                         Type::Texture2D { sample_scalar, .. }
                         | Type::Texture2DArray { sample_scalar }
                         | Type::Texture3D { sample_scalar }
-                        | Type::TextureCube { sample_scalar } => {
+                        | Type::TextureCube { sample_scalar }
+                        | Type::Texture2DMS { sample_scalar }
+                        | Type::SubpassInput { sample_scalar, .. } => {
                             if matches!(
                                 method.name.as_str(),
-                                "sample" | "sample_lod" | "sample_grad" | "fetch" | "load"
+                                "sample"
+                                    | "sample_lod"
+                                    | "sample_grad"
+                                    | "fetch"
+                                    | "fetch_ms"
+                                    | "subpass_load"
+                                    | "load"
                             ) {
                                 ret_ty = Some(self.ctx.module.types.alloc(Type::Vector {
                                     scalar: sample_scalar,
@@ -8075,6 +8103,16 @@ fn format_type_name(types: &TypeArena, id: TypeId) -> String {
         Type::TextureCube { sample_scalar } => {
             format!("TextureCube<{}>", scalar_name(*sample_scalar))
         }
+        Type::Texture2DMS { sample_scalar } => {
+            format!("Texture2DMS<{}>", scalar_name(*sample_scalar))
+        }
+        Type::SubpassInput { sample_scalar, ms } => {
+            if *ms {
+                format!("SubpassInputMS<{}>", scalar_name(*sample_scalar))
+            } else {
+                format!("SubpassInput<{}>", scalar_name(*sample_scalar))
+            }
+        }
         Type::RwImage2D(fmt) => format!("RWImage2D<{fmt:?}>"),
         Type::RwImage2DArray(fmt) => format!("RWImage2DArray<{fmt:?}>"),
         Type::RwImage3D(fmt) => format!("RWImage3D<{fmt:?}>"),
@@ -8673,6 +8711,17 @@ fn lower_type_expr(
                 },
                 "TextureCube" => Type::TextureCube {
                     sample_scalar: first_type_arg_scalar(args).unwrap_or(ScalarKind::F32),
+                },
+                "Texture2DMS" => Type::Texture2DMS {
+                    sample_scalar: first_type_arg_scalar(args).unwrap_or(ScalarKind::F32),
+                },
+                "SubpassInput" => Type::SubpassInput {
+                    sample_scalar: first_type_arg_scalar(args).unwrap_or(ScalarKind::F32),
+                    ms: false,
+                },
+                "SubpassInputMS" => Type::SubpassInput {
+                    sample_scalar: first_type_arg_scalar(args).unwrap_or(ScalarKind::F32),
+                    ms: true,
                 },
                 "RWImage2D" => Type::RwImage2D(first_type_arg_image_format(args)?),
                 "RWImage2DArray" => Type::RwImage2DArray(first_type_arg_image_format(args)?),

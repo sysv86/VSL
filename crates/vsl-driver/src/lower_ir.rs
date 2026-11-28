@@ -16,7 +16,8 @@ use vsl_hir::{
 use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixLayout, GlslStd450Op, InstData, InstId,
     IrDescriptorVar,
-    IrFunction, IrInterpolation, IrLocalVar, IrModule, IrParam, IrPushConstantBlock,
+    IrFunction, IrInterlockMode, IrInterpolation, IrLocalVar, IrModule, IrParam,
+    IrPushConstantBlock,
     IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
     IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,
     IrType, IrWorkgroupVar, MemoryAccess, ScalarIrTy, StructuredStmt,
@@ -871,6 +872,16 @@ fn parse_stage_exec_meta(attrs: &[Attribute]) -> IrStageExecMeta {
                     });
                 }
                 "point_mode" => meta.point_mode = true,
+                "early_fragment_tests" => meta.early_fragment_tests = true,
+                "interlock" => {
+                    meta.interlock_mode = first_ident.as_deref().and_then(|s| match s {
+                        "pixel_ordered" => Some(IrInterlockMode::PixelOrdered),
+                        "pixel_unordered" => Some(IrInterlockMode::PixelUnordered),
+                        "sample_ordered" => Some(IrInterlockMode::SampleOrdered),
+                        "sample_unordered" => Some(IrInterlockMode::SampleUnordered),
+                        _ => None,
+                    });
+                }
                 _ => {}
             }
         }
@@ -919,6 +930,14 @@ fn parse_builtin_kind(name: &str) -> Option<BuiltinKind> {
         "primitive_id" => Some(BuiltinKind::PrimitiveId),
         "layer" => Some(BuiltinKind::Layer),
         "hit_triangle_vertex_positions" => Some(BuiltinKind::HitTriangleVertexPositionsKhr),
+        "sample_id" => Some(BuiltinKind::SampleId),
+        "sample_position" => Some(BuiltinKind::SamplePosition),
+        "sample_mask" => Some(BuiltinKind::SampleMask),
+        "primitive_shading_rate" => Some(BuiltinKind::PrimitiveShadingRateKhr),
+        "shading_rate" => Some(BuiltinKind::ShadingRateKhr),
+        "view_index" => Some(BuiltinKind::ViewIndex),
+        "clip_distance" => Some(BuiltinKind::ClipDistance),
+        "cull_distance" => Some(BuiltinKind::CullDistance),
         _ => None,
     }
 }
@@ -1146,8 +1165,20 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 continue;
             }
 
-            // Skip descriptor parameters already bound via `ir_fn.descriptors`.
-            if descriptor_indices.contains_key(&param.name) {
+            // Record `#[input_attachment_index(N)]` for `SubpassInput` descriptors.
+            if let Some(&desc_idx) = descriptor_indices.get(&param.name) {
+                if let Some(ast_param) = ast_fn.and_then(|f| f.params.get(param_pos)) {
+                    for attr in &ast_param.attrs {
+                        for entry in &attr.entries {
+                            if entry.name.name == "input_attachment_index"
+                                && let Some(Expr::IntLit { value, .. }) = entry.args.first()
+                                && let Ok(idx) = value.parse::<u32>()
+                            {
+                                ir_fn.stage_exec_meta.input_attachment_indices.push((desc_idx, idx));
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -4658,6 +4689,20 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 );
                 return Ok(id);
             }
+            "begin_invocation_interlock" => {
+                let id = self
+                    .ir_fn
+                    .emit_typed(IrType::Void, InstData::BeginInvocationInterlockExt);
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "end_invocation_interlock" => {
+                let id = self
+                    .ir_fn
+                    .emit_typed(IrType::Void, InstData::EndInvocationInterlockExt);
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
             "nonuniform" => {
                 let inner = self.require_arg(args, 0, joined, span, out)?;
                 let ty = self.inst_ty(inner).clone();
@@ -6513,6 +6558,8 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 | "store"
                 | "query_size"
                 | "query_levels"
+                | "subpass_load"
+                | "fetch_ms"
                 | "texel_pointer"
         ) {
             return None;
@@ -6724,6 +6771,42 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     InstData::ImageQuerySize {
                         descriptor_index,
                         lod,
+                    },
+                )
+            }
+            "subpass_load" => {
+                let sample = args.first().map(|a| self.lower_expr(&a.value, out));
+                self.ir_fn.emit_typed(
+                    IrType::Vector {
+                        scalar: ScalarIrTy::F32,
+                        len: 4,
+                    },
+                    InstData::SubpassLoad {
+                        descriptor_index,
+                        sample,
+                    },
+                )
+            }
+            "fetch_ms" => {
+                let Some(coord) = args.first().map(|a| self.lower_expr(&a.value, out)) else {
+                    return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
+                };
+                let sample = args
+                    .get(1)
+                    .map(|a| self.lower_expr(&a.value, out))
+                    .unwrap_or_else(|| {
+                        self.ir_fn
+                            .emit_typed(IrType::Scalar(ScalarIrTy::I32), InstData::ConstI32(0))
+                    });
+                self.ir_fn.emit_typed(
+                    IrType::Vector {
+                        scalar: ScalarIrTy::F32,
+                        len: 4,
+                    },
+                    InstData::ImageFetchMs {
+                        descriptor_index,
+                        coord,
+                        sample,
                     },
                 )
             }
