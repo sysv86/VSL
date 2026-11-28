@@ -113,9 +113,7 @@ impl HardwareCaps {
             "mesh_shader" => Some(Self::MESH_SHADER),
             "tessellation" => Some(Self::TESSELLATION),
             "geometry_shader" | "geometry" => Some(Self::GEOMETRY_SHADER),
-            "shader_invocation_reorder" | "ser" | "ser_nv" => {
-                Some(Self::SHADER_INVOCATION_REORDER)
-            }
+            "shader_invocation_reorder" | "ser" | "ser_nv" => Some(Self::SHADER_INVOCATION_REORDER),
             "ser_ext" | "ray_tracing_invocation_reorder" => {
                 Some(Self::SHADER_INVOCATION_REORDER_EXT)
             }

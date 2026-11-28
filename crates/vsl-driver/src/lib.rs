@@ -683,6 +683,15 @@ impl VslCompiler {
             pending.push((entry_idx, func, stage, effective_wg_size, cache_key));
         }
 
+        let debug_source = if options.emit_debug_info {
+            self.sources.get(file).map(|sf| vsl_ir::IrDebugSource {
+                file_name: SmolStr::new(&sf.name),
+                source_text: Some(SmolStr::new(&sf.text)),
+            })
+        } else {
+            None
+        };
+
         // Compile cache-missed entry points (in parallel via `std::thread::scope` when 2+ exist),
         // placing compiled units back into `slots` by original `entry_idx` for deterministic order.
         let compiled_results: Vec<
@@ -699,6 +708,7 @@ impl VslCompiler {
                         stage,
                         wg_size,
                         cache_key,
+                        debug_source.as_ref(),
                     );
                     Ok((entry_idx, cache_key, unit, diags))
                 })
@@ -707,6 +717,7 @@ impl VslCompiler {
             let hir_ref = &hir;
             let items_ref = parsed.unit.items.as_slice();
             let schema_ref = options.pack_schema.as_ref();
+            let debug_ref = debug_source.as_ref();
             std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(pending.len());
                 for (entry_idx, func, stage, wg_size, cache_key) in pending {
@@ -715,6 +726,7 @@ impl VslCompiler {
                     let handle = scope.spawn(move || {
                         let (unit, diags) = compile_single_entry_unit(
                             hir_ref, func, items_ref, schema_ref, stage, wg_size, cache_key,
+                            debug_ref,
                         );
                         (entry_idx, cache_key, unit, diags)
                     });
@@ -857,6 +869,7 @@ impl VslCompiler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_single_entry_unit(
     hir: &HirModule,
     func: &HirFunction,
@@ -865,6 +878,7 @@ fn compile_single_entry_unit(
     stage: ShaderStage,
     workgroup_size: Option<[u32; 3]>,
     cache_key: [u8; 32],
+    debug_source: Option<&vsl_ir::IrDebugSource>,
 ) -> (CompiledShaderUnit, Vec<Diagnostic>) {
     let mut lowered =
         lower_entry_module_to_ir(hir, func, module_items, pack_schema, stage, workgroup_size);
@@ -929,13 +943,10 @@ fn compile_single_entry_unit(
         entry_ir.required_caps |= required_caps;
     }
 
-    if options.emit_debug_info
+    if let Some(dbg) = debug_source
         && let Some(entry_ir) = lowered.ir_module.functions.first_mut()
     {
-        entry_ir.debug_source = Some(vsl_ir::IrDebugSource {
-            file_name: SmolStr::new(source_name),
-            source_text: Some(SmolStr::new(source)),
-        });
+        entry_ir.debug_source = Some(dbg.clone());
     }
     let spirv = emit_module_spirv(&lowered.ir_module);
 
@@ -2398,5 +2409,281 @@ mod tests {
         for unit in &out.units {
             validate_spirv_with_spirv_val(&unit.entry_point, &unit.spirv);
         }
+    }
+
+    fn compile_standalone_and_validate(
+        label: &str,
+        src: &str,
+        emit_debug_info: bool,
+    ) -> Vec<CompiledShaderUnit> {
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
+        opts.abi = AbiProfile::Standalone;
+        opts.active_caps = HardwareCaps::all();
+        opts.emit_debug_info = emit_debug_info;
+        let mut compiler = VslCompiler::new();
+        let out = compiler.compile_shader_source(format!("{label}.vsl"), src, &opts);
+        assert!(
+            !out.has_errors(),
+            "compile `{label}` failed:\n{:?}",
+            out.diagnostics
+        );
+        assert!(!out.units.is_empty(), "compile `{label}` emitted 0 units");
+        for unit in &out.units {
+            validate_spirv_with_spirv_val(&format!("{label}_{}", unit.entry_point), &unit.spirv);
+        }
+        out.units
+    }
+
+    #[test]
+    fn e2e_vulkan14_stages_rt_mesh_task_geom_tess() {
+        // 1. RT Pipeline stages: raygen, closest_hit, any_hit, miss, intersection, callable
+        compile_standalone_and_validate(
+            "e2e_rt_stages",
+            r"
+            @raygen
+            fn rgen(
+                #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+                #[ray_payload(0)] payload: vec4,
+                #[builtin(launch_id)] lid: uvec3,
+                #[builtin(launch_size)] lsize: uvec3,
+            ) {
+                let o: vec3 = vec3(f32(lid.x), f32(lid.y), 0.0);
+                let d: vec3 = vec3(0.0, 0.0, 1.0);
+                trace_ray(tlas, 0u, 255u, 0u, 0u, 0u, o, 0.001, d, 100.0, payload);
+            }
+
+            @closest_hit
+            fn rchit(
+                #[incoming_ray_payload(0)] payload: vec4,
+                #[hit_attribute] bary: vec2,
+                #[builtin(world_ray_origin)] ro: vec3,
+                #[builtin(ray_tmax)] tmax: f32,
+            ) {
+                let x: f32 = ro.x + tmax + bary.x;
+                let _unused: f32 = x;
+            }
+
+            @any_hit
+            fn rahit(#[incoming_ray_payload(0)] payload: vec4) {
+                if payload.x < 0.0 {
+                    ignore_intersection();
+                } else {
+                    terminate_ray();
+                }
+            }
+
+            @miss
+            fn rmiss(#[incoming_ray_payload(0)] payload: vec4) {
+                let _p: f32 = payload.x;
+            }
+
+            @intersection
+            fn rint() {
+                let hit: bool = report_intersection(1.0, 0u);
+                let _h: bool = hit;
+            }
+
+            @callable
+            fn rcall(#[incoming_callable_data(0)] data: vec4) {
+                let _d: f32 = data.x;
+            }
+            ",
+            false,
+        );
+
+        // 2. Task + Mesh stages
+        compile_standalone_and_validate(
+            "e2e_mesh_task",
+            r"
+            @task
+            #[workgroup_size(32, 1, 1)]
+            fn task_main(#[task_payload] payload: u32) {
+                emit_mesh_tasks(1u, 1u, 1u);
+            }
+
+            @mesh
+            #[workgroup_size(32, 1, 1)]
+            #[max_vertices(3)]
+            #[max_primitives(1)]
+            #[output_topology(triangles)]
+            fn mesh_main() {
+                set_mesh_outputs(3u, 1u);
+            }
+            ",
+            false,
+        );
+
+        // 3. Legacy Geometry + Tessellation stages
+        compile_standalone_and_validate(
+            "e2e_geom_tess",
+            r"
+            @geometry
+            #[input_topology(triangles)]
+            #[output_topology(triangle_strip)]
+            #[max_vertices(3)]
+            fn geom_main() {
+                emit_vertex();
+                end_primitive();
+            }
+
+            @tess_control
+            #[output_vertices(3)]
+            fn tcs_main(#[builtin(invocation_id)] iid: u32) {
+                let _i: u32 = iid;
+            }
+
+            @tess_eval
+            #[tess_domain(triangles)]
+            #[tess_spacing(equal)]
+            #[tess_order(ccw)]
+            fn tes_main(#[builtin(tess_coord)] tc: vec3) {
+                let _c: f32 = tc.x;
+            }
+            ",
+            false,
+        );
+    }
+
+    #[test]
+    fn e2e_vulkan14_raster_subgroups_coop_and_debug() {
+        // 1. Raster: EarlyFragmentTests + Interlock + SubpassInput + Texture2DMS + VRS + Multiview
+        compile_standalone_and_validate(
+            "e2e_raster",
+            r"
+            @stage(fragment)
+            #[early_fragment_tests]
+            #[interlock(pixel_ordered)]
+            fn frag_main(
+                #[binding(set = 0, binding = 0)] #[input_attachment_index(0)] sub_in: SubpassInput<f32>,
+                #[binding(set = 0, binding = 1)] ms_tex: Texture2DMS<f32>,
+                #[builtin(view_index)] view: i32,
+                #[builtin(sample_id)] sid: i32,
+                #[builtin(shading_rate)] vrs: i32,
+            ) {
+                begin_invocation_interlock();
+                let a: vec4 = sub_in.subpass_load();
+                let b: vec4 = ms_tex.fetch_ms(ivec2(0, 0), sid);
+                let _sum: f32 = a.x + b.x + f32(view + vrs);
+                end_invocation_interlock();
+            }
+            ",
+            false,
+        );
+
+        // 2. Subgroups + 1D/BufferView textures + DebugInfo.100 + debug_printf
+        compile_standalone_and_validate(
+            "e2e_subgroups_and_debug",
+            r#"
+            @stage(compute(64, 1, 1))
+            fn cs_main(
+                #[binding(set = 0, binding = 0)] tex1d: Texture1D<f32>,
+                #[binding(set = 0, binding = 1)] bufv: BufferView<f32>,
+                #[binding(set = 0, binding = 2)] rw1d: RWImage1D<rgba16f>,
+            ) {
+                let v: f32 = 1.5;
+                let b: f32 = subgroup_broadcast(v, 0u);
+                let m: f32 = subgroup_mul(b);
+                let em: f32 = subgroup_exclusive_mul(m);
+                let im: f32 = subgroup_inclusive_mul(em);
+                let su: f32 = subgroup_shuffle_up(im, 1u);
+                let sd: f32 = subgroup_shuffle_down(su, 1u);
+                let cl: f32 = subgroup_clustered_add(sd, 4u);
+                let qb: f32 = quad_broadcast(cl, 0u);
+                let ba: u32 = subgroup_bit_and(15u);
+                let bo: u32 = subgroup_bit_or(ba);
+                let bx: u32 = subgroup_bit_xor(bo);
+                let bl: bool = subgroup_logical_and(bx > 0u);
+                let bal: uvec4 = subgroup_ballot(bl);
+                let ext: bool = subgroup_ballot_bit_extract(bal, 0u);
+                let lsb: u32 = subgroup_ballot_find_lsb(bal);
+                let msb: u32 = subgroup_ballot_find_msb(bal);
+                debug_printf("qb=%f lsb=%u msb=%u", qb, lsb, msb);
+                let _e: bool = ext;
+            }
+            "#,
+            true,
+        );
+
+        // 3. Cooperative Matrix + Opacity Micromap + Ray Position Fetch
+        compile_standalone_and_validate(
+            "e2e_coop_and_rt_ext",
+            r"
+            #[cap(ray_query, opacity_micromap, ray_tracing_position_fetch)]
+            @stage(compute(32, 1, 1))
+            fn rt_ext_main(
+                #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+            ) {
+                let rq: RayQuery;
+                let flags: u32 = RayFlags::FORCE_OPACITY_MICROMAP_2_STATE;
+                rq.initialize(tlas, flags, 255u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0);
+                let _pos: [vec3; 3] = rq.committed_triangle_vertex_positions();
+            }
+            ",
+            false,
+        );
+
+        // 4. SER (HitObject) end-to-end (both NV and EXT capability profiles)
+        compile_standalone_and_validate(
+            "e2e_ser_nv",
+            r"
+            #[cap(shader_invocation_reorder)]
+            @raygen
+            fn ser_nv_main(
+                #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+                #[ray_payload(0)] payload: vec4,
+            ) {
+                let ho: HitObject;
+                ho.record_empty();
+                ho.trace_ray(tlas, 0u, 255u, 0u, 0u, 0u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0, payload);
+                reorder_thread_with_hit_object(ho, 1u, 2u);
+                if ho.is_hit() {
+                    let _t: f32 = ho.ray_tmax();
+                    let _sbt: u32 = ho.sbt_record_index();
+                    ho.execute_shader(payload);
+                }
+                reorder_thread_with_hint(0u, 1u);
+            }
+            ",
+            false,
+        );
+
+        // 5. Explicit Sampler + Texture2D + Texture1D + RWImage1D
+        compile_standalone_and_validate(
+            "e2e_explicit_sampler",
+            r"
+            @stage(compute(8, 8, 1))
+            fn samp_main(
+                #[binding(set = 0, binding = 0)] tex: Texture2D<f32>,
+                #[binding(set = 0, binding = 1)] samp: Sampler,
+                #[binding(set = 0, binding = 2)] out_img: RWImage2D<rgba16f>,
+                #[builtin(global_invocation_id)] gid: uvec3,
+            ) {
+                let c: vec4 = tex.sample_lod(samp, vec2(0.5, 0.5), 0.0);
+                out_img.store(ivec2(i32(gid.x), i32(gid.y)), c);
+            }
+            ",
+            false,
+        );
+
+        // 6. Cooperative Matrix load / length / store with BDA pointer
+        compile_standalone_and_validate(
+            "e2e_coop_matrix",
+            r"
+            #[cap(float16)]
+            #[push_constant]
+            struct CoopPc {
+                buf: ptr_mut<f16, align = 16>,
+            }
+
+            #[cap(cooperative_matrix, float16)]
+            @stage(compute(32, 1, 1))
+            fn coop_main(pc: CoopPc) {
+                let m: CoopMatAcc<f16, rows = 16, cols = 16> = coop_mat_load(pc.buf, 16u);
+                let _len: u32 = coop_mat_length(m);
+                coop_mat_store(pc.buf, m, 16u);
+            }
+            ",
+            false,
+        );
     }
 }

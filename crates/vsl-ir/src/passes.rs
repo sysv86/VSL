@@ -2424,10 +2424,12 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             value: remap_id(*value, remap),
             lane: remap_id(*lane, remap),
         },
-        InstData::SubgroupBallotBitExtract { ballot, index } => InstData::SubgroupBallotBitExtract {
-            ballot: remap_id(*ballot, remap),
-            index: remap_id(*index, remap),
-        },
+        InstData::SubgroupBallotBitExtract { ballot, index } => {
+            InstData::SubgroupBallotBitExtract {
+                ballot: remap_id(*ballot, remap),
+                index: remap_id(*index, remap),
+            }
+        }
         InstData::SubgroupBallotFindLsb(v) => InstData::SubgroupBallotFindLsb(remap_id(*v, remap)),
         InstData::SubgroupBallotFindMsb(v) => InstData::SubgroupBallotFindMsb(remap_id(*v, remap)),
         InstData::SubgroupShuffleUp { value, delta } => InstData::SubgroupShuffleUp {

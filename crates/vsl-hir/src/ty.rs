@@ -26,11 +26,9 @@ impl LayoutKind {
     }
 }
 
-/// Scalar primitive types supported by VSL 2.0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 /// Element scalar type for `CoopMat<T, R, C, Use>` (`VK_KHR_cooperative_matrix`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CoopMatScalar {
     F16,
     Bf16,
@@ -41,6 +39,9 @@ pub enum CoopMatScalar {
     U32,
 }
 
+/// Scalar primitive types supported by VSL 2.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScalarKind {
     Bool,
     I32,

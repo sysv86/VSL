@@ -6,8 +6,7 @@ use crate::hir::{
     HirImpl, HirModule, HirParam, HirStmt, HirStruct, HirStructField, HirStructId, HirSwitchCase,
     HirTrait, HirTraitMethod, HirWorkgroupVar, SymbolId, SymbolKind,
 };
-use crate::ty::{
-    CoopMatScalar,LayoutKind, ScalarKind, Type, TypeArena, TypeId};
+use crate::ty::{CoopMatScalar, LayoutKind, ScalarKind, Type, TypeArena, TypeId};
 use indexmap::{IndexMap, IndexSet};
 use la_arena::Arena;
 use smol_str::SmolStr;
@@ -6922,12 +6921,12 @@ impl BodyScanner<'_, '_> {
                                 "is_hit" => Some(
                                     self.ctx.module.types.alloc(Type::Scalar(ScalarKind::Bool)),
                                 ),
-                                "ray_tmax" => Some(
-                                    self.ctx.module.types.alloc(Type::Scalar(ScalarKind::F32)),
-                                ),
-                                "sbt_record_index" => Some(
-                                    self.ctx.module.types.alloc(Type::Scalar(ScalarKind::U32)),
-                                ),
+                                "ray_tmax" => {
+                                    Some(self.ctx.module.types.alloc(Type::Scalar(ScalarKind::F32)))
+                                }
+                                "sbt_record_index" => {
+                                    Some(self.ctx.module.types.alloc(Type::Scalar(ScalarKind::U32)))
+                                }
                                 _ => Some(self.ctx.module.types.alloc(Type::Void)),
                             };
                         }
@@ -7559,7 +7558,10 @@ fn infer_rayquery_method_return(method: &str, types: &mut TypeArena) -> Option<T
                 scalar: ScalarKind::F32,
                 len: 3,
             });
-            Type::Array { element: v3, len: 3 }
+            Type::Array {
+                element: v3,
+                len: 3,
+            }
         }
         _ => return None,
     };
@@ -8224,10 +8226,7 @@ fn format_type_name(types: &TypeArena, id: TypeId) -> String {
         Type::RayQuery => "RayQuery".to_owned(),
         Type::HitObject => "HitObject".to_owned(),
         Type::CoopMatrix {
-            scalar,
-            rows,
-            cols,
-            ..
+            scalar, rows, cols, ..
         } => format!("CoopMat<{scalar:?}, {rows}, {cols}>"),
         Type::TypeParam(p) => p.to_string(),
     }
@@ -8904,7 +8903,7 @@ fn lower_type_expr(
                             _ => None,
                         })
                         .unwrap_or(16);
-                    let use_kind = match joined.as_str() {
+                    let use_kind = match name.as_str() {
                         "CoopMatA" => 0,
                         "CoopMatB" => 1,
                         _ => 2,

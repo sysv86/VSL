@@ -244,7 +244,8 @@ impl IrType {
             | Self::Array { .. }
             | Self::RuntimeArray(_)
             | Self::Struct(_)
-            | Self::Pointer { .. } => None,
+            | Self::Pointer { .. }
+            | Self::CoopMatrix { .. } => None,
         }
     }
 
@@ -284,7 +285,7 @@ impl IrType {
     /// Returns the tight byte size of this type (or `0` for `Void`, runtime arrays, and logical pointers).
     pub fn byte_size(&self) -> u32 {
         match self {
-            Self::Void | Self::RuntimeArray(_) => 0,
+            Self::Void | Self::RuntimeArray(_) | Self::CoopMatrix { .. } => 0,
             Self::Scalar(s) => s.byte_size(),
             Self::Vector { scalar, len } => scalar.byte_size().saturating_mul(u32::from(*len)),
             Self::Matrix { scalar, cols, rows } => scalar
@@ -1769,7 +1770,7 @@ impl InstData {
             | Self::DebugLine { .. }
             | Self::Nop => Vec::new(),
             Self::DebugPrintf { args, .. } => args.clone(),
-            Self::SubpassLoad { sample, .. } => sample.into_iter().copied().collect(),
+            Self::SubpassLoad { sample, .. } => sample.iter().copied().collect(),
             Self::ImageFetchMs { coord, sample, .. } => vec![*coord, *sample],
             Self::CoopMatrixLoad { ptr, stride, .. } => {
                 let mut ops = vec![*ptr];

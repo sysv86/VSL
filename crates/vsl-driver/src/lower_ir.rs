@@ -15,12 +15,11 @@ use vsl_hir::{
 };
 use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixLayout, GlslStd450Op, InstData, InstId,
-    IrDescriptorVar,
-    IrFunction, IrInterlockMode, SubgroupClusteredOp, IrInterpolation, IrLocalVar, IrModule, IrParam,
-    IrPushConstantBlock,
-    IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
-    IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,
-    IrType, IrWorkgroupVar, MemoryAccess, ScalarIrTy, StructuredStmt,
+    IrDescriptorVar, IrFunction, IrInterlockMode, IrInterpolation, IrLocalVar, IrModule, IrParam,
+    IrPushConstantBlock, IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar,
+    IrStorageClass, IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing,
+    IrTopology, IrType, IrWorkgroupVar, MemoryAccess, ScalarIrTy, StructuredStmt,
+    SubgroupClusteredOp,
 };
 use vsl_mc::{
     BuiltinStructDesc, DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS,
@@ -337,7 +336,10 @@ fn ir_type_byte_stride(ty: &IrType) -> u32 {
             storage: IrStorageClass::PhysicalStorageBuffer,
             ..
         } => 8,
-        IrType::Void | IrType::RuntimeArray(_) | IrType::Pointer { .. } | IrType::CoopMatrix { .. } => 4,
+        IrType::Void
+        | IrType::RuntimeArray(_)
+        | IrType::Pointer { .. }
+        | IrType::CoopMatrix { .. } => 4,
     }
 }
 
@@ -786,16 +788,24 @@ fn parse_stage_var_attr(attrs: &[Attribute]) -> Option<(IrStorageClass, Option<u
                 }
             });
             match entry.name.name.as_str() {
-                "ray_payload" => return Some((IrStorageClass::RayPayloadKhr, Some(loc.unwrap_or(0)))),
+                "ray_payload" => {
+                    return Some((IrStorageClass::RayPayloadKhr, Some(loc.unwrap_or(0))));
+                }
                 "incoming_ray_payload" => {
-                    return Some((IrStorageClass::IncomingRayPayloadKhr, Some(loc.unwrap_or(0))));
+                    return Some((
+                        IrStorageClass::IncomingRayPayloadKhr,
+                        Some(loc.unwrap_or(0)),
+                    ));
                 }
                 "hit_attribute" => return Some((IrStorageClass::HitAttributeKhr, None)),
                 "callable_data" => {
                     return Some((IrStorageClass::CallableDataKhr, Some(loc.unwrap_or(0))));
                 }
                 "incoming_callable_data" => {
-                    return Some((IrStorageClass::IncomingCallableDataKhr, Some(loc.unwrap_or(0))));
+                    return Some((
+                        IrStorageClass::IncomingCallableDataKhr,
+                        Some(loc.unwrap_or(0)),
+                    ));
                 }
                 "shader_record" | "shader_record_buffer" => {
                     return Some((IrStorageClass::ShaderRecordBufferKhr, None));
@@ -1019,6 +1029,8 @@ struct LowerCtx<'a, 'd> {
     push_constant_fields: IndexMap<SmolStr, u32>,
     ray_query_handles: IndexMap<SmolStr, u32>,
     next_ray_query_id: u32,
+    hit_object_handles: IndexMap<SmolStr, u32>,
+    next_hit_object_id: u32,
     module_consts: IndexMap<SmolStr, HirExpr>,
     spec_defaults: IndexMap<SmolStr, SpecConstantDefault>,
     param_layouts: IndexMap<SmolStr, PackParamLayout>,
@@ -1185,7 +1197,10 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                                 && let Some(Expr::IntLit(value, _)) = entry.args.first()
                                 && let Ok(idx) = value.parse::<u32>()
                             {
-                                ir_fn.stage_exec_meta.input_attachment_indices.push((desc_idx, idx));
+                                ir_fn
+                                    .stage_exec_meta
+                                    .input_attachment_indices
+                                    .push((desc_idx, idx));
                             }
                         }
                     }
@@ -1348,6 +1363,8 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             push_constant_fields,
             ray_query_handles: IndexMap::new(),
             next_ray_query_id: 0,
+            hit_object_handles: IndexMap::new(),
+            next_hit_object_id: 0,
             module_consts,
             spec_defaults,
             param_layouts,
@@ -1382,6 +1399,20 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         next_id
     }
 
+    fn hit_object_id_for_receiver(&mut self, receiver: &HirExpr) -> u32 {
+        let key = match &receiver.kind {
+            HirExprKind::Path { path, .. } => path.clone(),
+            _ => SmolStr::new_static("__default_ho"),
+        };
+        if let Some(&id) = self.hit_object_handles.get(&key) {
+            return id;
+        }
+        let next_id = self.next_hit_object_id;
+        self.next_hit_object_id = self.next_hit_object_id.saturating_add(1);
+        self.hit_object_handles.insert(key, next_id);
+        next_id
+    }
+
     fn clear_local_binding(&mut self, name: &SmolStr) {
         self.ssa_locals.shift_remove(name);
         self.local_var_slots.shift_remove(name);
@@ -1389,6 +1420,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         self.desc_elem_bindings.shift_remove(name);
         self.ptr_meta.shift_remove(name);
         self.ray_query_handles.shift_remove(name);
+        self.hit_object_handles.shift_remove(name);
     }
 
     fn record_local_ptr_meta(&mut self, name: &SmolStr, ty_id: TypeId) {
@@ -1417,6 +1449,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         let saved_desc_elems = self.desc_elem_bindings.clone();
         let saved_ptr_meta = self.ptr_meta.clone();
         let saved_rq = self.ray_query_handles.clone();
+        let saved_ho = self.hit_object_handles.clone();
 
         let mut out = Vec::new();
         for stmt in &block.stmts {
@@ -1433,6 +1466,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         self.desc_elem_bindings = saved_desc_elems;
         self.ptr_meta = saved_ptr_meta;
         self.ray_query_handles = saved_rq;
+        self.hit_object_handles = saved_ho;
 
         (out, tail)
     }
@@ -1473,6 +1507,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     let rq_id = self.next_ray_query_id;
                     self.next_ray_query_id = self.next_ray_query_id.saturating_add(1);
                     self.ray_query_handles.insert(name.clone(), rq_id);
+                    return;
+                }
+                if matches!(self.hir.types.get(*ty), Type::HitObject) {
+                    self.clear_local_binding(name);
+                    let ho_id = self.next_hit_object_id;
+                    self.next_hit_object_id = self.next_hit_object_id.saturating_add(1);
+                    self.hit_object_handles.insert(name.clone(), ho_id);
                     return;
                 }
 
@@ -2604,10 +2645,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 out.push(StructuredStmt::Eval(store));
             }
             if let Some(&var_index) = self.stage_var_indices.get(path) {
-                let store = self.ir_fn.emit_typed(
-                    IrType::Void,
-                    InstData::StoreStageVar { var_index, value },
-                );
+                let store = self
+                    .ir_fn
+                    .emit_typed(IrType::Void, InstData::StoreStageVar { var_index, value });
                 out.push(StructuredStmt::Eval(store));
             }
             if let Some(&kind) = self.builtin_params.get(path) {
@@ -4634,6 +4674,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 return Ok(id);
             }
             "reorder_thread_with_hit_object" => {
+                let hit_object_id = args
+                    .first()
+                    .map_or(0, |a| self.hit_object_id_for_receiver(&a.value));
                 let hint = if args.len() >= 3 {
                     Some(self.require_arg(args, 1, joined, span, out)?)
                 } else {
@@ -4647,7 +4690,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let id = self.ir_fn.emit_typed(
                     IrType::Void,
                     InstData::ReorderThreadWithHitObject {
-                        hit_object_id: 0,
+                        hit_object_id,
                         hint,
                         bits,
                     },
@@ -5074,7 +5117,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let val = self.require_arg(args, 0, joined, span, out)?;
                 self.ir_fn.uses_subgroups = true;
                 let ty = self.inst_ty(val).clone();
-                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupExclusiveMul(val));
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::SubgroupExclusiveMul(val));
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }
@@ -5082,7 +5127,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let val = self.require_arg(args, 0, joined, span, out)?;
                 self.ir_fn.uses_subgroups = true;
                 let ty = self.inst_ty(val).clone();
-                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupInclusiveMul(val));
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::SubgroupInclusiveMul(val));
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }
@@ -5090,7 +5137,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let val = self.require_arg(args, 0, joined, span, out)?;
                 self.ir_fn.uses_subgroups = true;
                 let ty = self.inst_ty(val).clone();
-                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupExclusiveMin(val));
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::SubgroupExclusiveMin(val));
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }
@@ -5098,7 +5147,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let val = self.require_arg(args, 0, joined, span, out)?;
                 self.ir_fn.uses_subgroups = true;
                 let ty = self.inst_ty(val).clone();
-                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupInclusiveMin(val));
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::SubgroupInclusiveMin(val));
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }
@@ -5106,7 +5157,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let val = self.require_arg(args, 0, joined, span, out)?;
                 self.ir_fn.uses_subgroups = true;
                 let ty = self.inst_ty(val).clone();
-                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupExclusiveMax(val));
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::SubgroupExclusiveMax(val));
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }
@@ -5114,7 +5167,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let val = self.require_arg(args, 0, joined, span, out)?;
                 self.ir_fn.uses_subgroups = true;
                 let ty = self.inst_ty(val).clone();
-                let id = self.ir_fn.emit_typed(ty, InstData::SubgroupInclusiveMax(val));
+                let id = self
+                    .ir_fn
+                    .emit_typed(ty, InstData::SubgroupInclusiveMax(val));
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }
@@ -6489,6 +6544,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             return id;
         }
 
+        // Complete SER `HitObject` method suite (`SPV_EXT/NV_shader_invocation_reorder`).
+        if let Some(id) =
+            self.try_lower_hit_object_method(receiver, method.as_str(), args, span, out)
+        {
+            return id;
+        }
+
         // Texture & Storage Image methods.
         if let Some(id) =
             self.try_lower_image_method(receiver, method.as_str(), args, expr_ir_ty, span, out)
@@ -6592,6 +6654,117 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 span,
             ),
         }
+    }
+
+    fn try_lower_hit_object_method(
+        &mut self,
+        receiver: &HirExpr,
+        method: &str,
+        args: &[HirCallArg],
+        span: Span,
+        out: &mut Vec<StructuredStmt>,
+    ) -> Option<InstId> {
+        let is_ho_receiver = matches!(self.hir.types.get(receiver.ty), Type::HitObject)
+            || matches!(&receiver.kind, HirExprKind::Path { path, .. } if self.hit_object_handles.contains_key(path));
+        if !is_ho_receiver {
+            return None;
+        }
+
+        let hit_object_id = self.hit_object_id_for_receiver(receiver);
+        let id = match method {
+            "trace_ray" => {
+                if args.len() < 11 {
+                    return Some(self.emit_diag(
+                        "E0528",
+                        "`HitObject::trace_ray` requires 11 arguments",
+                        span,
+                    ));
+                }
+                let tlas_descriptor_index = match &args[0].value.kind {
+                    HirExprKind::Path { path, .. } => self.resolve_descriptor_path(path),
+                    _ => None,
+                }
+                .or(self.tlas_descriptor_index)
+                .unwrap_or(0);
+                let ray_flags = self.lower_expr(&args[1].value, out);
+                let cull_mask = self.lower_expr(&args[2].value, out);
+                let sbt_offset = self.lower_expr(&args[3].value, out);
+                let sbt_stride = self.lower_expr(&args[4].value, out);
+                let miss_index = self.lower_expr(&args[5].value, out);
+                let origin = self.lower_expr(&args[6].value, out);
+                let t_min = self.lower_expr(&args[7].value, out);
+                let direction = self.lower_expr(&args[8].value, out);
+                let t_max = self.lower_expr(&args[9].value, out);
+                let payload_var_index = match &args[10].value.kind {
+                    HirExprKind::Path { path, .. } => {
+                        self.stage_var_indices.get(path.as_str()).copied()
+                    }
+                    _ => None,
+                }
+                .unwrap_or(0);
+                let id = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::HitObjectTraceRay {
+                        hit_object_id,
+                        tlas_descriptor_index,
+                        ray_flags,
+                        cull_mask,
+                        sbt_offset,
+                        sbt_stride,
+                        miss_index,
+                        origin,
+                        t_min,
+                        direction,
+                        t_max,
+                        payload_var_index,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                id
+            }
+            "record_empty" => {
+                let id = self
+                    .ir_fn
+                    .emit_typed(IrType::Void, InstData::HitObjectRecordEmpty(hit_object_id));
+                out.push(StructuredStmt::Eval(id));
+                id
+            }
+            "is_hit" => self.ir_fn.emit_typed(
+                IrType::Scalar(ScalarIrTy::Bool),
+                InstData::HitObjectIsHit(hit_object_id),
+            ),
+            "ray_tmax" => self.ir_fn.emit_typed(
+                IrType::Scalar(ScalarIrTy::F32),
+                InstData::HitObjectGetRayTMax(hit_object_id),
+            ),
+            "sbt_record_index" => self.ir_fn.emit_typed(
+                IrType::Scalar(ScalarIrTy::U32),
+                InstData::HitObjectGetSbtRecordIndex(hit_object_id),
+            ),
+            "execute_shader" => {
+                let payload_var_index = args
+                    .first()
+                    .and_then(|a| {
+                        if let HirExprKind::Path { path, .. } = &a.value.kind {
+                            self.stage_var_indices.get(path.as_str()).copied()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let id = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::HitObjectExecuteShader {
+                        hit_object_id,
+                        payload_var_index,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                id
+            }
+            _ => return None,
+        };
+        Some(id)
     }
 
     fn try_lower_ray_query_method(
@@ -6860,9 +7033,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 self.hir.types.get(a.value.ty),
                 Type::Sampler | Type::SamplerShadow
             );
-            if is_sampler
-                && let HirExprKind::Path { path, .. } = &a.value.kind
-            {
+            if is_sampler && let HirExprKind::Path { path, .. } = &a.value.kind {
                 sampler_descriptor_index = self.resolve_descriptor_path(path);
             }
             is_sampler
@@ -7081,13 +7252,12 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let Some(coord) = args.first().map(|a| self.lower_expr(&a.value, out)) else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
-                let sample = args.get(1).map_or_else(
-                    || {
-                        self.ir_fn
-                            .emit_typed(IrType::Scalar(ScalarIrTy::I32), InstData::ConstI32(0))
-                    },
-                    |a| self.lower_expr(&a.value, out),
-                );
+                let sample = if let Some(a) = args.get(1) {
+                    self.lower_expr(&a.value, out)
+                } else {
+                    self.ir_fn
+                        .emit_typed(IrType::Scalar(ScalarIrTy::I32), InstData::ConstI32(0))
+                };
                 self.ir_fn.emit_typed(
                     res_ty,
                     InstData::ImageFetchMs {
