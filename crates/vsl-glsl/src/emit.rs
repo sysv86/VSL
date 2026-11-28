@@ -144,6 +144,8 @@ pub(crate) struct EmitCtx {
     pub imported_mc_world: bool,
     pub shadowed_world: bool,
     pub tmp_counter: u32,
+    position_fetch_helpers_emitted: bool,
+    opacity_micromap_mode_emitted: bool,
 }
 
 impl EmitCtx {
@@ -163,6 +165,8 @@ impl EmitCtx {
             imported_mc_world: false,
             shadowed_world: false,
             tmp_counter: 0,
+            position_fetch_helpers_emitted: false,
+            opacity_micromap_mode_emitted: false,
         }
     }
 
@@ -376,6 +380,8 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
         let _ = writeln!(out, "// module {}", module_decl.path.joined());
     }
     out.push('\n');
+
+    emit_ray_query_support(&scan, &mut ctx, &mut out);
 
     // 0. Global `mc::*` scene & bindless resource declarations.
     emit_mc_global_decls(&scan, opts, &mut out);
@@ -718,12 +724,47 @@ pub(crate) fn scan_fn_decl_without_param_inference(func: &FnDecl) -> FeatureScan
     scan
 }
 
+fn emit_ray_query_support(scan: &FeatureScan, ctx: &mut EmitCtx, out: &mut String) {
+    if scan
+        .extensions
+        .contains("GL_EXT_opacity_micromap_ray_query_mode")
+        && !ctx.opacity_micromap_mode_emitted
+    {
+        out.push_str("const bool gl_EnableOpacityMicromapEXT = true;\n\n");
+        ctx.opacity_micromap_mode_emitted = true;
+    }
+    if scan
+        .extensions
+        .contains("GL_EXT_ray_tracing_position_fetch")
+        && !ctx.position_fetch_helpers_emitted
+    {
+        // The GLSL builtin writes an array through an out argument. Wrappers preserve
+        // expression evaluation order and keep the committed selector a literal.
+        for (kind, committed) in [("committed", true), ("candidate", false)] {
+            let _ = writeln!(
+                out,
+                "vec3[3] _vsl_ray_query_{kind}_triangle_vertex_positions(in rayQueryEXT q) {{"
+            );
+            out.push_str("    vec3 positions[3];\n");
+            let _ = writeln!(
+                out,
+                "    rayQueryGetIntersectionTriangleVertexPositionsEXT(q, {committed}, positions);"
+            );
+            out.push_str("    return positions;\n}\n\n");
+        }
+        ctx.position_fetch_helpers_emitted = true;
+    }
+}
+
 pub(crate) fn emit_fn_decl_with_ctx(
     func: &FnDecl,
     self_ty: Option<&str>,
     ctx: &mut EmitCtx,
     out: &mut String,
 ) {
+    if ctx.opts.route_params_to_vs_motion {
+        emit_ray_query_support(&scan_fn_decl_without_param_inference(func), ctx, out);
+    }
     let saved_locals = ctx.local_types.clone();
     let saved_shadowed_world = ctx.shadowed_world;
 
@@ -736,7 +777,10 @@ pub(crate) fn emit_fn_decl_with_ctx(
         } else {
             param.ty.as_ref().map_or_else(
                 || "float".to_owned(),
-                |t| type_to_glsl_with_subst(t, &ctx.generic_subst).0,
+                |t| {
+                    let (base, suffix) = type_to_glsl_with_subst(t, &ctx.generic_subst);
+                    format!("{base}{suffix}")
+                },
             )
         };
         ctx.local_types.insert(param.name.name.clone(), ty_str);
@@ -804,7 +848,10 @@ fn fn_return_glsl_type_with_subst(
 ) -> String {
     func.return_ty.as_ref().map_or_else(
         || "void".to_owned(),
-        |ty| type_to_glsl_with_subst(ty, generic_subst).0,
+        |ty| {
+            let (base, suffix) = type_to_glsl_with_subst(ty, generic_subst);
+            format!("{base}{suffix}")
+        },
     )
 }
 
@@ -1475,7 +1522,7 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
             } else {
                 ("float".to_owned(), String::new())
             };
-            ctx.local_types.insert(name.name.clone(), ty_str.clone());
+            let local_ty = format!("{ty_str}{arr_suffix}");
             let glsl_name = escape_glsl_ident(&name.name);
 
             if let Some(Expr::If {
@@ -1497,6 +1544,7 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
                     ctx,
                     out,
                 );
+                ctx.local_types.insert(name.name.clone(), local_ty);
                 if name.name == "world" {
                     ctx.shadowed_world = true;
                 }
@@ -1513,6 +1561,7 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
                 write_indent(indent, out);
                 let _ = writeln!(out, "{ty_str} {glsl_name}{arr_suffix};");
             }
+            ctx.local_types.insert(name.name.clone(), local_ty);
             if name.name == "world" {
                 ctx.shadowed_world = true;
             }
@@ -2239,6 +2288,12 @@ fn emit_method_call_expr_with_hoist(
         .map(|a| emit_expr_with_hoist(&a.value, indent, ctx, pre_stmts))
         .collect();
 
+    if recv_ty == "rayQueryEXT"
+        && let Some(result) = emit_ray_query_method(method, &recv, &rendered_args)
+    {
+        return result;
+    }
+
     match method {
         "store" => {
             if rendered_args.len() == 2 {
@@ -2319,6 +2374,24 @@ fn emit_method_call_expr_with_hoist(
                 recv
             }
         }
+        _ => {
+            let mangled = format!("{recv_ty}_{method}");
+            let fn_call = if ctx.fn_returns.contains_key(mangled.as_str()) {
+                mangled
+            } else {
+                method.to_owned()
+            };
+            if rendered_args.is_empty() {
+                format!("{fn_call}({recv})")
+            } else {
+                format!("{fn_call}({recv}, {})", rendered_args.join(", "))
+            }
+        }
+    }
+}
+
+fn emit_ray_query_method(method: &str, recv: &str, rendered_args: &[String]) -> Option<String> {
+    Some(match method {
         "initialize" => format!(
             "rayQueryInitializeEXT({recv}, {})",
             rendered_args.join(", ")
@@ -2356,20 +2429,11 @@ fn emit_method_call_expr_with_hoist(
         "committed_barycentrics" => {
             format!("rayQueryGetIntersectionBarycentricsEXT({recv}, true)")
         }
-        _ => {
-            let mangled = format!("{recv_ty}_{method}");
-            let fn_call = if ctx.fn_returns.contains_key(mangled.as_str()) {
-                mangled
-            } else {
-                method.to_owned()
-            };
-            if rendered_args.is_empty() {
-                format!("{fn_call}({recv})")
-            } else {
-                format!("{fn_call}({recv}, {})", rendered_args.join(", "))
-            }
+        "committed_triangle_vertex_positions" | "candidate_triangle_vertex_positions" => {
+            format!("_vsl_ray_query_{method}({recv})")
         }
-    }
+        _ => return None,
+    })
 }
 
 pub(crate) fn type_to_glsl(ty: &TypeExpr) -> (String, String) {
@@ -2541,6 +2605,28 @@ fn resolve_struct_lit_name(path: &Path, fields: &[(Ident, Expr)], ctx: &EmitCtx)
     base
 }
 
+fn ray_query_method_type(method: &str) -> Option<String> {
+    Some(match method {
+        "committed_type"
+        | "candidate_type"
+        | "committed_instance_custom_index"
+        | "committed_instance_id"
+        | "committed_primitive_index"
+        | "committed_geometry_index" => "uint".to_owned(),
+        "committed_object_to_world" | "committed_world_to_object" => "mat4x3".to_owned(),
+        "committed_t" | "candidate_t" => "float".to_owned(),
+        "initialize" | "confirm_intersection" | "terminate" | "generate_intersection" => {
+            "void".to_owned()
+        }
+        "committed_barycentrics" => "vec2".to_owned(),
+        "proceed" | "committed_front_face" => "bool".to_owned(),
+        "committed_triangle_vertex_positions" | "candidate_triangle_vertex_positions" => {
+            "vec3[3]".to_owned()
+        }
+        _ => return None,
+    })
+}
+
 fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
     match expr {
         Expr::BoolLit(_, _) => "bool".to_owned(),
@@ -2563,7 +2649,14 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
             }
         }
         Expr::Path { path, .. } => {
-            let joined = path.joined().replace("::", "_");
+            let path_name = path.joined();
+            if path_name.starts_with("mc::RayFlags::")
+                || path_name.starts_with("mc::HitType::")
+                || path_name == "RayFlags::FORCE_OPACITY_MICROMAP_2_STATE"
+            {
+                return "uint".to_owned();
+            }
+            let joined = path_name.replace("::", "_");
             if let Some(ty) = ctx.local_types.get(joined.as_str()) {
                 return ty.clone();
             }
@@ -2602,7 +2695,15 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
             }
             "float".to_owned()
         }
-        Expr::Index { receiver, .. } => infer_glsl_type(receiver, ctx),
+        Expr::Index { receiver, .. } => {
+            let ty = infer_glsl_type(receiver, ctx);
+            if let Some((base, suffix)) = ty.split_once('[')
+                && let Some((_, rest)) = suffix.split_once(']')
+            {
+                return format!("{base}{rest}");
+            }
+            ty
+        }
         Expr::Unary { op, operand, .. } => match op {
             UnaryOp::Not => "bool".to_owned(),
             _ => infer_glsl_type(operand, ctx),
@@ -2611,6 +2712,11 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
             receiver, method, ..
         } => {
             let recv_ty = infer_glsl_type(receiver, ctx);
+            if recv_ty == "rayQueryEXT"
+                && let Some(ty) = ray_query_method_type(&method.name)
+            {
+                return ty;
+            }
             match method.name.as_str() {
                 "offset" => recv_ty,
                 "load" => ctx
@@ -2618,19 +2724,6 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
                     .get(&recv_ty)
                     .map_or_else(|| "vec4".to_owned(), |b| b.elem_glsl.clone()),
                 "fetch" | "sample" | "sample_lod" => "vec4".to_owned(),
-                "committed_type"
-                | "candidate_type"
-                | "committed_instance_custom_index"
-                | "committed_instance_id"
-                | "committed_primitive_index"
-                | "committed_geometry_index" => "uint".to_owned(),
-                "committed_object_to_world" | "committed_world_to_object" => "mat4x3".to_owned(),
-                "committed_t" | "candidate_t" => "float".to_owned(),
-                "initialize" | "confirm_intersection" | "terminate" | "generate_intersection" => {
-                    "void".to_owned()
-                }
-                "committed_barycentrics" => "vec2".to_owned(),
-                "proceed" | "committed_front_face" => "bool".to_owned(),
                 other => {
                     let mangled = format!("{recv_ty}_{other}");
                     ctx.fn_returns
@@ -2826,7 +2919,23 @@ fn format_path_expr(path: &Path, ctx: &EmitCtx) -> String {
     let joined = path.joined();
     match joined.as_str() {
         "mc::RayFlags::OPAQUE" => "gl_RayFlagsOpaqueEXT".to_owned(),
+        "mc::RayFlags::NONE" => "gl_RayFlagsNoneEXT".to_owned(),
+        "mc::RayFlags::NO_OPAQUE" => "gl_RayFlagsNoOpaqueEXT".to_owned(),
+        "mc::RayFlags::TERMINATE_ON_FIRST_HIT" => "gl_RayFlagsTerminateOnFirstHitEXT".to_owned(),
+        "mc::RayFlags::SKIP_CLOSEST_HIT" => "gl_RayFlagsSkipClosestHitShaderEXT".to_owned(),
+        "mc::RayFlags::CULL_BACK_FACING" => "gl_RayFlagsCullBackFacingTrianglesEXT".to_owned(),
+        "mc::RayFlags::CULL_FRONT_FACING" => "gl_RayFlagsCullFrontFacingTrianglesEXT".to_owned(),
+        "mc::RayFlags::CULL_OPAQUE" => "gl_RayFlagsCullOpaqueEXT".to_owned(),
+        "mc::RayFlags::CULL_NO_OPAQUE" => "gl_RayFlagsCullNoOpaqueEXT".to_owned(),
+        "mc::RayFlags::FORCE_OPACITY_MICROMAP_2_STATE"
+        | "RayFlags::FORCE_OPACITY_MICROMAP_2_STATE" => {
+            "gl_RayFlagsForceOpacityMicromap2StateEXT".to_owned()
+        }
         "mc::HitType::Triangle" => "gl_RayQueryCommittedIntersectionTriangleEXT".to_owned(),
+        "mc::HitType::None" => "gl_RayQueryCommittedIntersectionNoneEXT".to_owned(),
+        "mc::HitType::AABB" | "mc::HitType::Procedural" => {
+            "gl_RayQueryCommittedIntersectionGeneratedEXT".to_owned()
+        }
         "mc::tlas" => "tlas".to_owned(),
         "mc::bindless" => "bindless".to_owned(),
         "mc::sharc_config" | "mc::sharc" => "mc_sharc_config".to_owned(),
@@ -3308,6 +3417,19 @@ fn scan_attrs(attrs: &[Attribute], scan: &mut FeatureScan) {
                                 "ray_query" => {
                                     scan.extensions.insert("GL_EXT_ray_query");
                                 }
+                                "position_fetch" | "ray_tracing_position_fetch" => {
+                                    scan.extensions.insert("GL_EXT_ray_query");
+                                    scan.extensions.insert("GL_EXT_ray_tracing_position_fetch");
+                                }
+                                "omm" | "opacity_micromap" => {
+                                    scan.extensions.insert("GL_EXT_ray_query");
+                                    scan.extensions.insert("GL_EXT_opacity_micromap");
+                                }
+                                "omm_khr" | "opacity_micromap_khr" => {
+                                    scan.extensions.insert("GL_EXT_ray_query");
+                                    scan.extensions
+                                        .insert("GL_EXT_opacity_micromap_ray_query_mode");
+                                }
                                 "int64_atomics" => {
                                     scan.extensions
                                         .insert("GL_EXT_shader_explicit_arithmetic_types_int64");
@@ -3489,6 +3611,13 @@ fn scan_expr_with_subst(
             } else if joined.starts_with("subgroup_") {
                 scan.extensions.insert("GL_KHR_shader_subgroup_basic");
                 scan.extensions.insert("GL_KHR_shader_subgroup_ballot");
+            } else if matches!(
+                joined.as_str(),
+                "mc::RayFlags::FORCE_OPACITY_MICROMAP_2_STATE"
+                    | "RayFlags::FORCE_OPACITY_MICROMAP_2_STATE"
+            ) {
+                scan.extensions.insert("GL_EXT_ray_query");
+                scan.extensions.insert("GL_EXT_opacity_micromap");
             } else if let Some(rest) = joined.strip_prefix("mc::") {
                 mark_mc_global(rest, scan);
             }

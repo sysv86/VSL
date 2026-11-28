@@ -598,6 +598,7 @@ pub(crate) fn build_hook_chain_unit(
         used_specs,
         used_params,
         debug_channels,
+        ray_interfaces: Vec::new(),
         cache_key,
     })
 }

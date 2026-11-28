@@ -1,0 +1,15 @@
+// Read per-record coefficients from the ray-generation SBT record.
+struct RecordCoefficients {
+    gain: vec4,
+    bias: vec4,
+}
+
+@raygen
+fn record_color(
+    #[binding(set = 0, binding = 0)] result: RWImage2D<rgba16f>,
+    #[shader_record] coefficients: RecordCoefficients,
+    #[builtin(launch_id)] pixel: uvec3,
+) {
+    let base = vec4(0.25, 0.5, 0.75, 1.0);
+    result.store(ivec2(pixel.xy), base * coefficients.gain + coefficients.bias);
+}

@@ -137,6 +137,233 @@ mod tests {
         assert!(glsl.contains("vec2 uv = rayQueryGetIntersectionBarycentricsEXT(rq, true);"));
     }
 
+    const POSITION_FETCH_VSL: &str = r"
+        #[cap(ray_query, position_fetch, omm, omm_khr)]
+        @stage(compute(1, 1, 1))
+        fn query_main(
+            #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+            #[binding(set = 0, binding = 1)] result_buf: RWBuffer<f32>,
+        ) {
+            let mut rq: RayQuery;
+            let flags = RayFlags::FORCE_OPACITY_MICROMAP_2_STATE;
+            rq.initialize(tlas, flags, 255u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0);
+            while rq.proceed() {
+                if rq.candidate_type() == 0u {
+                    let candidate = rq.candidate_triangle_vertex_positions();
+                    let first = candidate[0u];
+                    result_buf[0u] = first.x;
+                    rq.confirm_intersection();
+                }
+            }
+            if rq.committed_type() == mc::HitType::Triangle {
+                let committed: [vec3; 3] = rq.committed_triangle_vertex_positions();
+                let second = committed[1u];
+                let third = rq.committed_triangle_vertex_positions()[2u];
+                result_buf[1u] = second.x + third.y;
+            }
+        }
+    ";
+
+    fn emit_standalone_test_shader(src: &str) -> String {
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        emit_glsl_460_with_options(
+            &parsed.unit,
+            EmitOptions {
+                abi: vsl_mc::AbiProfile::Standalone,
+                ..EmitOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn dispatches_ray_query_methods_only_for_ray_query_receivers() {
+        let glsl = emit_standalone_test_shader(
+            r"
+            struct Cursor { value: f32 }
+            impl Cursor {
+                fn initialize(self) -> f32 { self.value }
+                fn proceed(self) -> f32 { self.value }
+                fn committed_type(self) -> vec2 { vec2(self.value, 0.0) }
+                fn committed_triangle_vertex_positions(self) -> u32 { 7u }
+            }
+            #[cap(ray_query)]
+            @stage(compute(1, 1, 1))
+            fn query_main(
+                #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+                #[binding(set = 0, binding = 1)] result_buf: RWBuffer<f32>,
+            ) {
+                let cursor = Cursor { value: 1.0 };
+                let init = cursor.initialize();
+                let step = cursor.proceed();
+                let kind = cursor.committed_type();
+                let vertices = cursor.committed_triangle_vertex_positions();
+                let mut rq: RayQuery;
+                rq.initialize(tlas, mc::RayFlags::OPAQUE, 255u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0);
+                while rq.proceed() {}
+                let hit = rq.committed_type();
+                result_buf[0u] = init + step + kind.x + f32(vertices) + f32(hit);
+            }
+        ",
+        );
+        assert!(
+            glsl.contains("float init = Cursor_initialize(cursor);"),
+            "{glsl}"
+        );
+        assert!(
+            glsl.contains("float step = Cursor_proceed(cursor);"),
+            "{glsl}"
+        );
+        assert!(
+            glsl.contains("vec2 kind = Cursor_committed_type(cursor);"),
+            "{glsl}"
+        );
+        assert!(
+            glsl.contains("uint vertices = Cursor_committed_triangle_vertex_positions(cursor);"),
+            "{glsl}"
+        );
+        assert!(glsl.contains("while (rayQueryProceedEXT(rq))"), "{glsl}");
+        assert!(
+            glsl.contains("uint hit = rayQueryGetIntersectionTypeEXT(rq, true);"),
+            "{glsl}"
+        );
+        assert!(
+            !glsl.contains("GL_EXT_ray_tracing_position_fetch"),
+            "{glsl}"
+        );
+        validate_glsl_if_available("receiver_dispatch", &glsl, false);
+    }
+
+    #[test]
+    fn emits_ray_query_position_fetch_arrays_and_opacity_micromap_modes() {
+        let glsl = emit_standalone_test_shader(POSITION_FETCH_VSL);
+        for expected in [
+            "#extension GL_EXT_ray_query : require",
+            "#extension GL_EXT_ray_tracing_position_fetch : require",
+            "#extension GL_EXT_opacity_micromap : require",
+            "#extension GL_EXT_opacity_micromap_ray_query_mode : require",
+            "const bool gl_EnableOpacityMicromapEXT = true;",
+            "rayQueryGetIntersectionTriangleVertexPositionsEXT(q, true, positions);",
+            "rayQueryGetIntersectionTriangleVertexPositionsEXT(q, false, positions);",
+            "uint flags = gl_RayFlagsForceOpacityMicromap2StateEXT;",
+            "vec3[3] candidate = _vsl_ray_query_candidate_triangle_vertex_positions(rq);",
+            "vec3 first = candidate[0u];",
+            "vec3 committed[3] = _vsl_ray_query_committed_triangle_vertex_positions(rq);",
+            "vec3 second = committed[1u];",
+            "vec3 third = _vsl_ray_query_committed_triangle_vertex_positions(rq)[2u];",
+        ] {
+            assert!(glsl.contains(expected), "missing {expected}:\n{glsl}");
+        }
+        assert_eq!(
+            glsl.matches("const bool gl_EnableOpacityMicromapEXT = true;")
+                .count(),
+            1
+        );
+        let aliases = POSITION_FETCH_VSL.replace(
+            "position_fetch, omm, omm_khr",
+            "ray_tracing_position_fetch, opacity_micromap, opacity_micromap_khr",
+        );
+        assert_eq!(glsl, emit_standalone_test_shader(&aliases));
+    }
+
+    #[test]
+    fn keeps_legacy_and_khr_opacity_micromap_capabilities_independent() {
+        let legacy = emit_standalone_test_shader(&POSITION_FETCH_VSL.replace(", omm_khr", ""));
+        assert!(legacy.contains("#extension GL_EXT_opacity_micromap : require"));
+        assert!(!legacy.contains("GL_EXT_opacity_micromap_ray_query_mode"));
+        assert!(!legacy.contains("gl_EnableOpacityMicromapEXT"));
+        let khr = emit_standalone_test_shader(&POSITION_FETCH_VSL.replace(", omm,", ",").replace(
+            "RayFlags::FORCE_OPACITY_MICROMAP_2_STATE",
+            "mc::RayFlags::OPAQUE",
+        ));
+        assert!(!khr.contains("#extension GL_EXT_opacity_micromap : require"));
+        assert!(khr.contains("#extension GL_EXT_opacity_micromap_ray_query_mode : require"));
+        assert!(khr.contains("const bool gl_EnableOpacityMicromapEXT = true;"));
+    }
+
+    fn validate_glsl_if_available(label: &str, glsl: &str, check_omm_mode: bool) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let path =
+            std::env::temp_dir().join(format!("vsl_glsl_{label}_{}.spv", std::process::id()));
+        let child = Command::new("glslangValidator")
+            .args([
+                "--stdin",
+                "-S",
+                "comp",
+                "-V",
+                "--target-env",
+                "vulkan1.3",
+                "-o",
+            ])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !check_omm_mode => return,
+            Err(err) => panic!("failed to invoke glslangValidator: {err}"),
+        };
+        child
+            .stdin
+            .take()
+            .expect("glslang stdin")
+            .write_all(glsl.as_bytes())
+            .expect("write GLSL");
+        let compiled = child.wait_with_output().expect("wait for glslang");
+        assert!(
+            compiled.status.success(),
+            "glslang failed: {}\n{}\n{glsl}",
+            String::from_utf8_lossy(&compiled.stdout),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let validated = Command::new("spirv-val")
+            .args(["--target-env", "vulkan1.3"])
+            .arg(&path)
+            .output();
+        let disassembled = check_omm_mode.then(|| {
+            Command::new("spirv-dis")
+                .arg(&path)
+                .output()
+                .expect("spirv-dis")
+        });
+        std::fs::remove_file(&path).expect("remove temporary SPIR-V");
+        match validated {
+            Ok(out) => assert!(
+                out.status.success(),
+                "spirv-val: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !check_omm_mode => {}
+            Err(err) => panic!("failed to invoke spirv-val: {err}"),
+        }
+        if let Some(disassembled) = disassembled {
+            assert!(disassembled.status.success());
+            let assembly = String::from_utf8_lossy(&disassembled.stdout);
+            for expected in [
+                "OpRayQueryGetIntersectionTriangleVertexPositionsKHR",
+                "RayTracingOpacityMicromapExecutionModeKHR",
+                "OpacityMicromapIdKHR",
+                "OpConstantTrue",
+            ] {
+                assert!(
+                    assembly.contains(expected),
+                    "missing {expected}:\n{assembly}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires glslang and SPIRV-Tools with 2026 KHR opacity micromap support"]
+    fn validates_generated_ray_query_extensions_with_khronos_tools() {
+        let glsl = emit_standalone_test_shader(POSITION_FETCH_VSL);
+        validate_glsl_if_available("ray_query_extensions", &glsl, true);
+    }
+
     #[test]
     fn emits_trait_and_generic_template_metadata_in_standalone_restir() {
         let parsed = parse_source(FileId(0), RESTIR_VSL);

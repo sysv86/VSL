@@ -26,8 +26,8 @@ use vsl_mc::{
     DESCRIPTOR_SET_SCENE_GLOBALS, DescriptorAccess, DescriptorBinding, DescriptorKind,
     EMISSIVE_LIGHT_LAYOUT, EMISSIVE_LIGHT_SSBO_LAYOUT, HardwareCaps, INSTANCE_META_LAYOUT,
     INSTANCE_META_SSBO_LAYOUT, ImageFormat, PackParamLayout, PackParamType,
-    RESTIR_RESERVOIR_LAYOUT, RESTIR_RESERVOIR_SSBO_LAYOUT, ShaderStage, SpecConstantDefault,
-    TextureDim, WORLD_UBO_LAYOUT, builtin_descriptor_layout,
+    RESTIR_RESERVOIR_LAYOUT, RESTIR_RESERVOIR_SSBO_LAYOUT, RayInterfaceKind, ShaderStage,
+    SpecConstantDefault, TextureDim, WORLD_UBO_LAYOUT, builtin_descriptor_layout,
 };
 use vsl_syntax::ast::{
     Attribute, BinaryOp, Block, Expr, FnDecl, Item, ParamMode, Stmt, TypeArg, TypeExpr, UnaryOp,
@@ -854,45 +854,141 @@ fn has_param_attr(attrs: &[Attribute], name: &str) -> bool {
         .any(|a| a.entries.iter().any(|e| e.name.name.as_str() == name))
 }
 
-fn parse_stage_var_attr(attrs: &[Attribute]) -> Option<(IrStorageClass, Option<u32>)> {
-    for attr in attrs {
-        for entry in &attr.entries {
-            let loc = entry.args.first().and_then(|e| {
-                if let Expr::IntLit(value, _) = e {
-                    value.parse::<u32>().ok()
-                } else {
-                    None
+fn ray_interface_kind(storage: IrStorageClass) -> Option<RayInterfaceKind> {
+    match storage {
+        IrStorageClass::RayPayloadKhr => Some(RayInterfaceKind::RayPayload),
+        IrStorageClass::IncomingRayPayloadKhr => Some(RayInterfaceKind::IncomingRayPayload),
+        IrStorageClass::CallableDataKhr => Some(RayInterfaceKind::CallableData),
+        IrStorageClass::IncomingCallableDataKhr => Some(RayInterfaceKind::IncomingCallableData),
+        IrStorageClass::HitAttributeKhr => Some(RayInterfaceKind::HitAttribute),
+        IrStorageClass::ShaderRecordBufferKhr => Some(RayInterfaceKind::ShaderRecord),
+        _ => None,
+    }
+}
+
+fn parse_stage_var_attr(
+    attrs: &[Attribute],
+    span: Span,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<(IrStorageClass, Option<u32>)> {
+    let mut result = None;
+    for entry in attrs.iter().flat_map(|attr| &attr.entries) {
+        let storage = match entry.name.name.as_str() {
+            "ray_payload" => IrStorageClass::RayPayloadKhr,
+            "incoming_ray_payload" => IrStorageClass::IncomingRayPayloadKhr,
+            "hit_attribute" => IrStorageClass::HitAttributeKhr,
+            "callable_data" => IrStorageClass::CallableDataKhr,
+            "incoming_callable_data" => IrStorageClass::IncomingCallableDataKhr,
+            "shader_record" | "shader_record_buffer" => IrStorageClass::ShaderRecordBufferKhr,
+            "task_payload" => IrStorageClass::TaskPayloadWorkgroupExt,
+            _ => continue,
+        };
+        let loc = if ray_interface_kind(storage).is_some_and(RayInterfaceKind::has_location) {
+            match entry.args.as_slice() {
+                [] => Some(0),
+                [Expr::IntLit(raw, _)] => {
+                    match parse_u64_literal(raw).and_then(|val| u32::try_from(val).ok()) {
+                        Some(value) => Some(value),
+                        None => {
+                            diagnostics.push(Diagnostic::error(
+                                "E0520",
+                                "RT interface location must be a non-negative 32-bit integer",
+                                span,
+                            ));
+                            Some(0)
+                        }
+                    }
                 }
-            });
-            match entry.name.name.as_str() {
-                "ray_payload" => {
-                    return Some((IrStorageClass::RayPayloadKhr, Some(loc.unwrap_or(0))));
-                }
-                "incoming_ray_payload" => {
-                    return Some((
-                        IrStorageClass::IncomingRayPayloadKhr,
-                        Some(loc.unwrap_or(0)),
+                _ => {
+                    diagnostics.push(Diagnostic::error(
+                        "E0520",
+                        "RT interface attribute accepts at most one integer location",
+                        span,
                     ));
+                    Some(0)
                 }
-                "hit_attribute" => return Some((IrStorageClass::HitAttributeKhr, None)),
-                "callable_data" => {
-                    return Some((IrStorageClass::CallableDataKhr, Some(loc.unwrap_or(0))));
-                }
-                "incoming_callable_data" => {
-                    return Some((
-                        IrStorageClass::IncomingCallableDataKhr,
-                        Some(loc.unwrap_or(0)),
-                    ));
-                }
-                "shader_record" | "shader_record_buffer" => {
-                    return Some((IrStorageClass::ShaderRecordBufferKhr, None));
-                }
-                "task_payload" => return Some((IrStorageClass::TaskPayloadWorkgroupExt, None)),
-                _ => {}
             }
+        } else {
+            if !entry.args.is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    "E0520",
+                    "this stage interface attribute does not accept arguments",
+                    span,
+                ));
+            }
+            None
+        };
+        if result.is_some() {
+            diagnostics.push(Diagnostic::error(
+                "E0520",
+                "multiple stage interface attributes on one parameter",
+                span,
+            ));
+        } else {
+            result = Some((storage, loc));
         }
     }
-    None
+    result
+}
+
+fn validate_stage_var(
+    stage: Option<ShaderStage>,
+    param: &vsl_hir::HirParam,
+    storage: IrStorageClass,
+    location: Option<u32>,
+    ty: &IrType,
+    existing: &[IrStageVar],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(kind) = ray_interface_kind(storage) else {
+        return;
+    };
+    let error = |message: String| Diagnostic::error("E0520", message, param.span);
+    if !stage.is_some_and(|stage| kind.allows_stage(stage)) {
+        diagnostics.push(error(format!(
+            "{kind:?} is not allowed in the {stage:?} shader stage"
+        )));
+    }
+    if param.builtin.is_some()
+        || param.is_push_constant
+        || param.explicit_binding.is_some()
+        || param.pack_resource_slot.is_some()
+    {
+        diagnostics.push(error(format!(
+            "RT interface parameter `{}` cannot also be a builtin or descriptor",
+            param.name
+        )));
+    }
+    if existing
+        .iter()
+        .any(|v| v.storage == storage && (!kind.allows_multiple() || v.location == location))
+    {
+        diagnostics.push(error(format!(
+            "duplicate {kind:?} interface at location {location:?}"
+        )));
+    }
+    if (kind == RayInterfaceKind::ShaderRecord
+        || kind == RayInterfaceKind::HitAttribute && stage != Some(ShaderStage::Intersection))
+        && param.mode != ParamMode::In
+    {
+        diagnostics.push(error(format!("{kind:?} is read-only in this shader stage")));
+    }
+    if kind == RayInterfaceKind::HitAttribute
+        && stage == Some(ShaderStage::Intersection)
+        && param.mode != ParamMode::Out
+    {
+        diagnostics.push(error(
+            "intersection hit attributes must be output parameters".into(),
+        ));
+    }
+    if ty.explicit_size_align(LayoutKind::Scalar).is_none() {
+        diagnostics.push(error(format!("{kind:?} requires a fixed-size value type")));
+    }
+    if kind == RayInterfaceKind::ShaderRecord && !matches!(ty, IrType::Struct(_)) {
+        diagnostics.push(error(
+            "shader record requires a fixed-size struct type".into(),
+        ));
+    }
 }
 
 fn parse_stage_exec_meta(attrs: &[Attribute]) -> IrStageExecMeta {
@@ -1171,6 +1267,23 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         }
 
         for (param_pos, param) in func.params.iter().enumerate() {
+            let stage_var = ast_fn
+                .and_then(|f| f.params.get(param_pos))
+                .and_then(|p| parse_stage_var_attr(&p.attrs, param.span, diagnostics));
+            if let Some((storage, location)) = stage_var {
+                let ty = param
+                    .ty
+                    .map_or(IrType::Void, |id| IrType::from_hir_type(&hir.types, id));
+                validate_stage_var(
+                    stage,
+                    param,
+                    storage,
+                    location,
+                    &ty,
+                    &ir_fn.stage_vars,
+                    diagnostics,
+                );
+            }
             if let Some(ref builtin_name) = param.builtin
                 && let Some(kind) = parse_builtin_kind(builtin_name.as_str())
             {
@@ -1201,18 +1314,35 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             }
 
             // RT/Task stage variables (`#[ray_payload]`, `#[hit_attribute]`, `#[callable_data]`, `#[shader_record]`, `#[task_payload]`).
-            if let Some(ast_param) = ast_fn.and_then(|f| f.params.get(param_pos))
-                && let Some((storage, location)) = parse_stage_var_attr(&ast_param.attrs)
-            {
+            if let Some((storage, location)) = stage_var {
                 let ir_ty = param
                     .ty
                     .map_or(IrType::Void, |id| IrType::from_hir_type(&hir.types, id));
+                let record_ty = if storage == IrStorageClass::ShaderRecordBufferKhr {
+                    if param.ty.is_some_and(|ty| hir.types.contains_bool(ty)) {
+                        diagnostics.push(Diagnostic::error(
+                            "E0520",
+                            "bool is not allowed in a shader record block",
+                            param.span,
+                        ));
+                    }
+                    if let IrType::Struct(layout) = &ir_ty {
+                        ir_ty.with_explicit_layout(layout.layout).unwrap_or_else(|| {
+                            diagnostics.push(Diagnostic::error("E0520", "shader record layout overflows or contains an unsupported type", param.span));
+                            ir_ty.clone()
+                        })
+                    } else {
+                        ir_ty.clone()
+                    }
+                } else {
+                    ir_ty.clone()
+                };
                 let var_index = ir_fn.stage_vars.len() as u32;
                 ir_fn.stage_vars.push(IrStageVar {
                     name: param.name.clone(),
                     storage,
                     location,
-                    ty: ir_ty.clone(),
+                    ty: record_ty,
                 });
                 stage_var_indices.insert(param.name.clone(), var_index);
                 let loaded = ir_fn.emit_typed(ir_ty.clone(), InstData::LoadStageVar { var_index });
@@ -4731,6 +4861,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 return Ok(id);
             }
             "ignore_intersection" => {
+                if !args.is_empty() {
+                    return Err(self.emit_diag(
+                        "E0528",
+                        "`ignore_intersection` requires exactly 0 arguments",
+                        span,
+                    ));
+                }
                 let id = self
                     .ir_fn
                     .emit_typed(IrType::Void, InstData::IgnoreIntersectionKhr);
@@ -4738,6 +4875,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 return Ok(id);
             }
             "terminate_ray" => {
+                if !args.is_empty() {
+                    return Err(self.emit_diag(
+                        "E0528",
+                        "`terminate_ray` requires exactly 0 arguments",
+                        span,
+                    ));
+                }
                 let id = self
                     .ir_fn
                     .emit_typed(IrType::Void, InstData::TerminateRayKhr);
@@ -4745,6 +4889,13 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 return Ok(id);
             }
             "report_intersection" => {
+                if args.len() != 2 {
+                    return Err(self.emit_diag(
+                        "E0528",
+                        "`report_intersection` requires exactly 2 arguments",
+                        span,
+                    ));
+                }
                 let hit_t = self.require_arg(args, 0, joined, span, out)?;
                 let hit_kind = self.require_arg(args, 1, joined, span, out)?;
                 let id = self.ir_fn.emit_typed(
@@ -6862,6 +7013,17 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             return None;
         }
 
+        if matches!(
+            method,
+            "record_empty" | "is_hit" | "ray_tmax" | "sbt_record_index"
+        ) && !args.is_empty()
+        {
+            return Some(self.emit_diag(
+                "E0528",
+                format!("`HitObject::{method}` requires exactly 0 arguments"),
+                span,
+            ));
+        }
         let hit_object_id = self.hit_object_id_for_receiver(receiver);
         let id = match method {
             "trace_ray" => {
@@ -6999,6 +7161,40 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             return None;
         }
 
+        if matches!(
+            method,
+            "proceed"
+                | "committed_type"
+                | "candidate_type"
+                | "confirm_intersection"
+                | "terminate"
+                | "committed_t"
+                | "candidate_t"
+                | "committed_instance_id"
+                | "committed_instance_custom_index"
+                | "committed_primitive_index"
+                | "committed_geometry_index"
+                | "committed_object_to_world"
+                | "committed_world_to_object"
+                | "committed_front_face"
+                | "committed_barycentrics"
+                | "committed_triangle_vertex_positions"
+                | "candidate_triangle_vertex_positions"
+        ) && !args.is_empty()
+        {
+            return Some(self.emit_diag(
+                "E0528",
+                format!("`RayQuery::{method}` requires exactly 0 arguments"),
+                span,
+            ));
+        }
+        if method == "generate_intersection" && args.len() != 1 {
+            return Some(self.emit_diag(
+                "E0528",
+                "`RayQuery::generate_intersection` requires exactly 1 argument",
+                span,
+            ));
+        }
         let ray_query_id = self.ray_query_id_for_receiver(receiver);
         let id = match method {
             "initialize" => {

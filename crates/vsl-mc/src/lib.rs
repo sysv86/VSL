@@ -2,6 +2,7 @@
 
 mod contract;
 mod layouts;
+mod ray_interface;
 mod reflection;
 
 pub use contract::{
@@ -19,6 +20,10 @@ pub use layouts::{
     RESTIR_RESERVOIR_LAYOUT, RESTIR_RESERVOIR_SSBO_FIELDS, RESTIR_RESERVOIR_SSBO_LAYOUT,
     SHARC_CONFIG_UBO_FIELDS, SHARC_CONFIG_UBO_LAYOUT, SpecConstantDefault, WORLD_UBO_FIELDS,
     WORLD_UBO_LAYOUT, builtin_descriptor_layout, builtin_struct_layout_by_name,
+};
+pub use ray_interface::{
+    RayInterfaceKind, RayInterfaceLink, RayInterfaceMember, RayInterfaceType, RayInterfaceVariable,
+    RayScalar, ShaderRecordField, ShaderRecordLayout, validate_ray_interface_link,
 };
 pub use reflection::{
     CompiledShaderUnit, DebugChannelBinding, DescriptorAccess, DescriptorBinding, DescriptorKind,

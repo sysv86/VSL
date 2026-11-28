@@ -1,0 +1,16 @@
+// A callable shader applies a simple color transform to shared interface data.
+@raygen
+fn call_color(
+    #[binding(set = 0, binding = 0)] result: RWImage2D<rgba16f>,
+    #[callable_data(2)] inout color: vec4,
+    #[builtin(launch_id)] pixel: uvec3,
+) {
+    color = vec4(0.2, 0.4, 0.6, 1.0);
+    execute_callable(0u, color);
+    result.store(ivec2(pixel.xy), color);
+}
+
+@callable
+fn swap_channels(#[incoming_callable_data(2)] inout color: vec4) {
+    color = vec4(color.z, color.y, color.x, color.w);
+}

@@ -36,7 +36,7 @@ use vsl_pack::{
     EvalConfig, PipelineIr, SchedulePlan, SettingValueIr, evaluate_pack_vsl, validate_and_schedule,
     validate_pass_bindings_against_shader,
 };
-use vsl_spirv::emit_module_spirv;
+use vsl_spirv::{emit_module_spirv, reflect_ray_interfaces};
 use vsl_syntax::ast::{FnDecl, Item};
 use vsl_syntax::{ParseResult, parse_source};
 
@@ -949,6 +949,11 @@ fn compile_single_entry_unit(
         entry_ir.debug_source = Some(dbg.clone());
     }
     let spirv = emit_module_spirv(&lowered.ir_module);
+    let ray_interfaces = lowered
+        .ir_module
+        .functions
+        .first()
+        .map_or_else(Vec::new, reflect_ray_interfaces);
 
     let unit = CompiledShaderUnit {
         entry_point: func.name.clone(),
@@ -962,6 +967,7 @@ fn compile_single_entry_unit(
         used_specs,
         used_params,
         debug_channels,
+        ray_interfaces,
         cache_key,
     };
     (unit, lowered.diagnostics)
@@ -2491,6 +2497,114 @@ mod tests {
     }
 
     #[test]
+    fn rt_stage_requires_pipeline_feature_and_reflects_it() {
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
+        opts.abi = AbiProfile::Standalone;
+        let source = "@miss fn background() {}";
+        let missing =
+            VslCompiler::new().compile_shader_source("missing_pipeline.vsl", source, &opts);
+        assert!(missing.has_errors());
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("RAY_TRACING_PIPELINE"))
+        );
+        opts.active_caps |= HardwareCaps::RAY_TRACING_PIPELINE;
+        let enabled =
+            VslCompiler::new().compile_shader_source("enabled_pipeline.vsl", source, &opts);
+        assert!(!enabled.has_errors(), "{:?}", enabled.diagnostics);
+        assert!(
+            enabled.units[0]
+                .required_caps
+                .contains(HardwareCaps::RAY_TRACING_PIPELINE)
+        );
+        validate_spirv_with_spirv_val("enabled_pipeline", &enabled.units[0].spirv);
+    }
+
+    #[test]
+    fn rt_interface_declarations_and_intrinsic_arities_are_checked() {
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier3PathTracing);
+        opts.abi = AbiProfile::Standalone;
+        opts.active_caps = HardwareCaps::all();
+        let cases = [
+            (
+                "@raygen fn main(#[ray_payload(0)] a: vec4, #[ray_payload(0)] b: vec4) {}",
+                "duplicate RayPayload",
+            ),
+            (
+                "@miss fn main(#[incoming_ray_payload(0)] a: vec4, #[incoming_ray_payload(1)] b: vec4) {}",
+                "duplicate IncomingRayPayload",
+            ),
+            (
+                "@raygen fn main(#[hit_attribute] a: vec2) {}",
+                "not allowed",
+            ),
+            (
+                "@raygen fn main(#[shader_record] a: f32) {}",
+                "requires a fixed-size struct",
+            ),
+            (
+                "@closest_hit fn main(#[hit_attribute] out a: vec2) {}",
+                "read-only",
+            ),
+            (
+                "@intersection fn main(#[hit_attribute] a: vec2) {}",
+                "must be output parameters",
+            ),
+            (
+                "@raygen fn main(#[ray_payload(1, 2)] a: vec4) {}",
+                "at most one integer location",
+            ),
+            (
+                "@raygen fn main(#[ray_payload(4294967296)] a: vec4) {}",
+                "32-bit integer",
+            ),
+            (
+                "@raygen fn main(#[ray_payload(0)] #[callable_data(0)] a: vec4) {}",
+                "multiple stage interface attributes",
+            ),
+            (
+                "@any_hit fn main() { ignore_intersection(1u); }",
+                "requires exactly 0 arguments",
+            ),
+            (
+                "@any_hit fn main() { terminate_ray(1u); }",
+                "requires exactly 0 arguments",
+            ),
+            (
+                "@intersection fn main() { report_intersection(1.0, 0u, 1u); }",
+                "requires exactly 2 arguments",
+            ),
+            (
+                "#[cap(ser_nv)] @raygen fn main() { let ho: HitObject; ho.record_empty(1u); }",
+                "requires exactly 0 arguments",
+            ),
+            (
+                "#[cap(ray_query)] @stage(compute(1, 1, 1)) fn main() { let mut rq: RayQuery; rq.proceed(1u); }",
+                "requires exactly 0 arguments",
+            ),
+            (
+                "#[cap(ray_query)] @stage(compute(1, 1, 1)) fn main() { let mut rq: RayQuery; rq.generate_intersection(1.0, 2.0); }",
+                "requires exactly 1 argument",
+            ),
+        ];
+        for (src, expected) in cases {
+            let result =
+                VslCompiler::new().compile_shader_source("invalid_interface.vsl", src, &opts);
+            assert!(result.has_errors(), "invalid RT interface compiled: {src}");
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains(expected)),
+                "{src}: expected {expected}: {:?}",
+                result.diagnostics
+            );
+        }
+    }
+
+    #[test]
     fn rt_calls_require_matching_interface_storage_classes() {
         let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
         opts.abi = AbiProfile::Standalone;
@@ -2637,6 +2751,223 @@ mod tests {
             let units = compile_standalone_and_validate(cap, &src, false);
             assert_rt_payload_reloaded(&units[0].spirv, &[trace_op, execute_op]);
         }
+    }
+
+    fn spirv_instructions(words: &[u32]) -> impl Iterator<Item = (u32, &[u32])> {
+        let mut cursor = 5;
+        std::iter::from_fn(move || {
+            if cursor == words.len() {
+                return None;
+            }
+            let count = (words[cursor] >> 16) as usize;
+            assert!(
+                count > 0 && cursor + count <= words.len(),
+                "malformed SPIR-V instruction"
+            );
+            let opcode = words[cursor] & 0xffff;
+            let operands = &words[cursor + 1..cursor + count];
+            cursor += count;
+            Some((opcode, operands))
+        })
+    }
+
+    #[test]
+    fn opacity_micromap_profiles_emit_independent_capabilities_and_modes() {
+        for (label, caps, flags, expect_flag, expect_mode) in [
+            (
+                "legacy",
+                "ray_query, opacity_micromap",
+                "RayFlags::FORCE_OPACITY_MICROMAP_2_STATE",
+                true,
+                false,
+            ),
+            ("khr", "ray_query, omm_khr", "0u", false, true),
+            (
+                "combined",
+                "ray_query, omm, opacity_micromap_khr",
+                "RayFlags::FORCE_OPACITY_MICROMAP_2_STATE",
+                true,
+                true,
+            ),
+            ("plain", "ray_query", "0u", false, false),
+        ] {
+            let src = format!(
+                r"
+                #[cap({caps})]
+                @stage(compute(1, 1, 1))
+                fn query_main(#[binding(set = 0, binding = 0)] tlas: AccelerationStructure) {{
+                    let rq: RayQuery;
+                    rq.initialize(tlas, {flags}, 255u, vec3(0.0), 0.001, vec3(0.0, 0.0, 1.0), 10.0);
+                    while rq.proceed() {{
+                        if rq.candidate_type() == 0u {{ rq.confirm_intersection(); }}
+                    }}
+                }}
+            "
+            );
+            let units = compile_standalone_and_validate(label, &src, false);
+            let words = &units[0].spirv;
+            let caps: Vec<_> = spirv_instructions(words)
+                .filter(|(op, _)| *op == 17)
+                .map(|(_, args)| args[0])
+                .collect();
+            assert_eq!(caps.contains(&5381), expect_flag, "{label}");
+            assert_eq!(caps.contains(&6032), expect_mode, "{label}");
+            let modes: Vec<_> = spirv_instructions(words)
+                .filter(|(op, args)| *op == 331 && args[1] == 6031)
+                .collect();
+            assert_eq!(modes.len(), usize::from(expect_mode), "{label}");
+            if let Some((_, args)) = modes.first() {
+                let constant_id = args[2];
+                assert!(
+                    spirv_instructions(words)
+                        .any(|(op, operands)| op == 41 && operands[1] == constant_id)
+                );
+            }
+            assert_eq!(
+                units[0]
+                    .required_caps
+                    .contains(HardwareCaps::OPACITY_MICROMAP_KHR),
+                expect_mode
+            );
+        }
+    }
+
+    #[test]
+    fn ray_interfaces_reflect_recursive_payload_types_and_explicit_links() {
+        use vsl_mc::{
+            RayInterfaceKind, RayInterfaceLink, RayInterfaceType, RayScalar,
+            validate_ray_interface_link,
+        };
+        let units = compile_standalone_and_validate(
+            "rt_interface_links",
+            r"
+            struct Payload { radiance: vec3, depth: u32, samples: [f32; 2] }
+            struct Equivalent { rgb: vec3, level: u32, values: [f32; 2] }
+            struct Incompatible { rgb: vec3, level: i32, values: [f32; 2] }
+            @raygen
+            fn rgen(#[ray_payload(0)] payload: Payload, #[callable_data(3)] data: vec2) {}
+            @closest_hit
+            fn rchit(#[incoming_ray_payload(0)] payload: Equivalent) {}
+            @miss
+            fn mismatch(#[incoming_ray_payload(0)] payload: Incompatible) {}
+            @miss
+            fn wrong_location(#[incoming_ray_payload(2)] payload: Equivalent) {}
+            @callable
+            fn callable_main(#[incoming_callable_data(3)] data: vec2) {}
+            @intersection
+            fn rint(#[hit_attribute] out attr: vec2) { attr = vec2(0.5); report_intersection(1.0, 0u); }
+            @any_hit
+            fn rahit(#[hit_attribute] attr: vec2) {}
+            ",
+            false,
+        );
+        let unit = |name: &str| units.iter().find(|u| u.entry_point == name).unwrap();
+        let rgen = unit("rgen");
+        assert_eq!(rgen.ray_interfaces.len(), 2);
+        let payload = &rgen.ray_interfaces[0];
+        assert_eq!(payload.kind, RayInterfaceKind::RayPayload);
+        assert_eq!(payload.location, Some(0));
+        assert_eq!(payload.ty.logical_byte_size(), Some(24));
+        let RayInterfaceType::Struct { fields, .. } = &payload.ty else {
+            panic!("missing payload struct");
+        };
+        assert_eq!(
+            fields[1].ty,
+            RayInterfaceType::Scalar {
+                scalar: RayScalar::U32
+            }
+        );
+        assert!(payload.record_layout.is_none());
+        let trace = RayInterfaceLink::Trace {
+            caller_kind: RayInterfaceKind::RayPayload,
+            location: 0,
+        };
+        assert!(validate_ray_interface_link(rgen, unit("rchit"), trace).is_ok());
+        assert!(
+            validate_ray_interface_link(rgen, unit("mismatch"), trace)
+                .unwrap_err()
+                .contains("type mismatch")
+        );
+        assert!(
+            validate_ray_interface_link(rgen, unit("wrong_location"), trace)
+                .unwrap_err()
+                .contains("location mismatch")
+        );
+        assert!(
+            validate_ray_interface_link(rgen, unit("callable_main"), trace)
+                .unwrap_err()
+                .contains("invalid shader stages")
+        );
+        assert!(
+            validate_ray_interface_link(
+                rgen,
+                unit("callable_main"),
+                RayInterfaceLink::Callable {
+                    caller_kind: RayInterfaceKind::CallableData,
+                    location: 3,
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_ray_interface_link(
+                unit("rint"),
+                unit("rahit"),
+                RayInterfaceLink::ProceduralHit
+            )
+            .is_ok()
+        );
+        let serialized = serde_json::to_string(rgen).unwrap();
+        let roundtrip: CompiledShaderUnit = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(*rgen, roundtrip);
+    }
+
+    #[test]
+    fn shader_record_reflection_uses_emitted_array_and_matrix_strides() {
+        let units = compile_standalone_and_validate(
+            "rt_record_layout",
+            r"
+            #[layout(scalar)]
+            struct Inner { values: [f32; 2] }
+            #[layout(std140)]
+            struct Record {
+                tag: u32,
+                points: [vec3; 2],
+                transform: mat2,
+                inner: Inner,
+            }
+            @raygen
+            fn rgen(
+                #[shader_record] record: Record,
+                #[binding(set = 0, binding = 0)] result: RWBuffer<f32>,
+            ) {
+                result[0u] = f32(record.tag) + record.points[1].x + record.transform[0].x + record.inner.values[1];
+            }
+            ",
+            false,
+        );
+        let unit = &units[0];
+        assert_eq!(unit.ray_interfaces.len(), 1);
+        let variable = &unit.ray_interfaces[0];
+        assert_eq!(variable.kind, vsl_mc::RayInterfaceKind::ShaderRecord);
+        assert_eq!(variable.location, None);
+        assert_eq!(unit.descriptors.len(), 1);
+        let layout = variable.record_layout.as_ref().unwrap();
+        assert_eq!((layout.byte_size, layout.alignment), (112, 16));
+        assert_eq!(
+            layout
+                .fields
+                .iter()
+                .map(|f| (f.byte_offset, f.byte_size))
+                .collect::<Vec<_>>(),
+            [(0, 4), (16, 32), (48, 32), (80, 32)]
+        );
+        assert_eq!(layout.fields[1].array_stride, Some(16));
+        assert_eq!(layout.fields[2].matrix_stride, Some(16));
+        let nested = layout.fields[3].nested.as_ref().unwrap();
+        assert_eq!(nested.fields[0].array_stride, Some(16));
+        assert!(spirv_instructions(&unit.spirv).any(|(op, args)| op == 71 && args[1..] == [6, 16]));
+        assert!(spirv_instructions(&unit.spirv).any(|(op, args)| op == 72 && args[2..] == [7, 16]));
     }
 
     #[test]

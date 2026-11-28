@@ -97,6 +97,8 @@ bitflags! {
         const MULTIVIEW                     = 1 << 17;
         const SAMPLE_RATE_SHADING           = 1 << 18;
         const INPUT_ATTACHMENT              = 1 << 19;
+        /// Opts ray-query traversal into VK_KHR_opacity_micromap execution mode.
+        const OPACITY_MICROMAP_KHR           = 1 << 20;
     }
 }
 
@@ -118,6 +120,7 @@ impl HardwareCaps {
                 Some(Self::SHADER_INVOCATION_REORDER_EXT)
             }
             "opacity_micromap" | "omm" => Some(Self::OPACITY_MICROMAP),
+            "opacity_micromap_khr" | "omm_khr" => Some(Self::OPACITY_MICROMAP_KHR),
             "ray_tracing_position_fetch" | "position_fetch" => {
                 Some(Self::RAY_TRACING_POSITION_FETCH)
             }

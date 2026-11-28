@@ -359,6 +359,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     "used_specs": unit.used_specs,
                     "used_params": unit.used_params,
                     "debug_channels": unit.debug_channels,
+                    "ray_interfaces": unit.ray_interfaces,
                     "cache_key": unit.cache_key,
                 }));
             }

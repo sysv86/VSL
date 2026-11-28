@@ -1347,6 +1347,7 @@ kind = "transfer"
             used_specs: Vec::new(),
             used_params: Vec::new(),
             debug_channels: Vec::new(),
+            ray_interfaces: Vec::new(),
             cache_key: [0u8; 32],
         }
     }

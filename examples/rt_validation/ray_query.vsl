@@ -1,0 +1,24 @@
+// Compute a distance-and-barycentrics diagnostic for each invocation.
+#[cap(ray_query)]
+@stage(compute(8, 8, 1))
+fn query_image(
+    #[binding(set = 0, binding = 0)] scene: AccelerationStructure,
+    #[binding(set = 0, binding = 1)] result: RWImage2D<rgba16f>,
+    #[builtin(global_invocation_id)] pixel: uvec3,
+) {
+    let origin = vec3(f32(pixel.x) * 0.01, f32(pixel.y) * 0.01, -2.0);
+    let direction = vec3(0.0, 0.0, 1.0);
+    let mut query: RayQuery;
+    query.initialize(scene, 0u, 255u, origin, 0.01, direction, 64.0);
+    while query.proceed() {
+        if query.candidate_type() == 0u {
+            query.confirm_intersection();
+        }
+    }
+    let mut color = vec4(0.0);
+    if query.committed_type() == 1u {
+        let uv = query.committed_barycentrics();
+        color = vec4(uv.x, uv.y, query.committed_t() / 64.0, 1.0);
+    }
+    result.store(ivec2(pixel.xy), color);
+}

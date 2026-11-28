@@ -3,7 +3,8 @@ use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixScalar, GlslStd450Op, InstData, InstId,
     IrDescriptorVar, IrFunction, IrInterlockMode, IrInterpolation, IrModule, IrPushConstantBlock,
     IrStorageClass, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology, IrType,
-    IrWorkgroupVar, ScalarIrTy, SpecConstantOpKind, StructuredStmt, SubgroupClusteredOp,
+    IrWorkgroupVar, LayoutKind, ScalarIrTy, SpecConstantOpKind, StructuredStmt,
+    SubgroupClusteredOp,
 };
 use vsl_mc::{
     DescriptorAccess, DescriptorKind, HardwareCaps, ImageFormat, SampleScalar, ShaderStage,
@@ -396,9 +397,13 @@ impl SpirvEmitter {
         mode: spirv::ExecutionMode,
         id_operands: &[u32],
     ) {
+        self.emit_execution_mode_id_raw(entry_id, mode as u32, id_operands);
+    }
+
+    fn emit_execution_mode_id_raw(&mut self, entry_id: u32, mode: u32, id_operands: &[u32]) {
         let mut operands = Vec::with_capacity(2 + id_operands.len());
         operands.push(entry_id);
-        operands.push(mode as u32);
+        operands.push(mode);
         operands.extend_from_slice(id_operands);
         push_inst(
             &mut self.execution_modes,
@@ -604,6 +609,11 @@ impl SpirvEmitter {
     }
 
     fn emit_ir_type_with_layout(&mut self, ty: &IrType, in_block: bool) -> u32 {
+        self.emit_ir_type_in_layout(ty, in_block.then_some(LayoutKind::Std430))
+    }
+
+    fn emit_ir_type_in_layout(&mut self, ty: &IrType, layout: Option<LayoutKind>) -> u32 {
+        let in_block = layout.is_some();
         match ty {
             IrType::Void => self.emit_type_void(),
             IrType::Scalar(scalar) => match scalar {
@@ -637,15 +647,22 @@ impl SpirvEmitter {
                 self.emit_type_matrix(col_ty, u32::from((*cols).clamp(2, 4)))
             }
             IrType::Array { element, len } => {
-                let elem_ty = self.emit_ir_type_with_layout(element, in_block);
+                let elem_ty = self.emit_ir_type_in_layout(element, layout);
                 let u32_ty = self.emit_type_int(32, 0);
                 let len_const = self.emit_constant_32(u32_ty, (*len).max(1));
-                let stride = in_block.then(|| ir_type_stride(element));
+                let stride = layout.map(|mode| {
+                    element
+                        .explicit_array_stride(mode)
+                        .unwrap_or_else(|| ir_type_stride(element))
+                });
                 self.emit_type_array_with_stride(elem_ty, len_const, stride)
             }
             IrType::RuntimeArray(element) => {
-                let elem_ty = self.emit_ir_type_with_layout(element, true);
-                let stride = ir_type_stride(element);
+                let mode = layout.unwrap_or(LayoutKind::Std430);
+                let elem_ty = self.emit_ir_type_in_layout(element, Some(mode));
+                let stride = element
+                    .explicit_array_stride(mode)
+                    .unwrap_or_else(|| ir_type_stride(element));
                 self.emit_type_runtime_array_with_stride(elem_ty, Some(stride))
             }
             IrType::Struct(layout) => self.emit_struct_type(layout, false, in_block),
@@ -759,15 +776,16 @@ impl SpirvEmitter {
                 .iter()
                 .map(|field| {
                     if explicit && let IrType::RuntimeArray(elem) = &field.ty {
-                        let elem_ty = self.emit_ir_type_with_layout(elem, true);
+                        let elem_ty = self.emit_ir_type_in_layout(elem, Some(layout.layout));
                         let stride = if field.byte_size > 0 {
                             field.byte_size
                         } else {
-                            ir_type_stride(elem)
+                            elem.explicit_array_stride(layout.layout)
+                                .unwrap_or_else(|| ir_type_stride(elem))
                         };
                         self.emit_type_runtime_array_with_stride(elem_ty, Some(stride))
                     } else {
-                        self.emit_ir_type_with_layout(&field.ty, explicit)
+                        self.emit_ir_type_in_layout(&field.ty, explicit.then_some(layout.layout))
                     }
                 })
                 .collect()
@@ -797,12 +815,7 @@ impl SpirvEmitter {
                         spirv::Decoration::Offset,
                         &[field.byte_offset],
                     );
-                    let mat_stride = matrix_col_stride(&field.ty).or_else(|| match &field.ty {
-                        IrType::Array { element, .. } | IrType::RuntimeArray(element) => {
-                            matrix_col_stride(element)
-                        }
-                        _ => None,
-                    });
+                    let mat_stride = field.ty.explicit_matrix_stride(layout.layout);
                     if let Some(col_stride) = mat_stride {
                         self.emit_member_decorate(
                             struct_ty,
@@ -1205,7 +1218,7 @@ const fn map_ir_storage_class(sc: IrStorageClass) -> spirv::StorageClass {
     }
 }
 
-fn ir_type_stride(ty: &IrType) -> u32 {
+pub(crate) fn ir_type_stride(ty: &IrType) -> u32 {
     match ty {
         IrType::Scalar(s) => s.byte_size(),
         IrType::Vector { scalar, len: 3 } => scalar.byte_size().saturating_mul(4),
@@ -1264,7 +1277,7 @@ fn ir_type_align(ty: &IrType) -> u32 {
     }
 }
 
-fn matrix_col_stride(ty: &IrType) -> Option<u32> {
+pub(crate) fn matrix_col_stride(ty: &IrType) -> Option<u32> {
     match ty {
         IrType::Matrix { scalar, rows, .. } => {
             let col_elems = if *rows == 3 { 4 } else { u32::from(*rows) };
@@ -1824,7 +1837,14 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
     }
     if caps.contains(HardwareCaps::OPACITY_MICROMAP) {
         emitter.emit_capability_raw(5381); // RayTracingOpacityMicromapEXT
-        emitter.emit_extension("SPV_EXT_opacity_micromap");
+        if !caps.contains(HardwareCaps::OPACITY_MICROMAP_KHR) {
+            emitter.emit_extension("SPV_EXT_opacity_micromap");
+        }
+    }
+    if caps.contains(HardwareCaps::OPACITY_MICROMAP_KHR) {
+        // SPV_KHR_opacity_micromap: the execution mode is independent of the legacy ray flag.
+        emitter.emit_capability_raw(6032); // RayTracingOpacityMicromapExecutionModeKHR
+        emitter.emit_extension("SPV_KHR_opacity_micromap");
     }
     let uses_rq_pos_fetch = module.functions.iter().any(|f| {
         f.insts
@@ -1855,6 +1875,7 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
     if uses_ray_query
         || uses_rq_pos_fetch
         || caps.contains(HardwareCaps::RAY_QUERY)
+        || caps.contains(HardwareCaps::OPACITY_MICROMAP_KHR)
         || (uses_accel_struct && !uses_rt_pipeline)
     {
         emitter.emit_capability(spirv::Capability::RayQueryKHR);
@@ -2392,6 +2413,14 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                 ShaderStage::Geometry => spirv::ExecutionModel::Geometry as u32,
             };
             pending_entry_points.push((exec_model_raw, fn_id, func.name.to_string()));
+            if func
+                .required_caps
+                .contains(HardwareCaps::OPACITY_MICROMAP_KHR)
+            {
+                let bool_ty = emitter.emit_type_bool();
+                let enabled = emitter.emit_constant_bool(bool_ty, true);
+                emitter.emit_execution_mode_id_raw(fn_id, 6031, &[enabled]); // OpacityMicromapIdKHR
+            }
             if stage == ShaderStage::Fragment {
                 emitter.emit_execution_mode(fn_id, spirv::ExecutionMode::OriginUpperLeft, &[]);
                 if writes_frag_depth {
@@ -7310,10 +7339,27 @@ impl FnLowerCtx<'_> {
             }
             InstData::LoadStageVar { var_index } => {
                 if let Some(sv) = self.stage_vars.get(var_index as usize) {
+                    let sv = *sv;
                     let res = self.emitter.alloc_id();
                     self.emitter
                         .emit_fn_inst(spirv::Op::Load, &[sv.val_ty, res, sv.var_id]);
-                    (res, sv.val_ty)
+                    if self.func.stage_vars[var_index as usize].storage
+                        == IrStorageClass::ShaderRecordBufferKhr
+                    {
+                        // A shader record uses decorated memory types. Copy into the ordinary
+                        // SSA type before field extraction or passing it to a helper function.
+                        let value_ty = self.emitter.emit_ir_type(&self.func.insts[id].ir_ty);
+                        if value_ty != sv.val_ty {
+                            let value = self.emitter.alloc_id();
+                            self.emitter
+                                .emit_fn_inst(spirv::Op::CopyLogical, &[value_ty, value, res]);
+                            (value, value_ty)
+                        } else {
+                            (res, sv.val_ty)
+                        }
+                    } else {
+                        (res, sv.val_ty)
+                    }
                 } else {
                     let u32_ty = self.u32_ty();
                     (self.emit_zero_const(u32_ty), u32_ty)

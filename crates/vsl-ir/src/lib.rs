@@ -1,7 +1,9 @@
 //! Structured SSA intermediate representation and deterministic legalization passes.
 
+mod memory_layout;
 pub mod passes;
 pub mod ssa;
+pub use vsl_hir::LayoutKind;
 
 pub use passes::{
     ConstFoldPass, CopyPropPass, DeadCodeEliminationPass, DeadStoreElimPass, IrPass, LicmPass,

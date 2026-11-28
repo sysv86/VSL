@@ -90,6 +90,9 @@ pub struct CompiledShaderUnit {
     pub used_specs: Vec<SpecConstantUsage>,
     pub used_params: Vec<PackParamBinding>,
     pub debug_channels: Vec<DebugChannelBinding>,
+    /// Ray tracing stage interfaces and shader record layout; absent for raster/compute units.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ray_interfaces: Vec<crate::RayInterfaceVariable>,
     /// BLAKE3 L2 artifact hash covering `(entry_point_hir_hash, tier, caps, used_specs, driver_uuid)`.
     pub cache_key: [u8; 32],
 }

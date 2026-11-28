@@ -3343,6 +3343,12 @@ impl LowerCtx<'_> {
             parse_fn_attribute(attr, func, &mut parsed_attrs, self.diags);
         }
 
+        // A ray tracing entry point requires the pipeline feature even when it
+        // has no explicit trace instruction (for example, a constant miss shader).
+        if parsed_attrs.stage.is_some_and(ShaderStage::is_ray_tracing) {
+            parsed_attrs.required_caps |= HardwareCaps::RAY_TRACING_PIPELINE;
+        }
+
         // Check required caps against active device caps.
         let missing_caps = parsed_attrs.required_caps.difference(self.active_caps);
         if !missing_caps.is_empty() {

@@ -175,7 +175,7 @@ pub fn compute_l2_artifact_hash(
     driver_uuid: &[u8; 16],
 ) -> L2ArtifactHash {
     let mut l1_hasher = blake3::Hasher::new();
-    l1_hasher.update(b"vsl2-l2-spv-v2:");
+    l1_hasher.update(b"vsl2-l2-spv-v3:");
     l1_hasher.update(&entry_point_hir_hash.0);
     l1_hasher.update(entry_point_name.as_bytes());
     l1_hasher.update(&[active_tier.as_u8()]);

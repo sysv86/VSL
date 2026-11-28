@@ -1,0 +1,17 @@
+// Use the cross-vendor EXT profile for deferred shader invocation.
+#[cap(ser_ext)]
+@raygen
+fn deferred_ext(
+    #[binding(set = 0, binding = 0)] scene: AccelerationStructure,
+    #[binding(set = 0, binding = 1)] result: RWImage2D<rgba16f>,
+    #[ray_payload(0)] inout color: vec4,
+    #[builtin(launch_id)] pixel: uvec3,
+) {
+    color = vec4(0.0);
+    let origin = vec3(f32(pixel.x) * 0.01, f32(pixel.y) * 0.01, -2.0);
+    let hit: HitObject;
+    hit.trace_ray(scene, 0u, 255u, 0u, 0u, 0u, origin, 0.01, vec3(0.0, 0.0, 1.0), 64.0, color);
+    reorder_thread_with_hit_object(hit, pixel.x & 3u, 2u);
+    hit.execute_shader(color);
+    result.store(ivec2(pixel.xy), color);
+}
