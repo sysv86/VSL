@@ -139,6 +139,22 @@ structures, using the KHR extension without enabling the legacy EXT extension.
 A two-state, level-zero micromap produced `[0, 0]` for transparent geometry
 and `[501, 0]` for opaque geometry in both the native and GLSL backends.
 
+Legacy EXT opacity micromap execution was checked separately with
+`VK_EXT_opacity_micromap`, without enabling the KHR extension. Both backends
+produced the expected hit/miss results for the two-state format. With the
+four-state format and `FORCE_OPACITY_MICROMAP_2_STATE`, all four encoded
+states were tested at subdivision level zero:
+
+| Encoded state | Expected hit/miss | Native SPIR-V | GLSL |
+| --- | --- | --- | --- |
+| 0 (transparent) | `[0, 0]` | `[0, 0]` | `[0, 0]` |
+| 1 (opaque) | `[501, 0]` | `[501, 0]` | `[501, 0]` |
+| 2 (unknown transparent) | `[0, 0]` | `[0, 0]` | `[0, 0]` |
+| 3 (unknown opaque) | `[501, 0]` | `[501, 0]` | `[501, 0]` |
+
+The expected classification follows the two-state override table in the
+[Vulkan ray traversal specification](https://docs.vulkan.org/spec/latest/chapters/raytraversal.html).
+
 Slang 2026.23 was also used as an independent compiler for equivalent inline
 ray-query and ray-tracing-pipeline shaders. Both Slang outputs produced the
 same `[501, 0]` result as VSL on the same GPU and scene.
@@ -154,8 +170,8 @@ The optional script requires Slang, glslangValidator and SPIRV-Tools. It
 validates binaries but does not execute GPU dispatches. The development host
 programs were temporary fixtures outside the compiler workspace. Hardware
 results cover the tested RTX 3050 and scenes, not every driver, micromap
-format, subdivision level, or shader configuration. Legacy EXT micromap
-execution and performance benchmarking were not covered by these tests.
+format, subdivision level, or shader configuration. Performance benchmarking
+was not covered by these tests.
 
 ## Scope and references
 

@@ -14,11 +14,12 @@ command -v spirv-val >/dev/null
 cargo build -p vsl-cli --release
 compiler="${VSL_COMPILER:-$root/target/release/vslc}"
 
-for name in ray_query position_fetch omm_khr; do
+for name in ray_query position_fetch omm_khr omm_ext; do
     flags=(--abi standalone --tier 3)
     case "$name" in
         position_fetch) flags+=(--cap position_fetch) ;;
         omm_khr) flags+=(--cap omm_khr) ;;
+        omm_ext) flags+=(--cap omm) ;;
     esac
     "$compiler" emit-spv "$here/$name.vsl" "${flags[@]}" --out "$out/$name.vsl.spv"
     "$compiler" emit-glsl "$here/$name.vsl" --abi standalone --out "$out/$name.comp"
@@ -39,8 +40,8 @@ while IFS= read -r -d '' binary; do
     spirv-val --target-env vulkan1.4 "$binary"
     count=$((count + 1))
 done < <(find "$out" -name '*.spv' -type f -print0)
-if (( count != 13 )); then
-    printf 'Expected 13 SPIR-V modules, found %d\n' "$count" >&2
+if (( count != 15 )); then
+    printf 'Expected 15 SPIR-V modules, found %d\n' "$count" >&2
     exit 1
 fi
 printf 'Validated %d differential SPIR-V modules. Artifacts: %s\n' "$count" "$out"
