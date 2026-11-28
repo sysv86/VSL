@@ -5578,6 +5578,7 @@ fn max_ray_query_id_plus_one(func: &IrFunction) -> u32 {
     for (_, inst) in func.insts.iter() {
         let rq = match inst.data {
             InstData::RayQueryInitialize { ray_query_id, .. }
+            | InstData::RayQueryTriangleVertexPositions { ray_query_id, .. }
             | InstData::RayQueryGenerateIntersection { ray_query_id, .. } => Some(ray_query_id),
             InstData::RayQueryProceed(id)
             | InstData::RayQueryCommittedType(id)
@@ -5856,25 +5857,15 @@ fn remap_inlined_resource_indices(data: &mut InstData, res: &InlineResourceRemap
             tlas_descriptor_index,
             ..
         } => {
-            if let Some(&mapped) = res.desc_map.get(tlas_descriptor_index) {
+            if let Some(&mapped) = res.desc_remap.get(*tlas_descriptor_index as usize) {
                 *tlas_descriptor_index = mapped;
-            }
-        }
-        InstData::SubpassLoad {
-            descriptor_index, ..
-        }
-        | InstData::ImageFetchMs {
-            descriptor_index, ..
-        } => {
-            if let Some(&mapped) = res.desc_map.get(descriptor_index) {
-                *descriptor_index = mapped;
             }
         }
         InstData::HitObjectTraceRay {
             tlas_descriptor_index,
             ..
         } => {
-            if let Some(&mapped) = res.desc_map.get(tlas_descriptor_index) {
+            if let Some(&mapped) = res.desc_remap.get(*tlas_descriptor_index as usize) {
                 *tlas_descriptor_index = mapped;
             }
         }

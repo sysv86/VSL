@@ -570,7 +570,40 @@ fn format_hir_type(types: &TypeArena, ty_id: TypeId) -> String {
         Type::Buffer { element } => format!("Buffer<{}>", format_hir_type(types, *element)),
         Type::RwBuffer { element } => format!("RWBuffer<{}>", format_hir_type(types, *element)),
         Type::AccelStruct => "AccelStruct".to_owned(),
+        Type::Texture1D { sample_scalar } => {
+            format!("Texture1D<{}>", format_scalar_kind(*sample_scalar))
+        }
+        Type::Texture2DMS { sample_scalar } => {
+            format!("Texture2DMS<{}>", format_scalar_kind(*sample_scalar))
+        }
+        Type::BufferView { sample_scalar } => {
+            format!("BufferView<{}>", format_scalar_kind(*sample_scalar))
+        }
+        Type::SubpassInput { sample_scalar, ms } => {
+            if *ms {
+                format!("SubpassInputMS<{}>", format_scalar_kind(*sample_scalar))
+            } else {
+                format!("SubpassInput<{}>", format_scalar_kind(*sample_scalar))
+            }
+        }
+        Type::RwImage1D(fmt) => format!("RWImage1D<{fmt:?}>"),
+        Type::RwBufferView(fmt) => format!("RWBufferView<{fmt:?}>"),
         Type::RayQuery => "RayQuery".to_owned(),
+        Type::HitObject => "HitObject".to_owned(),
+        Type::CoopMatrix {
+            scalar, rows, cols, ..
+        } => {
+            let s = match scalar {
+                vsl_hir::CoopMatScalar::F16 => "f16",
+                vsl_hir::CoopMatScalar::Bf16 => "bf16",
+                vsl_hir::CoopMatScalar::F32 => "f32",
+                vsl_hir::CoopMatScalar::I8 => "i8",
+                vsl_hir::CoopMatScalar::U8 => "u8",
+                vsl_hir::CoopMatScalar::I32 => "i32",
+                vsl_hir::CoopMatScalar::U32 => "u32",
+            };
+            format!("CoopMat<{s}, {rows}, {cols}>")
+        }
         Type::TypeParam(name) => name.to_string(),
     }
 }

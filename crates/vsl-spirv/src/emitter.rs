@@ -700,6 +700,7 @@ impl SpirvEmitter {
                     CoopMatrixScalar::F16 => self.emit_type_float(16),
                     CoopMatrixScalar::Bf16 => {
                         self.emit_capability_raw(5116); // BFloat16TypeKHR
+                        self.emit_capability_raw(5118); // BFloat16CooperativeMatrixKHR
                         self.emit_extension("SPV_KHR_bfloat16");
                         let key = TypeKey::Float(0xBF16);
                         if let Some(&id) = self.type_cache.get(&key) {
@@ -1234,7 +1235,7 @@ fn ir_type_stride(ty: &IrType) -> u32 {
             storage: IrStorageClass::PhysicalStorageBuffer,
             ..
         } => 8,
-        IrType::Void | IrType::RuntimeArray(_) | IrType::Pointer { .. } => 4,
+        IrType::Void | IrType::RuntimeArray(_) | IrType::Pointer { .. } | IrType::CoopMatrix { .. } => 4,
     }
 }
 
@@ -1263,7 +1264,7 @@ fn ir_type_align(ty: &IrType) -> u32 {
             storage: IrStorageClass::PhysicalStorageBuffer,
             ..
         } => 8,
-        IrType::Void | IrType::Pointer { .. } => 4,
+        IrType::Void | IrType::Pointer { .. } | IrType::CoopMatrix { .. } => 4,
     }
 }
 
@@ -2369,8 +2370,8 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                     let (cap_raw, mode_raw) = match interlock {
                         IrInterlockMode::PixelOrdered => (5378, 5366),
                         IrInterlockMode::PixelUnordered => (5378, 5367),
-                        IrInterlockMode::SampleOrdered => (5379, 5368),
-                        IrInterlockMode::SampleUnordered => (5379, 5369),
+                        IrInterlockMode::SampleOrdered => (5363, 5368),
+                        IrInterlockMode::SampleUnordered => (5363, 5369),
                     };
                     emitter.emit_capability_raw(cap_raw);
                     emitter.emit_execution_mode_raw(fn_id, mode_raw, &[]);
@@ -2537,7 +2538,7 @@ fn map_texture_dim(dim: Option<TextureDim>) -> (spirv::Dim, u32, u32, u32, u32) 
         TextureDim::Dim3D => (spirv::Dim::Dim3D, 0, 3, 3, 3),
         TextureDim::DimCube => (spirv::Dim::DimCube, 0, 3, 3, 2),
         TextureDim::DimBuffer => (spirv::Dim::DimBuffer, 0, 1, 1, 1),
-        TextureDim::SubpassData => (spirv::Dim::SubpassData, 0, 2, 2, 2),
+        TextureDim::SubpassData | TextureDim::SubpassDataMS => (spirv::Dim::DimSubpassData, 0, 2, 2, 2),
     }
 }
 
@@ -2630,12 +2631,13 @@ fn emit_descriptor_var(
         DescriptorKind::InputAttachment => {
             emitter.emit_capability(spirv::Capability::InputAttachment);
             let sampled_ty = map_sample_scalar(emitter, desc.sample_scalar);
+            let ms = u32::from(desc.dim == Some(TextureDim::SubpassDataMS));
             let img_ty = emitter.emit_type_image(
                 sampled_ty,
                 spirv::Dim::DimSubpassData,
                 0,
                 0,
-                0,
+                ms,
                 2,
                 spirv::ImageFormat::Unknown,
             );
@@ -3043,6 +3045,12 @@ fn emit_builtin_var(
     let var_id = emitter.emit_variable(ptr_ty, sc);
     emitter.emit_name(var_id, name);
     emitter.emit_decorate(var_id, spirv::Decoration::BuiltIn, &[spv_builtin]);
+    if matches!(kind, BuiltinKind::TessLevelOuter | BuiltinKind::TessLevelInner) {
+        emitter.emit_decorate(var_id, spirv::Decoration::Patch, &[]);
+    }
+    if kind == BuiltinKind::CullPrimitiveExt {
+        emitter.emit_decorate_raw(var_id, 5271, &[]); // PerPrimitiveEXT
+    }
     EmittedBuiltinVar {
         var_id,
         value_ty,
@@ -3875,6 +3883,17 @@ impl FnLowerCtx<'_> {
         target_elem_ty: u32,
         coord_components: u32,
     ) -> u32 {
+        if coord_components <= 1 {
+            if let Some((comp_ty, _)) = self.vector_component_info(coord_ty) {
+                let raw_c = self.emitter.alloc_id();
+                self.emitter.emit_fn_inst(
+                    spirv::Op::CompositeExtract,
+                    &[comp_ty, raw_c, raw_coord_id, 0],
+                );
+                return self.coerce_to_ty(raw_c, comp_ty, target_elem_ty);
+            }
+            return self.coerce_to_ty(raw_coord_id, coord_ty, target_elem_ty);
+        }
         let coord_vec_ty = self
             .emitter
             .emit_type_vector(target_elem_ty, coord_components);
@@ -5523,7 +5542,7 @@ impl FnLowerCtx<'_> {
                     } else {
                         u32_ty
                     };
-                    let res_ty = self.emitter.emit_type_vector(elem_ty, desc.size_components);
+                    let res_ty = if desc.size_components <= 1 { elem_ty } else { self.emitter.emit_type_vector(elem_ty, desc.size_components) };
                     let res = self.emitter.alloc_id();
                     if desc.kind == DescriptorKind::StorageImage {
                         self.emitter
@@ -6634,13 +6653,21 @@ impl FnLowerCtx<'_> {
                             (res, bi.scalar_ty)
                         }
                     } else {
-                        (loaded, bi.scalar_ty)
+                        (loaded, bi.value_ty)
                     }
                 } else {
                     let ty = match kind {
-                        BuiltinKind::FragCoord | BuiltinKind::Position | BuiltinKind::FragDepth => {
-                            self.f32_ty()
-                        }
+                        BuiltinKind::FragCoord
+                        | BuiltinKind::Position
+                        | BuiltinKind::FragDepth
+                        | BuiltinKind::WorldRayOriginKhr
+                        | BuiltinKind::WorldRayDirectionKhr
+                        | BuiltinKind::ObjectRayOriginKhr
+                        | BuiltinKind::ObjectRayDirectionKhr
+                        | BuiltinKind::TessCoord
+                        | BuiltinKind::SamplePosition
+                        | BuiltinKind::ClipDistance
+                        | BuiltinKind::CullDistance => self.f32_ty(),
                         BuiltinKind::FrontFacing => self.bool_ty(),
                         _ => self.u32_ty(),
                     };
@@ -7441,8 +7468,7 @@ impl FnLowerCtx<'_> {
             } => {
                 let u32_ty = self.u32_ty();
                 let ptr_id = self.ensure_inst(ptr);
-                let mat_ir_ty = self.func.insts[id].ir_ty.clone();
-                let mat_ty = self.emitter.emit_ir_type(&mat_ir_ty);
+                let mat_ty = self.emitter.emit_ir_type(&self.func.insts[id].ir_ty);
                 let layout_id = self.emitter.emit_constant_32(u32_ty, layout as u32);
                 let res = self.emitter.alloc_id();
                 let mut ops = vec![mat_ty, res, ptr_id, layout_id];
@@ -7521,7 +7547,7 @@ impl FnLowerCtx<'_> {
                         let res_ty = self.emitter.emit_type_vector(desc.sampled_ty, 4);
                         let res = self.emitter.alloc_id();
                         if let Some(s) = sample {
-                            let s_id = self.get_val(s);
+                            let s_id = self.ensure_inst(s);
                             self.emitter.emit_fn_inst(
                                 spirv::Op::ImageRead,
                                 &[res_ty, res, img_id, zero_coord, 0x40, s_id],
@@ -7555,8 +7581,8 @@ impl FnLowerCtx<'_> {
             } => {
                 let f32_ty = self.f32_ty();
                 let vec4_ty = self.emitter.emit_type_vector(f32_ty, 4);
-                let coord_id = self.get_val(coord);
-                let sample_id = self.get_val(sample);
+                let coord_id = self.ensure_inst(coord);
+                let sample_id = self.ensure_inst(sample);
                 if let Some(desc) = self.descriptors.get(descriptor_index as usize).cloned() {
                     if let Some(img_id) = self.load_raw_image(&desc) {
                         let res_ty = self.emitter.emit_type_vector(desc.sampled_ty, 4);
@@ -9854,8 +9880,8 @@ fn encode_literal_string(s: &str) -> Vec<u32> {
 mod tests {
     use super::*;
     use vsl_ir::{
-        IrLocalVar, IrParam, IrPass, IrStageIoVar, LowerBdaOffsetsPass, MemoryAccess,
-        PropagateNonUniformPass,
+        CoopMatrixUse, IrLocalVar, IrParam, IrPass, IrStageIoVar, IrStageVar, LowerBdaOffsetsPass,
+        MemoryAccess, PropagateNonUniformPass,
     };
     use vsl_mc::BINDLESS_IMAGE_COUNT;
 
@@ -12987,7 +13013,7 @@ mod tests {
                 len: 3,
             },
             InstData::CompositeConstruct {
-                components: vec![f0, f0, f0],
+                elems: vec![f0, f0, f0],
             },
         );
         let dir = rg.emit_typed(
@@ -12996,22 +13022,22 @@ mod tests {
                 len: 3,
             },
             InstData::CompositeConstruct {
-                components: vec![f0, f0, f1],
+                elems: vec![f0, f0, f1],
             },
         );
         let trace = rg.emit_typed(
             IrType::Void,
             InstData::TraceRayKhr {
-                accel_descriptor_index: 0,
+                tlas_descriptor_index: 0,
                 ray_flags: u0,
                 cull_mask: u0,
                 sbt_offset: u0,
                 sbt_stride: u0,
                 miss_index: u0,
                 origin: orig,
-                tmin: f0,
+                t_min: f0,
                 direction: dir,
-                tmax: f100,
+                t_max: f100,
                 payload_var_index: 0,
             },
         );
@@ -13075,7 +13101,7 @@ mod tests {
         cm.stage = Some(ShaderStage::Compute);
         cm.workgroup_size = Some([32, 1, 1]);
         let mat_ty = IrType::CoopMatrix {
-            scalar: CoopMatrixScalar::F16,
+            component: CoopMatrixScalar::F16,
             scope: AtomicScope::Subgroup,
             rows: 16,
             cols: 16,

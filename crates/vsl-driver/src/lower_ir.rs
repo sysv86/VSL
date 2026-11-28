@@ -63,7 +63,7 @@ pub(crate) fn lower_entry_module_to_ir(
         &entry_fn.reflection.descriptor_types,
         Some(stage),
         workgroup_size,
-        stage == ShaderStage::Compute,
+        stage.allows_workgroup_vars(),
         None,
         &mut diagnostics,
     );
@@ -92,7 +92,7 @@ pub(crate) fn lower_entry_module_to_ir(
             &entry_fn.reflection.descriptor_types,
             None,
             None,
-            stage == ShaderStage::Compute,
+            stage.allows_workgroup_vars(),
             inherited_push_constants.as_ref(),
             &mut diagnostics,
         );
@@ -337,7 +337,7 @@ fn ir_type_byte_stride(ty: &IrType) -> u32 {
             storage: IrStorageClass::PhysicalStorageBuffer,
             ..
         } => 8,
-        IrType::Void | IrType::RuntimeArray(_) | IrType::Pointer { .. } => 4,
+        IrType::Void | IrType::RuntimeArray(_) | IrType::Pointer { .. } | IrType::CoopMatrix { .. } => 4,
     }
 }
 
@@ -779,7 +779,7 @@ fn parse_stage_var_attr(attrs: &[Attribute]) -> Option<(IrStorageClass, Option<u
     for attr in attrs {
         for entry in &attr.entries {
             let loc = entry.args.first().and_then(|e| {
-                if let Expr::IntLit { value, .. } = e {
+                if let Expr::IntLit(value, _) = e {
                     value.parse::<u32>().ok()
                 } else {
                     None
@@ -813,7 +813,7 @@ fn parse_stage_exec_meta(attrs: &[Attribute]) -> IrStageExecMeta {
     for attr in attrs {
         for entry in &attr.entries {
             let first_u32 = entry.args.first().and_then(|e| {
-                if let Expr::IntLit { value, .. } = e {
+                if let Expr::IntLit(value, _) = e {
                     value.parse::<u32>().ok()
                 } else {
                     None
@@ -1129,6 +1129,17 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 ssa_locals.insert(param.name.clone(), loaded);
                 if matches!(param.mode, ParamMode::Out | ParamMode::InOut) {
                     let slot = alloc_local_var(ir_fn, param.name.clone(), ir_ty.clone());
+                    if param.mode == ParamMode::InOut {
+                        let addr = emit_local_addr(ir_fn, slot, &ir_ty);
+                        let init_st = ir_fn.emit_typed(
+                            IrType::Void,
+                            InstData::LocalStore {
+                                ptr: addr,
+                                value: loaded,
+                            },
+                        );
+                        entry_preamble.push(StructuredStmt::Eval(init_st));
+                    }
                     local_var_slots.insert(param.name.clone(), (slot, ir_ty));
                 }
                 continue;
@@ -1171,7 +1182,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     for attr in &ast_param.attrs {
                         for entry in &attr.entries {
                             if entry.name.name == "input_attachment_index"
-                                && let Some(Expr::IntLit { value, .. }) = entry.args.first()
+                                && let Some(Expr::IntLit(value, _)) = entry.args.first()
                                 && let Ok(idx) = value.parse::<u32>()
                             {
                                 ir_fn.stage_exec_meta.input_attachment_indices.push((desc_idx, idx));
@@ -2646,8 +2657,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     return final_val;
                 }
                 let stage_out = self.stage_io_outputs.get(path).copied();
+                let stage_var_out = self.stage_var_indices.get(path).copied();
                 let builtin_out = self.builtin_params.get(path).copied();
-                if stage_out.is_some() || builtin_out.is_some() {
+                if stage_out.is_some() || stage_var_out.is_some() || builtin_out.is_some() {
                     let shadow = self.local_var_slots.get(path).cloned();
                     let final_val = if op == BinaryOp::Assign {
                         rhs_val
@@ -2684,6 +2696,16 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         let store = self.ir_fn.emit_typed(
                             IrType::Void,
                             InstData::StoreStageOutput {
+                                var_index,
+                                value: final_val,
+                            },
+                        );
+                        out.push(StructuredStmt::Eval(store));
+                    }
+                    if let Some(var_index) = stage_var_out {
+                        let store = self.ir_fn.emit_typed(
+                            IrType::Void,
+                            InstData::StoreStageVar {
                                 var_index,
                                 value: final_val,
                             },
@@ -3871,9 +3893,17 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 && let Some(comps) = parse_swizzle_str(field.as_str())
             {
                 let scalar = match kind {
-                    BuiltinKind::FragCoord | BuiltinKind::Position | BuiltinKind::FragDepth => {
-                        ScalarIrTy::F32
-                    }
+                    BuiltinKind::FragCoord
+                    | BuiltinKind::Position
+                    | BuiltinKind::FragDepth
+                    | BuiltinKind::WorldRayOriginKhr
+                    | BuiltinKind::WorldRayDirectionKhr
+                    | BuiltinKind::ObjectRayOriginKhr
+                    | BuiltinKind::ObjectRayDirectionKhr
+                    | BuiltinKind::TessCoord
+                    | BuiltinKind::SamplePosition
+                    | BuiltinKind::ClipDistance
+                    | BuiltinKind::CullDistance => ScalarIrTy::F32,
                     BuiltinKind::VertexIndex | BuiltinKind::InstanceIndex => ScalarIrTy::I32,
                     BuiltinKind::FrontFacing => ScalarIrTy::Bool,
                     _ => ScalarIrTy::U32,
@@ -4679,10 +4709,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 return Ok(id);
             }
             "coop_mat_length" => {
-                let mat_ty = args
-                    .first()
-                    .map(|a| IrType::from_hir_type(&self.hir.types, a.value.ty))
-                    .unwrap_or(IrType::Void);
+                let mat_ty = args.first().map_or(IrType::Void, |a| {
+                    IrType::from_hir_type(&self.hir.types, a.value.ty)
+                });
                 let id = self.ir_fn.emit_typed(
                     IrType::Scalar(ScalarIrTy::U32),
                     InstData::CoopMatrixLength { mat_ty },
@@ -6832,7 +6861,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 Type::Sampler | Type::SamplerShadow
             );
             if is_sampler
-                && let HirExprKind::Path(path) = &a.value.kind
+                && let HirExprKind::Path { path, .. } = &a.value.kind
             {
                 sampler_descriptor_index = self.resolve_descriptor_path(path);
             }
@@ -7041,10 +7070,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             "subpass_load" => {
                 let sample = args.first().map(|a| self.lower_expr(&a.value, out));
                 self.ir_fn.emit_typed(
-                    IrType::Vector {
-                        scalar: ScalarIrTy::F32,
-                        len: 4,
-                    },
+                    res_ty,
                     InstData::SubpassLoad {
                         descriptor_index,
                         sample,
@@ -7055,18 +7081,15 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let Some(coord) = args.first().map(|a| self.lower_expr(&a.value, out)) else {
                     return Some(self.ir_fn.emit_typed(IrType::Void, InstData::Nop));
                 };
-                let sample = args
-                    .get(1)
-                    .map(|a| self.lower_expr(&a.value, out))
-                    .unwrap_or_else(|| {
+                let sample = args.get(1).map_or_else(
+                    || {
                         self.ir_fn
                             .emit_typed(IrType::Scalar(ScalarIrTy::I32), InstData::ConstI32(0))
-                    });
-                self.ir_fn.emit_typed(
-                    IrType::Vector {
-                        scalar: ScalarIrTy::F32,
-                        len: 4,
                     },
+                    |a| self.lower_expr(&a.value, out),
+                );
+                self.ir_fn.emit_typed(
+                    res_ty,
                     InstData::ImageFetchMs {
                         descriptor_index,
                         coord,

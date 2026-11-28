@@ -6,7 +6,8 @@ use crate::hir::{
     HirImpl, HirModule, HirParam, HirStmt, HirStruct, HirStructField, HirStructId, HirSwitchCase,
     HirTrait, HirTraitMethod, HirWorkgroupVar, SymbolId, SymbolKind,
 };
-use crate::ty::{LayoutKind, ScalarKind, Type, TypeArena, TypeId};
+use crate::ty::{
+    CoopMatScalar,LayoutKind, ScalarKind, Type, TypeArena, TypeId};
 use indexmap::{IndexMap, IndexSet};
 use la_arena::Arena;
 use smol_str::SmolStr;
@@ -4891,29 +4892,33 @@ fn classify_resource_type(ty: &Type, mode: ParamMode) -> Option<ClassifiedResour
             kind: DescriptorKind::SampledImage,
             dim: Some(TextureDim::Dim1D),
             image_format: None,
-            sample_scalar: Some(*sample_scalar),
+            sample_scalar: scalar_to_sample_scalar(*sample_scalar),
             access: DescriptorAccess::ReadOnly,
+            is_unsized: false,
         }),
         Type::BufferView { sample_scalar } => Some(ClassifiedResource {
             kind: DescriptorKind::SampledImage,
             dim: Some(TextureDim::DimBuffer),
             image_format: None,
-            sample_scalar: Some(*sample_scalar),
+            sample_scalar: scalar_to_sample_scalar(*sample_scalar),
             access: DescriptorAccess::ReadOnly,
+            is_unsized: false,
         }),
         Type::RwImage1D(fmt) => Some(ClassifiedResource {
             kind: DescriptorKind::StorageImage,
             dim: Some(TextureDim::Dim1D),
             image_format: Some(*fmt),
             sample_scalar: None,
-            access: DescriptorAccess::ReadWrite,
+            access: rw_image_access(mode),
+            is_unsized: false,
         }),
         Type::RwBufferView(fmt) => Some(ClassifiedResource {
             kind: DescriptorKind::StorageImage,
             dim: Some(TextureDim::DimBuffer),
             image_format: Some(*fmt),
             sample_scalar: None,
-            access: DescriptorAccess::ReadWrite,
+            access: rw_image_access(mode),
+            is_unsized: false,
         }),
         Type::Texture2DMS { sample_scalar } => Some(ClassifiedResource {
             kind: DescriptorKind::SampledImage,
@@ -4923,9 +4928,13 @@ fn classify_resource_type(ty: &Type, mode: ParamMode) -> Option<ClassifiedResour
             access: DescriptorAccess::ReadOnly,
             is_unsized: false,
         }),
-        Type::SubpassInput { sample_scalar, .. } => Some(ClassifiedResource {
+        Type::SubpassInput { sample_scalar, ms } => Some(ClassifiedResource {
             kind: DescriptorKind::InputAttachment,
-            dim: Some(TextureDim::SubpassData),
+            dim: Some(if *ms {
+                TextureDim::SubpassDataMS
+            } else {
+                TextureDim::SubpassData
+            }),
             sample_scalar: scalar_to_sample_scalar(*sample_scalar),
             image_format: None,
             access: DescriptorAccess::ReadOnly,
@@ -7565,6 +7574,12 @@ fn infer_builtin_call_return_type(
     match name {
         "report_intersection" => Some(types.alloc(Type::Scalar(ScalarKind::Bool))),
         "coop_mat_length" => Some(types.alloc(Type::Scalar(ScalarKind::U32))),
+        "coop_mat_load" => Some(types.alloc(Type::CoopMatrix {
+            scalar: CoopMatScalar::F16,
+            rows: 16,
+            cols: 16,
+            use_kind: 2,
+        })),
         "coop_mat_mul_add" => arg_types.get(2).copied().flatten(),
         "subgroup_ballot" => Some(types.alloc(Type::Vector {
             scalar: ScalarKind::U32,
@@ -8856,27 +8871,36 @@ fn lower_type_expr(
                         .and_then(|a| match a {
                             TypeArg::Type(TypeExpr::Named { path, .. }) => {
                                 match path.joined().as_str() {
-                                    "f16" | "bf16" => Some(ScalarKind::F16),
-                                    "f32" => Some(ScalarKind::F32),
-                                    "i32" | "i8" => Some(ScalarKind::I32),
-                                    "u32" | "u8" => Some(ScalarKind::U32),
+                                    "f16" => Some(CoopMatScalar::F16),
+                                    "bf16" => Some(CoopMatScalar::Bf16),
+                                    "f32" => Some(CoopMatScalar::F32),
+                                    "i8" => Some(CoopMatScalar::I8),
+                                    "u8" => Some(CoopMatScalar::U8),
+                                    "i32" => Some(CoopMatScalar::I32),
+                                    "u32" => Some(CoopMatScalar::U32),
                                     _ => None,
                                 }
                             }
                             _ => None,
                         })
-                        .unwrap_or(ScalarKind::F16);
+                        .unwrap_or(CoopMatScalar::F16);
                     let rows = args
                         .get(1)
                         .and_then(|a| match a {
-                            TypeArg::Const(Expr::IntLit { value, .. }) => value.parse::<u32>().ok(),
+                            TypeArg::NamedExpr {
+                                value: Expr::IntLit(value, _),
+                                ..
+                            } => value.parse::<u32>().ok(),
                             _ => None,
                         })
                         .unwrap_or(16);
                     let cols = args
                         .get(2)
                         .and_then(|a| match a {
-                            TypeArg::Const(Expr::IntLit { value, .. }) => value.parse::<u32>().ok(),
+                            TypeArg::NamedExpr {
+                                value: Expr::IntLit(value, _),
+                                ..
+                            } => value.parse::<u32>().ok(),
                             _ => None,
                         })
                         .unwrap_or(16);

@@ -55,7 +55,7 @@ pub struct CompileOptions {
     pub driver_uuid: [u8; 16],
     /// Optional directory for persistent disk L2 `CompiledShaderUnit` artifacts.
     pub l2_cache_dir: Option<PathBuf>,
-    /// Emit `NonSemantic.Shader.DebugInfo.100` metadata for RenderDoc / Nsight debugging.
+    /// Emit `NonSemantic.Shader.DebugInfo.100` metadata for `RenderDoc` / Nsight debugging.
     pub emit_debug_info: bool,
 }
 
@@ -651,6 +651,10 @@ impl VslCompiler {
                     }
                 }
             }
+            let mut cache_uuid = options.driver_uuid;
+            if options.emit_debug_info {
+                cache_uuid[0] ^= 0xD8;
+            }
             let cache_key = compute_l2_artifact_hash(
                 l1_hash,
                 func.name.as_str(),
@@ -658,7 +662,7 @@ impl VslCompiler {
                 options.active_caps,
                 &used_spec_pairs,
                 &pack_schema_hash,
-                &options.driver_uuid,
+                &cache_uuid,
             )
             .0;
 

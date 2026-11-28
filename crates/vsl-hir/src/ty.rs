@@ -29,6 +29,18 @@ impl LayoutKind {
 /// Scalar primitive types supported by VSL 2.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Element scalar type for `CoopMat<T, R, C, Use>` (`VK_KHR_cooperative_matrix`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CoopMatScalar {
+    F16,
+    Bf16,
+    F32,
+    I8,
+    U8,
+    I32,
+    U32,
+}
+
 pub enum ScalarKind {
     Bool,
     I32,
@@ -131,7 +143,7 @@ pub enum Type {
     HitObject,
     /// Cooperative Matrix value type (`VK_KHR_cooperative_matrix`, `use_kind`: 0=A, 1=B, 2=Acc).
     CoopMatrix {
-        scalar: ScalarKind,
+        scalar: CoopMatScalar,
         rows: u32,
         cols: u32,
         use_kind: u32,

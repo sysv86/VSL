@@ -148,6 +148,7 @@ pub enum TextureDim {
     Dim2DMS,
     DimBuffer,
     SubpassData,
+    SubpassDataMS,
 }
 
 /// Sampled scalar element type for `Texture*<T>` descriptors.

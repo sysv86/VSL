@@ -340,10 +340,13 @@ impl IrType {
                 use_kind,
             } => Self::CoopMatrix {
                 component: match scalar {
-                    ScalarKind::F16 => CoopMatrixScalar::F16,
-                    ScalarKind::F32 => CoopMatrixScalar::F32,
-                    ScalarKind::I32 => CoopMatrixScalar::I32,
-                    _ => CoopMatrixScalar::U32,
+                    vsl_hir::CoopMatScalar::F16 => CoopMatrixScalar::F16,
+                    vsl_hir::CoopMatScalar::Bf16 => CoopMatrixScalar::Bf16,
+                    vsl_hir::CoopMatScalar::F32 => CoopMatrixScalar::F32,
+                    vsl_hir::CoopMatScalar::I8 => CoopMatrixScalar::I8,
+                    vsl_hir::CoopMatScalar::U8 => CoopMatrixScalar::U8,
+                    vsl_hir::CoopMatScalar::I32 => CoopMatrixScalar::I32,
+                    vsl_hir::CoopMatScalar::U32 => CoopMatrixScalar::U32,
                 },
                 scope: AtomicScope::Subgroup,
                 rows: *rows,
@@ -1988,7 +1991,91 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
             (BuiltinKind::FragCoord | BuiltinKind::Position | BuiltinKind::FragDepth, _) => {
                 IrType::Scalar(ScalarIrTy::F32)
             }
-            (BuiltinKind::FrontFacing, _) => IrType::Scalar(ScalarIrTy::Bool),
+            (BuiltinKind::FrontFacing | BuiltinKind::CullPrimitiveExt, _) => {
+                IrType::Scalar(ScalarIrTy::Bool)
+            }
+            (BuiltinKind::LaunchIdKhr | BuiltinKind::LaunchSizeKhr, None) => IrType::Vector {
+                scalar: ScalarIrTy::U32,
+                len: 3,
+            },
+            (BuiltinKind::LaunchIdKhr | BuiltinKind::LaunchSizeKhr, Some(_)) => {
+                IrType::Scalar(ScalarIrTy::U32)
+            }
+            (
+                BuiltinKind::WorldRayOriginKhr
+                | BuiltinKind::WorldRayDirectionKhr
+                | BuiltinKind::ObjectRayOriginKhr
+                | BuiltinKind::ObjectRayDirectionKhr
+                | BuiltinKind::TessCoord,
+                None,
+            ) => IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 3,
+            },
+            (
+                BuiltinKind::WorldRayOriginKhr
+                | BuiltinKind::WorldRayDirectionKhr
+                | BuiltinKind::ObjectRayOriginKhr
+                | BuiltinKind::ObjectRayDirectionKhr
+                | BuiltinKind::TessCoord
+                | BuiltinKind::RayTminKhr
+                | BuiltinKind::RayTmaxKhr
+                | BuiltinKind::ClipDistance
+                | BuiltinKind::CullDistance,
+                _,
+            ) => IrType::Scalar(ScalarIrTy::F32),
+            (BuiltinKind::SamplePosition, None) => IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 2,
+            },
+            (BuiltinKind::SamplePosition, Some(_)) => IrType::Scalar(ScalarIrTy::F32),
+            (BuiltinKind::ObjectToWorldKhr | BuiltinKind::WorldToObjectKhr, _) => IrType::Matrix {
+                scalar: ScalarIrTy::F32,
+                cols: 4,
+                rows: 3,
+            },
+            (BuiltinKind::TessLevelOuter, _) => IrType::Array {
+                element: Box::new(IrType::Scalar(ScalarIrTy::F32)),
+                len: 4,
+            },
+            (BuiltinKind::TessLevelInner, _) => IrType::Array {
+                element: Box::new(IrType::Scalar(ScalarIrTy::F32)),
+                len: 2,
+            },
+            (BuiltinKind::HitTriangleVertexPositionsKhr, _) => IrType::Array {
+                element: Box::new(IrType::Vector {
+                    scalar: ScalarIrTy::F32,
+                    len: 3,
+                }),
+                len: 3,
+            },
+            (BuiltinKind::PrimitiveLineIndicesExt, None) => IrType::Vector {
+                scalar: ScalarIrTy::U32,
+                len: 2,
+            },
+            (BuiltinKind::PrimitiveTriangleIndicesExt, None) => IrType::Vector {
+                scalar: ScalarIrTy::U32,
+                len: 3,
+            },
+            (
+                BuiltinKind::InstanceCustomIndexKhr
+                | BuiltinKind::HitKindKhr
+                | BuiltinKind::IncomingRayFlagsKhr
+                | BuiltinKind::RayGeometryIndexKhr
+                | BuiltinKind::PrimitivePointIndicesExt
+                | BuiltinKind::PrimitiveLineIndicesExt
+                | BuiltinKind::PrimitiveTriangleIndicesExt
+                | BuiltinKind::InvocationId
+                | BuiltinKind::PatchVertices
+                | BuiltinKind::PrimitiveId
+                | BuiltinKind::Layer
+                | BuiltinKind::SampleId
+                | BuiltinKind::SampleMask
+                | BuiltinKind::PrimitiveShadingRateKhr
+                | BuiltinKind::ShadingRateKhr
+                | BuiltinKind::ViewIndex,
+                _,
+            ) => IrType::Scalar(ScalarIrTy::U32),
         },
         _ => IrType::Void,
     }
