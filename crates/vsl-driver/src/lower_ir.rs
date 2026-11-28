@@ -1025,6 +1025,7 @@ struct LowerCtx<'a, 'd> {
     builtin_params: IndexMap<SmolStr, BuiltinKind>,
     stage_io_outputs: IndexMap<SmolStr, u32>,
     stage_var_indices: IndexMap<SmolStr, u32>,
+    stage_var_entry_loads: Vec<InstId>,
     push_constant_param: Option<SmolStr>,
     push_constant_fields: IndexMap<SmolStr, u32>,
     ray_query_handles: IndexMap<SmolStr, u32>,
@@ -1061,6 +1062,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         let mut builtin_params = IndexMap::new();
         let mut stage_io_outputs = IndexMap::new();
         let mut stage_var_indices = IndexMap::new();
+        let mut stage_var_entry_loads = Vec::new();
         if let Some(afn) = ast_fn {
             ir_fn.stage_exec_meta = parse_stage_exec_meta(&afn.attrs);
         }
@@ -1137,6 +1139,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 });
                 stage_var_indices.insert(param.name.clone(), var_index);
                 let loaded = ir_fn.emit_typed(ir_ty.clone(), InstData::LoadStageVar { var_index });
+                stage_var_entry_loads.push(loaded);
                 entry_preamble.push(StructuredStmt::Eval(loaded));
                 ssa_locals.insert(param.name.clone(), loaded);
                 if matches!(param.mode, ParamMode::Out | ParamMode::InOut) {
@@ -1359,6 +1362,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             builtin_params,
             stage_io_outputs,
             stage_var_indices,
+            stage_var_entry_loads,
             push_constant_param,
             push_constant_fields,
             ray_query_handles: IndexMap::new(),
@@ -2398,6 +2402,25 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     .emit_typed(ty_cloned, InstData::LocalLoad { ptr: addr });
             }
             if let Some(&id) = self.ssa_locals.get(path) {
+                // A shader call can modify the interface variable without changing
+                // the SSA binding established at function entry.
+                if let InstData::LoadStageVar { var_index } = self.ir_fn.insts[id].data
+                    && self.stage_var_indices.get(path) == Some(&var_index)
+                    && self.stage_var_entry_loads.get(var_index as usize) == Some(&id)
+                    && matches!(
+                        self.ir_fn.stage_vars[var_index as usize].storage,
+                        IrStorageClass::RayPayloadKhr
+                            | IrStorageClass::IncomingRayPayloadKhr
+                            | IrStorageClass::CallableDataKhr
+                            | IrStorageClass::IncomingCallableDataKhr
+                    )
+                {
+                    let value = self
+                        .ir_fn
+                        .emit_typed(expr_ir_ty.clone(), InstData::LoadStageVar { var_index });
+                    out.push(StructuredStmt::Eval(value));
+                    return value;
+                }
                 return id;
             }
             if let Some(&var_index) = self.workgroup_indices.get(path) {
@@ -3687,6 +3710,33 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             .then_some(index)
     }
 
+    // Mutable stage parameters have a Function-storage shadow for aggregate lvalues.
+    // Synchronize it at shader-call boundaries, where the callee can change the payload.
+    fn sync_rt_stage_shadow(
+        &mut self,
+        var_index: u32,
+        before_call: bool,
+        out: &mut Vec<StructuredStmt>,
+    ) {
+        let name = self.ir_fn.stage_vars[var_index as usize].name.clone();
+        let Some((slot, ty)) = self.local_var_slots.get(&name).cloned() else {
+            return;
+        };
+        let ptr = emit_local_addr(self.ir_fn, slot, &ty);
+        let store = if before_call {
+            let value = self.ir_fn.emit_typed(ty, InstData::LocalLoad { ptr });
+            self.ir_fn
+                .emit_typed(IrType::Void, InstData::StoreStageVar { var_index, value })
+        } else {
+            let value = self
+                .ir_fn
+                .emit_typed(ty, InstData::LoadStageVar { var_index });
+            self.ir_fn
+                .emit_typed(IrType::Void, InstData::LocalStore { ptr, value })
+        };
+        out.push(StructuredStmt::Eval(store));
+    }
+
     /// Emits `DescriptorAccessChain` + typed `DescriptorLoad` (and `CompositeConstruct` for
     /// vectors/matrices) using exact [`BuiltinStructDesc`] field index and byte offset.
     fn emit_builtin_struct_field_load(
@@ -4582,6 +4632,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let t_min = self.require_arg(args, 7, joined, span, out)?;
                 let direction = self.require_arg(args, 8, joined, span, out)?;
                 let t_max = self.require_arg(args, 9, joined, span, out)?;
+                self.sync_rt_stage_shadow(payload_var_index, true, out);
                 let id = self.ir_fn.emit_typed(
                     IrType::Void,
                     InstData::TraceRayKhr {
@@ -4599,6 +4650,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     },
                 );
                 out.push(StructuredStmt::Eval(id));
+                self.sync_rt_stage_shadow(payload_var_index, false, out);
                 return Ok(id);
             }
             "ignore_intersection" => {
@@ -4647,6 +4699,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     ));
                 };
                 let sbt_index = self.require_arg(args, 0, joined, span, out)?;
+                self.sync_rt_stage_shadow(callable_var_index, true, out);
                 let id = self.ir_fn.emit_typed(
                     IrType::Void,
                     InstData::ExecuteCallableKhr {
@@ -4655,6 +4708,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     },
                 );
                 out.push(StructuredStmt::Eval(id));
+                self.sync_rt_stage_shadow(callable_var_index, false, out);
                 return Ok(id);
             }
             "emit_mesh_tasks" => {
@@ -6750,6 +6804,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let t_min = self.lower_expr(&args[7].value, out);
                 let direction = self.lower_expr(&args[8].value, out);
                 let t_max = self.lower_expr(&args[9].value, out);
+                self.sync_rt_stage_shadow(payload_var_index, true, out);
                 let id = self.ir_fn.emit_typed(
                     IrType::Void,
                     InstData::HitObjectTraceRay {
@@ -6768,6 +6823,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     },
                 );
                 out.push(StructuredStmt::Eval(id));
+                self.sync_rt_stage_shadow(payload_var_index, false, out);
                 id
             }
             "record_empty" => {
@@ -6817,7 +6873,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                         payload_var_index,
                     },
                 );
+                self.sync_rt_stage_shadow(payload_var_index, true, out);
                 out.push(StructuredStmt::Eval(id));
+                self.sync_rt_stage_shadow(payload_var_index, false, out);
                 id
             }
             _ => return None,

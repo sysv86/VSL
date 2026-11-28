@@ -2503,6 +2503,87 @@ mod tests {
     }
 
     #[test]
+    fn rt_shader_calls_reload_payload_after_return() {
+        let units = compile_standalone_and_validate(
+            "rt_payload_reload",
+            r"
+            @raygen
+            fn rgen(
+                #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+                #[binding(set = 0, binding = 1)] image: RWImage2D<rgba16f>,
+                #[ray_payload(0)] payload: vec4,
+                #[callable_data(1)] inout data: vec4,
+            ) {
+                let before = payload;
+                trace_ray(tlas, 0u, 255u, 0u, 0u, 0u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0, payload);
+                data = payload + before;
+                execute_callable(0u, data);
+                image.store(ivec2(0, 0), data + payload);
+            }
+            ",
+            false,
+        );
+        assert_rt_payload_reloaded(&units[0].spirv, &[4445, 4446]);
+    }
+
+    fn assert_rt_payload_reloaded(words: &[u32], expected_calls: &[u32]) {
+        let mut calls = Vec::new();
+        let mut loads = Vec::new();
+        let mut offset = 5;
+        while offset < words.len() {
+            let count = (words[offset] >> 16) as usize;
+            let opcode = words[offset] & 0xffff;
+            let operands = &words[offset + 1..offset + count];
+            match opcode {
+                4445 | 4446 | 5260 | 5264 | 5316 | 5319 => {
+                    calls.push((opcode, offset, *operands.last().unwrap()));
+                }
+                61 => loads.push((offset, operands[2])),
+                _ => {}
+            }
+            offset += count;
+        }
+        assert_eq!(
+            calls.iter().map(|call| call.0).collect::<Vec<_>>(),
+            expected_calls
+        );
+        for (opcode, call_offset, pointer) in calls {
+            assert!(
+                loads
+                    .iter()
+                    .any(|&(offset, ptr)| offset > call_offset && ptr == pointer),
+                "shader call opcode {opcode} did not reload its interface variable"
+            );
+        }
+    }
+
+    #[test]
+    fn ser_nv_and_ext_reload_payload_after_execution() {
+        for (cap, trace_op, execute_op) in [("ser_nv", 5260, 5264), ("ser_ext", 5316, 5319)] {
+            let src = format!(
+                r"
+                #[cap({cap})]
+                @raygen
+                fn rgen(
+                    #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+                    #[binding(set = 0, binding = 1)] image: RWImage2D<rgba16f>,
+                    #[ray_payload(0)] inout payload: vec4,
+                ) {{
+                    payload = vec4(0.0, 0.0, 0.0, 1.0);
+                    let ho: HitObject;
+                    ho.trace_ray(tlas, 0u, 255u, 0u, 0u, 0u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0, payload);
+                    reorder_thread_with_hit_object(ho, 1u, 2u);
+                    ho.execute_shader(payload);
+                    image.store(ivec2(0, 0), payload);
+                }}
+            "
+            );
+            let units = compile_standalone_and_validate(cap, &src, false);
+            assert_rt_payload_reloaded(&units[0].spirv, &[trace_op, execute_op]);
+        }
+    }
+
+    #[test]
     fn ray_query_inferred_intersection_types_validate() {
         compile_standalone_and_validate(
             "ray_query_inferred_types",
