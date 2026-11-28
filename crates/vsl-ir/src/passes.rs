@@ -516,6 +516,7 @@ impl IrPass for ConstFoldPass {
                     | InstData::RayQueryCommittedWorldToObject(_)
                     | InstData::RayQueryCommittedFrontFace(_)
                     | InstData::RayQueryCommittedBarycentrics(_)
+                    | InstData::RayQueryRead { .. }
                     | InstData::TraceRayKhr { .. }
                     | InstData::IgnoreIntersectionKhr
                     | InstData::TerminateRayKhr
@@ -948,30 +949,38 @@ fn remap_stmts_ids(
     stmts: Vec<StructuredStmt>,
     remap: &IndexMap<InstId, InstId>,
 ) -> Vec<StructuredStmt> {
+    map_stmts_ids(stmts, &|id| remap_id(id, remap))
+}
+
+// Cross-function cloning uses a single lookup, not transitive SSA substitution.
+fn map_stmts_ids(
+    stmts: Vec<StructuredStmt>,
+    map: &impl Fn(InstId) -> InstId,
+) -> Vec<StructuredStmt> {
     stmts
         .into_iter()
         .map(|stmt| match stmt {
-            StructuredStmt::Eval(id) => StructuredStmt::Eval(remap_id(id, remap)),
+            StructuredStmt::Eval(id) => StructuredStmt::Eval(map(id)),
             StructuredStmt::If {
                 cond,
                 then_body,
                 else_body,
             } => StructuredStmt::If {
-                cond: remap_id(cond, remap),
-                then_body: remap_stmts_ids(then_body, remap),
-                else_body: remap_stmts_ids(else_body, remap),
+                cond: map(cond),
+                then_body: map_stmts_ids(then_body, map),
+                else_body: map_stmts_ids(else_body, map),
             },
             StructuredStmt::Switch {
                 selector,
                 cases,
                 default,
             } => StructuredStmt::Switch {
-                selector: remap_id(selector, remap),
+                selector: map(selector),
                 cases: cases
                     .into_iter()
-                    .map(|(k, b)| (k, remap_stmts_ids(b, remap)))
+                    .map(|(k, b)| (k, map_stmts_ids(b, map)))
                     .collect(),
-                default: remap_stmts_ids(default, remap),
+                default: map_stmts_ids(default, map),
             },
             StructuredStmt::Loop {
                 body,
@@ -981,16 +990,14 @@ fn remap_stmts_ids(
                 induction_init,
                 induction_step,
             } => StructuredStmt::Loop {
-                body: remap_stmts_ids(body, remap),
-                continuing: remap_stmts_ids(continuing, remap),
+                body: map_stmts_ids(body, map),
+                continuing: map_stmts_ids(continuing, map),
                 unroll,
                 trip_count,
-                induction_init: induction_init.map(|id| remap_id(id, remap)),
+                induction_init: induction_init.map(map),
                 induction_step,
             },
-            StructuredStmt::Return(val) => {
-                StructuredStmt::Return(val.map(|id| remap_id(id, remap)))
-            }
+            StructuredStmt::Return(val) => StructuredStmt::Return(val.map(map)),
             other @ (StructuredStmt::Break | StructuredStmt::Continue) => other,
         })
         .collect()
@@ -1983,6 +1990,10 @@ fn remap_id(mut id: InstId, remap: &IndexMap<InstId, InstId>) -> InstId {
 }
 
 fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstData {
+    map_inst_data(data, &|id| remap_id(id, remap))
+}
+
+fn map_inst_data(data: &InstData, map: &impl Fn(InstId) -> InstId) -> InstData {
     match data {
         InstData::ConstBool(v) => InstData::ConstBool(*v),
         InstData::ConstI32(v) => InstData::ConstI32(*v),
@@ -1990,54 +2001,52 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         InstData::ConstF32(v) => InstData::ConstF32(*v),
         InstData::ConstI64(v) => InstData::ConstI64(*v),
         InstData::ConstU64(v) => InstData::ConstU64(*v),
-        InstData::IAdd32(a, b) => InstData::IAdd32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::ISub32(a, b) => InstData::ISub32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::IMul32(a, b) => InstData::IMul32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::IDiv32(a, b) => InstData::IDiv32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::IRem32(a, b) => InstData::IRem32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FAdd32(a, b) => InstData::FAdd32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FSub32(a, b) => InstData::FSub32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FMul32(a, b) => InstData::FMul32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FDiv32(a, b) => InstData::FDiv32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::ICmpEq(a, b) => InstData::ICmpEq(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::ICmpNe(a, b) => InstData::ICmpNe(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::ICmpLt(a, b) => InstData::ICmpLt(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::ICmpLe(a, b) => InstData::ICmpLe(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::ICmpGt(a, b) => InstData::ICmpGt(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::ICmpGe(a, b) => InstData::ICmpGe(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::UCmpLt(a, b) => InstData::UCmpLt(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FCmpEq(a, b) => InstData::FCmpEq(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FCmpNe(a, b) => InstData::FCmpNe(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FCmpLt(a, b) => InstData::FCmpLt(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FCmpLe(a, b) => InstData::FCmpLe(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FCmpGt(a, b) => InstData::FCmpGt(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::FCmpGe(a, b) => InstData::FCmpGe(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::LogicalAnd(a, b) => {
-            InstData::LogicalAnd(remap_id(*a, remap), remap_id(*b, remap))
-        }
-        InstData::LogicalOr(a, b) => InstData::LogicalOr(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::LogicalNot(v) => InstData::LogicalNot(remap_id(*v, remap)),
+        InstData::IAdd32(a, b) => InstData::IAdd32(map(*a), map(*b)),
+        InstData::ISub32(a, b) => InstData::ISub32(map(*a), map(*b)),
+        InstData::IMul32(a, b) => InstData::IMul32(map(*a), map(*b)),
+        InstData::IDiv32(a, b) => InstData::IDiv32(map(*a), map(*b)),
+        InstData::IRem32(a, b) => InstData::IRem32(map(*a), map(*b)),
+        InstData::FAdd32(a, b) => InstData::FAdd32(map(*a), map(*b)),
+        InstData::FSub32(a, b) => InstData::FSub32(map(*a), map(*b)),
+        InstData::FMul32(a, b) => InstData::FMul32(map(*a), map(*b)),
+        InstData::FDiv32(a, b) => InstData::FDiv32(map(*a), map(*b)),
+        InstData::ICmpEq(a, b) => InstData::ICmpEq(map(*a), map(*b)),
+        InstData::ICmpNe(a, b) => InstData::ICmpNe(map(*a), map(*b)),
+        InstData::ICmpLt(a, b) => InstData::ICmpLt(map(*a), map(*b)),
+        InstData::ICmpLe(a, b) => InstData::ICmpLe(map(*a), map(*b)),
+        InstData::ICmpGt(a, b) => InstData::ICmpGt(map(*a), map(*b)),
+        InstData::ICmpGe(a, b) => InstData::ICmpGe(map(*a), map(*b)),
+        InstData::UCmpLt(a, b) => InstData::UCmpLt(map(*a), map(*b)),
+        InstData::FCmpEq(a, b) => InstData::FCmpEq(map(*a), map(*b)),
+        InstData::FCmpNe(a, b) => InstData::FCmpNe(map(*a), map(*b)),
+        InstData::FCmpLt(a, b) => InstData::FCmpLt(map(*a), map(*b)),
+        InstData::FCmpLe(a, b) => InstData::FCmpLe(map(*a), map(*b)),
+        InstData::FCmpGt(a, b) => InstData::FCmpGt(map(*a), map(*b)),
+        InstData::FCmpGe(a, b) => InstData::FCmpGe(map(*a), map(*b)),
+        InstData::LogicalAnd(a, b) => InstData::LogicalAnd(map(*a), map(*b)),
+        InstData::LogicalOr(a, b) => InstData::LogicalOr(map(*a), map(*b)),
+        InstData::LogicalNot(v) => InstData::LogicalNot(map(*v)),
         InstData::Select {
             cond,
             on_true,
             on_false,
         } => InstData::Select {
-            cond: remap_id(*cond, remap),
-            on_true: remap_id(*on_true, remap),
-            on_false: remap_id(*on_false, remap),
+            cond: map(*cond),
+            on_true: map(*on_true),
+            on_false: map(*on_false),
         },
-        InstData::BitAnd32(a, b) => InstData::BitAnd32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::BitOr32(a, b) => InstData::BitOr32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::BitXor32(a, b) => InstData::BitXor32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::BitNot32(v) => InstData::BitNot32(remap_id(*v, remap)),
-        InstData::Shl32(a, b) => InstData::Shl32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::Shr32(a, b) => InstData::Shr32(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::CastI64ToU64(v) => InstData::CastI64ToU64(remap_id(*v, remap)),
-        InstData::CastToU32(v) => InstData::CastToU32(remap_id(*v, remap)),
-        InstData::CastToI32(v) => InstData::CastToI32(remap_id(*v, remap)),
-        InstData::CastToF32(v) => InstData::CastToF32(remap_id(*v, remap)),
-        InstData::CastToI64(v) => InstData::CastToI64(remap_id(*v, remap)),
-        InstData::CastToU64(v) => InstData::CastToU64(remap_id(*v, remap)),
+        InstData::BitAnd32(a, b) => InstData::BitAnd32(map(*a), map(*b)),
+        InstData::BitOr32(a, b) => InstData::BitOr32(map(*a), map(*b)),
+        InstData::BitXor32(a, b) => InstData::BitXor32(map(*a), map(*b)),
+        InstData::BitNot32(v) => InstData::BitNot32(map(*v)),
+        InstData::Shl32(a, b) => InstData::Shl32(map(*a), map(*b)),
+        InstData::Shr32(a, b) => InstData::Shr32(map(*a), map(*b)),
+        InstData::CastI64ToU64(v) => InstData::CastI64ToU64(map(*v)),
+        InstData::CastToU32(v) => InstData::CastToU32(map(*v)),
+        InstData::CastToI32(v) => InstData::CastToI32(map(*v)),
+        InstData::CastToF32(v) => InstData::CastToF32(map(*v)),
+        InstData::CastToI64(v) => InstData::CastToI64(map(*v)),
+        InstData::CastToU64(v) => InstData::CastToU64(map(*v)),
         InstData::SpecConstant {
             spec_id,
             scalar,
@@ -2049,13 +2058,10 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         },
         InstData::GlslStd450 { op, args } => InstData::GlslStd450 {
             op: *op,
-            args: args.iter().map(|&a| remap_id(a, remap)).collect(),
+            args: args.iter().map(|&a| map(a)).collect(),
         },
         InstData::Phi { incoming } => InstData::Phi {
-            incoming: incoming
-                .iter()
-                .map(|&(v, pred)| (remap_id(v, remap), pred))
-                .collect(),
+            incoming: incoming.iter().map(|&(v, pred)| (map(v), pred)).collect(),
         },
         InstData::BdaOffset {
             base_ptr,
@@ -2063,25 +2069,25 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             stride_bytes,
             align,
         } => InstData::BdaOffset {
-            base_ptr: remap_id(*base_ptr, remap),
-            index_i64: remap_id(*index_i64, remap),
+            base_ptr: map(*base_ptr),
+            index_i64: map(*index_i64),
             stride_bytes: *stride_bytes,
             align: *align,
         },
-        InstData::ConvertPtrToU(v) => InstData::ConvertPtrToU(remap_id(*v, remap)),
+        InstData::ConvertPtrToU(v) => InstData::ConvertPtrToU(map(*v)),
         InstData::ConvertUToPtr { addr_u64, align } => InstData::ConvertUToPtr {
-            addr_u64: remap_id(*addr_u64, remap),
+            addr_u64: map(*addr_u64),
             align: *align,
         },
-        InstData::IMul64(a, b) => InstData::IMul64(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::IAdd64(a, b) => InstData::IAdd64(remap_id(*a, remap), remap_id(*b, remap)),
+        InstData::IMul64(a, b) => InstData::IMul64(map(*a), map(*b)),
+        InstData::IAdd64(a, b) => InstData::IAdd64(map(*a), map(*b)),
         InstData::BdaLoad { ptr, access } => InstData::BdaLoad {
-            ptr: remap_id(*ptr, remap),
+            ptr: map(*ptr),
             access: *access,
         },
         InstData::BdaStore { ptr, value, access } => InstData::BdaStore {
-            ptr: remap_id(*ptr, remap),
-            value: remap_id(*value, remap),
+            ptr: map(*ptr),
+            value: map(*value),
             access: *access,
         },
         InstData::ImageSample {
@@ -2094,9 +2100,9 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         } => InstData::ImageSample {
             descriptor_index: *descriptor_index,
             sampler_descriptor_index: *sampler_descriptor_index,
-            image_inst: image_inst.map(|i| remap_id(i, remap)),
-            coord: remap_id(*coord, remap),
-            lod: remap_id(*lod, remap),
+            image_inst: image_inst.map(map),
+            coord: map(*coord),
+            lod: map(*lod),
             is_fetch: *is_fetch,
         },
         InstData::ImageStore {
@@ -2105,16 +2111,16 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             value,
         } => InstData::ImageStore {
             descriptor_index: *descriptor_index,
-            coord: remap_id(*coord, remap),
-            value: remap_id(*value, remap),
+            coord: map(*coord),
+            value: map(*value),
         },
         InstData::WorkgroupAddr { var_index, index } => InstData::WorkgroupAddr {
             var_index: *var_index,
-            index: index.map(|i| remap_id(i, remap)),
+            index: index.map(map),
         },
         InstData::WorkgroupLoad { var_index, index } => InstData::WorkgroupLoad {
             var_index: *var_index,
-            index: index.map(|i| remap_id(i, remap)),
+            index: index.map(map),
         },
         InstData::WorkgroupStore {
             var_index,
@@ -2122,28 +2128,26 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             value,
         } => InstData::WorkgroupStore {
             var_index: *var_index,
-            index: index.map(|i| remap_id(i, remap)),
-            value: remap_id(*value, remap),
+            index: index.map(map),
+            value: map(*value),
         },
-        InstData::NonUniform(v) => InstData::NonUniform(remap_id(*v, remap)),
+        InstData::NonUniform(v) => InstData::NonUniform(map(*v)),
         InstData::ResourceAccessChain {
             descriptor_index,
             index,
         } => InstData::ResourceAccessChain {
             descriptor_index: *descriptor_index,
-            index: remap_id(*index, remap),
+            index: map(*index),
         },
-        InstData::ResourceLoad { ptr } => InstData::ResourceLoad {
-            ptr: remap_id(*ptr, remap),
-        },
+        InstData::ResourceLoad { ptr } => InstData::ResourceLoad { ptr: map(*ptr) },
         InstData::AtomicAdd {
             ptr,
             value,
             scope,
             order,
         } => InstData::AtomicAdd {
-            ptr: remap_id(*ptr, remap),
-            value: remap_id(*value, remap),
+            ptr: map(*ptr),
+            value: map(*value),
             scope: *scope,
             order: *order,
         },
@@ -2153,8 +2157,8 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             scope,
             order,
         } => InstData::AtomicMin {
-            ptr: remap_id(*ptr, remap),
-            value: remap_id(*value, remap),
+            ptr: map(*ptr),
+            value: map(*value),
             scope: *scope,
             order: *order,
         },
@@ -2164,8 +2168,8 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             scope,
             order,
         } => InstData::AtomicMax {
-            ptr: remap_id(*ptr, remap),
-            value: remap_id(*value, remap),
+            ptr: map(*ptr),
+            value: map(*value),
             scope: *scope,
             order: *order,
         },
@@ -2176,20 +2180,16 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             scope,
             order,
         } => InstData::AtomicCas {
-            ptr: remap_id(*ptr, remap),
-            expected: remap_id(*expected, remap),
-            desired: remap_id(*desired, remap),
+            ptr: map(*ptr),
+            expected: map(*expected),
+            desired: map(*desired),
             scope: *scope,
             order: *order,
         },
         InstData::WorkgroupBarrier => InstData::WorkgroupBarrier,
-        InstData::SubgroupBallot(v) => InstData::SubgroupBallot(remap_id(*v, remap)),
-        InstData::SubgroupBallotBitCount(v) => {
-            InstData::SubgroupBallotBitCount(remap_id(*v, remap))
-        }
-        InstData::SubgroupBroadcastFirst(v) => {
-            InstData::SubgroupBroadcastFirst(remap_id(*v, remap))
-        }
+        InstData::SubgroupBallot(v) => InstData::SubgroupBallot(map(*v)),
+        InstData::SubgroupBallotBitCount(v) => InstData::SubgroupBallotBitCount(map(*v)),
+        InstData::SubgroupBroadcastFirst(v) => InstData::SubgroupBroadcastFirst(map(*v)),
         InstData::DescriptorLoad {
             descriptor_index,
             word_index,
@@ -2218,12 +2218,12 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         } => InstData::RayQueryInitialize {
             ray_query_id: *ray_query_id,
             tlas_descriptor_index: *tlas_descriptor_index,
-            flags: remap_id(*flags, remap),
-            cull_mask: remap_id(*cull_mask, remap),
-            origin: remap_id(*origin, remap),
-            t_min: remap_id(*t_min, remap),
-            dir: remap_id(*dir, remap),
-            t_max: remap_id(*t_max, remap),
+            flags: map(*flags),
+            cull_mask: map(*cull_mask),
+            origin: map(*origin),
+            t_min: map(*t_min),
+            dir: map(*dir),
+            t_max: map(*t_max),
         },
         InstData::RayQueryProceed(rq) => InstData::RayQueryProceed(*rq),
         InstData::RayQueryCommittedType(rq) => InstData::RayQueryCommittedType(*rq),
@@ -2231,53 +2231,48 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             InstData::RayQueryCommittedInstanceCustomIndex(*rq)
         }
         InstData::RayQueryCommittedBarycentrics(rq) => InstData::RayQueryCommittedBarycentrics(*rq),
-        InstData::MakeVec2(a, b) => InstData::MakeVec2(remap_id(*a, remap), remap_id(*b, remap)),
-        InstData::MakeVec3(a, b, c) => InstData::MakeVec3(
-            remap_id(*a, remap),
-            remap_id(*b, remap),
-            remap_id(*c, remap),
-        ),
-        InstData::MakeVec4(a, b, c, d) => InstData::MakeVec4(
-            remap_id(*a, remap),
-            remap_id(*b, remap),
-            remap_id(*c, remap),
-            remap_id(*d, remap),
-        ),
+        InstData::RayQueryRead { ray_query_id, read } => InstData::RayQueryRead {
+            ray_query_id: *ray_query_id,
+            read: *read,
+        },
+        InstData::MakeVec2(a, b) => InstData::MakeVec2(map(*a), map(*b)),
+        InstData::MakeVec3(a, b, c) => InstData::MakeVec3(map(*a), map(*b), map(*c)),
+        InstData::MakeVec4(a, b, c, d) => InstData::MakeVec4(map(*a), map(*b), map(*c), map(*d)),
         InstData::ConstF16(bits) => InstData::ConstF16(*bits),
         InstData::FConvert { value, target } => InstData::FConvert {
-            value: remap_id(*value, remap),
+            value: map(*value),
             target: *target,
         },
         InstData::SpecConstantOp { op, operands } => InstData::SpecConstantOp {
             op: *op,
-            operands: operands.iter().map(|&o| remap_id(o, remap)).collect(),
+            operands: operands.iter().map(|&o| map(o)).collect(),
         },
         InstData::VectorTimesScalar { vec, scalar } => InstData::VectorTimesScalar {
-            vec: remap_id(*vec, remap),
-            scalar: remap_id(*scalar, remap),
+            vec: map(*vec),
+            scalar: map(*scalar),
         },
         InstData::MatrixTimesVector { mat, vec } => InstData::MatrixTimesVector {
-            mat: remap_id(*mat, remap),
-            vec: remap_id(*vec, remap),
+            mat: map(*mat),
+            vec: map(*vec),
         },
         InstData::MatrixTimesMatrix { lhs, rhs } => InstData::MatrixTimesMatrix {
-            lhs: remap_id(*lhs, remap),
-            rhs: remap_id(*rhs, remap),
+            lhs: map(*lhs),
+            rhs: map(*rhs),
         },
         InstData::VectorShuffle {
             lhs,
             rhs,
             components,
         } => InstData::VectorShuffle {
-            lhs: remap_id(*lhs, remap),
-            rhs: remap_id(*rhs, remap),
+            lhs: map(*lhs),
+            rhs: map(*rhs),
             components: components.clone(),
         },
         InstData::CompositeConstruct { elems } => InstData::CompositeConstruct {
-            elems: elems.iter().map(|&e| remap_id(e, remap)).collect(),
+            elems: elems.iter().map(|&e| map(e)).collect(),
         },
         InstData::CompositeExtract { composite, indices } => InstData::CompositeExtract {
-            composite: remap_id(*composite, remap),
+            composite: map(*composite),
             indices: indices.clone(),
         },
         InstData::CompositeInsert {
@@ -2285,39 +2280,37 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             value,
             indices,
         } => InstData::CompositeInsert {
-            composite: remap_id(*composite, remap),
-            value: remap_id(*value, remap),
+            composite: map(*composite),
+            value: map(*value),
             indices: indices.clone(),
         },
         InstData::LocalAddr { local_index } => InstData::LocalAddr {
             local_index: *local_index,
         },
-        InstData::LocalLoad { ptr } => InstData::LocalLoad {
-            ptr: remap_id(*ptr, remap),
-        },
+        InstData::LocalLoad { ptr } => InstData::LocalLoad { ptr: map(*ptr) },
         InstData::LocalStore { ptr, value } => InstData::LocalStore {
-            ptr: remap_id(*ptr, remap),
-            value: remap_id(*value, remap),
+            ptr: map(*ptr),
+            value: map(*value),
         },
         InstData::AccessChain { base_ptr, indices } => InstData::AccessChain {
-            base_ptr: remap_id(*base_ptr, remap),
-            indices: indices.iter().map(|&i| remap_id(i, remap)).collect(),
+            base_ptr: map(*base_ptr),
+            indices: indices.iter().map(|&i| map(i)).collect(),
         },
         InstData::DescriptorAccessChain {
             descriptor_index,
             indices,
         } => InstData::DescriptorAccessChain {
             descriptor_index: *descriptor_index,
-            indices: indices.iter().map(|&i| remap_id(i, remap)).collect(),
+            indices: indices.iter().map(|&i| map(i)).collect(),
         },
         InstData::DescriptorStore { ptr, value } => InstData::DescriptorStore {
-            ptr: remap_id(*ptr, remap),
-            value: remap_id(*value, remap),
+            ptr: map(*ptr),
+            value: map(*value),
         },
         InstData::Param { index } => InstData::Param { index: *index },
         InstData::FunctionCall { callee, args } => InstData::FunctionCall {
             callee: callee.clone(),
-            args: args.iter().map(|&a| remap_id(a, remap)).collect(),
+            args: args.iter().map(|&a| map(a)).collect(),
         },
         InstData::ImageSampleImplicitLod {
             descriptor_index,
@@ -2327,8 +2320,8 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         } => InstData::ImageSampleImplicitLod {
             descriptor_index: *descriptor_index,
             sampler_descriptor_index: *sampler_descriptor_index,
-            image_inst: image_inst.map(|i| remap_id(i, remap)),
-            coord: remap_id(*coord, remap),
+            image_inst: image_inst.map(map),
+            coord: map(*coord),
         },
         InstData::ImageSampleGrad {
             descriptor_index,
@@ -2340,10 +2333,10 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         } => InstData::ImageSampleGrad {
             descriptor_index: *descriptor_index,
             sampler_descriptor_index: *sampler_descriptor_index,
-            image_inst: image_inst.map(|i| remap_id(i, remap)),
-            coord: remap_id(*coord, remap),
-            ddx: remap_id(*ddx, remap),
-            ddy: remap_id(*ddy, remap),
+            image_inst: image_inst.map(map),
+            coord: map(*coord),
+            ddx: map(*ddx),
+            ddy: map(*ddy),
         },
         InstData::ImageSampleDrefExplicitLod {
             descriptor_index,
@@ -2355,10 +2348,10 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         } => InstData::ImageSampleDrefExplicitLod {
             descriptor_index: *descriptor_index,
             sampler_descriptor_index: *sampler_descriptor_index,
-            image_inst: image_inst.map(|i| remap_id(i, remap)),
-            coord: remap_id(*coord, remap),
-            dref: remap_id(*dref, remap),
-            lod: remap_id(*lod, remap),
+            image_inst: image_inst.map(map),
+            coord: map(*coord),
+            dref: map(*dref),
+            lod: map(*lod),
         },
         InstData::ImageGather {
             descriptor_index,
@@ -2369,8 +2362,8 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         } => InstData::ImageGather {
             descriptor_index: *descriptor_index,
             sampler_descriptor_index: *sampler_descriptor_index,
-            image_inst: image_inst.map(|i| remap_id(i, remap)),
-            coord: remap_id(*coord, remap),
+            image_inst: image_inst.map(map),
+            coord: map(*coord),
             component: *component,
         },
         InstData::ImageQuerySize {
@@ -2378,7 +2371,7 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             lod,
         } => InstData::ImageQuerySize {
             descriptor_index: *descriptor_index,
-            lod: lod.map(|i| remap_id(i, remap)),
+            lod: lod.map(map),
         },
         InstData::ImageQueryLevels { descriptor_index } => InstData::ImageQueryLevels {
             descriptor_index: *descriptor_index,
@@ -2389,83 +2382,83 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             sample,
         } => InstData::ImageTexelPointer {
             descriptor_index: *descriptor_index,
-            coord: remap_id(*coord, remap),
-            sample: remap_id(*sample, remap),
+            coord: map(*coord),
+            sample: map(*sample),
         },
         InstData::MemoryBarrier { scope, order } => InstData::MemoryBarrier {
             scope: *scope,
             order: *order,
         },
         InstData::SubgroupBallotExclusiveBitCount(v) => {
-            InstData::SubgroupBallotExclusiveBitCount(remap_id(*v, remap))
+            InstData::SubgroupBallotExclusiveBitCount(map(*v))
         }
         InstData::SubgroupBallotInclusiveBitCount(v) => {
-            InstData::SubgroupBallotInclusiveBitCount(remap_id(*v, remap))
+            InstData::SubgroupBallotInclusiveBitCount(map(*v))
         }
-        InstData::SubgroupAdd(v) => InstData::SubgroupAdd(remap_id(*v, remap)),
-        InstData::SubgroupMin(v) => InstData::SubgroupMin(remap_id(*v, remap)),
-        InstData::SubgroupMax(v) => InstData::SubgroupMax(remap_id(*v, remap)),
-        InstData::SubgroupExclusiveAdd(v) => InstData::SubgroupExclusiveAdd(remap_id(*v, remap)),
-        InstData::SubgroupInclusiveAdd(v) => InstData::SubgroupInclusiveAdd(remap_id(*v, remap)),
+        InstData::SubgroupAdd(v) => InstData::SubgroupAdd(map(*v)),
+        InstData::SubgroupMin(v) => InstData::SubgroupMin(map(*v)),
+        InstData::SubgroupMax(v) => InstData::SubgroupMax(map(*v)),
+        InstData::SubgroupExclusiveAdd(v) => InstData::SubgroupExclusiveAdd(map(*v)),
+        InstData::SubgroupInclusiveAdd(v) => InstData::SubgroupInclusiveAdd(map(*v)),
         InstData::SubgroupShuffle { value, lane } => InstData::SubgroupShuffle {
-            value: remap_id(*value, remap),
-            lane: remap_id(*lane, remap),
+            value: map(*value),
+            lane: map(*lane),
         },
         InstData::SubgroupShuffleXor { value, mask } => InstData::SubgroupShuffleXor {
-            value: remap_id(*value, remap),
-            mask: remap_id(*mask, remap),
+            value: map(*value),
+            mask: map(*mask),
         },
-        InstData::SubgroupAny(v) => InstData::SubgroupAny(remap_id(*v, remap)),
-        InstData::SubgroupAll(v) => InstData::SubgroupAll(remap_id(*v, remap)),
+        InstData::SubgroupAny(v) => InstData::SubgroupAny(map(*v)),
+        InstData::SubgroupAll(v) => InstData::SubgroupAll(map(*v)),
         InstData::SubgroupElect => InstData::SubgroupElect,
-        InstData::QuadSwapHorizontal(v) => InstData::QuadSwapHorizontal(remap_id(*v, remap)),
-        InstData::QuadSwapVertical(v) => InstData::QuadSwapVertical(remap_id(*v, remap)),
+        InstData::QuadSwapHorizontal(v) => InstData::QuadSwapHorizontal(map(*v)),
+        InstData::QuadSwapVertical(v) => InstData::QuadSwapVertical(map(*v)),
         InstData::SubgroupBroadcast { value, lane } => InstData::SubgroupBroadcast {
-            value: remap_id(*value, remap),
-            lane: remap_id(*lane, remap),
+            value: map(*value),
+            lane: map(*lane),
         },
         InstData::SubgroupBallotBitExtract { ballot, index } => {
             InstData::SubgroupBallotBitExtract {
-                ballot: remap_id(*ballot, remap),
-                index: remap_id(*index, remap),
+                ballot: map(*ballot),
+                index: map(*index),
             }
         }
-        InstData::SubgroupBallotFindLsb(v) => InstData::SubgroupBallotFindLsb(remap_id(*v, remap)),
-        InstData::SubgroupBallotFindMsb(v) => InstData::SubgroupBallotFindMsb(remap_id(*v, remap)),
+        InstData::SubgroupBallotFindLsb(v) => InstData::SubgroupBallotFindLsb(map(*v)),
+        InstData::SubgroupBallotFindMsb(v) => InstData::SubgroupBallotFindMsb(map(*v)),
         InstData::SubgroupShuffleUp { value, delta } => InstData::SubgroupShuffleUp {
-            value: remap_id(*value, remap),
-            delta: remap_id(*delta, remap),
+            value: map(*value),
+            delta: map(*delta),
         },
         InstData::SubgroupShuffleDown { value, delta } => InstData::SubgroupShuffleDown {
-            value: remap_id(*value, remap),
-            delta: remap_id(*delta, remap),
+            value: map(*value),
+            delta: map(*delta),
         },
-        InstData::SubgroupMul(v) => InstData::SubgroupMul(remap_id(*v, remap)),
-        InstData::SubgroupExclusiveMul(v) => InstData::SubgroupExclusiveMul(remap_id(*v, remap)),
-        InstData::SubgroupInclusiveMul(v) => InstData::SubgroupInclusiveMul(remap_id(*v, remap)),
-        InstData::SubgroupExclusiveMin(v) => InstData::SubgroupExclusiveMin(remap_id(*v, remap)),
-        InstData::SubgroupInclusiveMin(v) => InstData::SubgroupInclusiveMin(remap_id(*v, remap)),
-        InstData::SubgroupExclusiveMax(v) => InstData::SubgroupExclusiveMax(remap_id(*v, remap)),
-        InstData::SubgroupInclusiveMax(v) => InstData::SubgroupInclusiveMax(remap_id(*v, remap)),
-        InstData::SubgroupBitAnd(v) => InstData::SubgroupBitAnd(remap_id(*v, remap)),
-        InstData::SubgroupBitOr(v) => InstData::SubgroupBitOr(remap_id(*v, remap)),
-        InstData::SubgroupBitXor(v) => InstData::SubgroupBitXor(remap_id(*v, remap)),
-        InstData::SubgroupLogicalAnd(v) => InstData::SubgroupLogicalAnd(remap_id(*v, remap)),
-        InstData::SubgroupLogicalOr(v) => InstData::SubgroupLogicalOr(remap_id(*v, remap)),
-        InstData::SubgroupLogicalXor(v) => InstData::SubgroupLogicalXor(remap_id(*v, remap)),
+        InstData::SubgroupMul(v) => InstData::SubgroupMul(map(*v)),
+        InstData::SubgroupExclusiveMul(v) => InstData::SubgroupExclusiveMul(map(*v)),
+        InstData::SubgroupInclusiveMul(v) => InstData::SubgroupInclusiveMul(map(*v)),
+        InstData::SubgroupExclusiveMin(v) => InstData::SubgroupExclusiveMin(map(*v)),
+        InstData::SubgroupInclusiveMin(v) => InstData::SubgroupInclusiveMin(map(*v)),
+        InstData::SubgroupExclusiveMax(v) => InstData::SubgroupExclusiveMax(map(*v)),
+        InstData::SubgroupInclusiveMax(v) => InstData::SubgroupInclusiveMax(map(*v)),
+        InstData::SubgroupBitAnd(v) => InstData::SubgroupBitAnd(map(*v)),
+        InstData::SubgroupBitOr(v) => InstData::SubgroupBitOr(map(*v)),
+        InstData::SubgroupBitXor(v) => InstData::SubgroupBitXor(map(*v)),
+        InstData::SubgroupLogicalAnd(v) => InstData::SubgroupLogicalAnd(map(*v)),
+        InstData::SubgroupLogicalOr(v) => InstData::SubgroupLogicalOr(map(*v)),
+        InstData::SubgroupLogicalXor(v) => InstData::SubgroupLogicalXor(map(*v)),
         InstData::SubgroupClustered {
             op,
             value,
             cluster_size,
         } => InstData::SubgroupClustered {
             op: *op,
-            value: remap_id(*value, remap),
-            cluster_size: remap_id(*cluster_size, remap),
+            value: map(*value),
+            cluster_size: map(*cluster_size),
         },
-        InstData::QuadSwapDiagonal(v) => InstData::QuadSwapDiagonal(remap_id(*v, remap)),
+        InstData::QuadSwapDiagonal(v) => InstData::QuadSwapDiagonal(map(*v)),
         InstData::QuadBroadcast { value, lane } => InstData::QuadBroadcast {
-            value: remap_id(*value, remap),
-            lane: remap_id(*lane, remap),
+            value: map(*value),
+            lane: map(*lane),
         },
         InstData::BitFieldExtract {
             base,
@@ -2473,9 +2466,9 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             count,
             signed,
         } => InstData::BitFieldExtract {
-            base: remap_id(*base, remap),
-            offset: remap_id(*offset, remap),
-            count: remap_id(*count, remap),
+            base: map(*base),
+            offset: map(*offset),
+            count: map(*count),
             signed: *signed,
         },
         InstData::BitFieldInsert {
@@ -2484,31 +2477,31 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             offset,
             count,
         } => InstData::BitFieldInsert {
-            base: remap_id(*base, remap),
-            insert: remap_id(*insert, remap),
-            offset: remap_id(*offset, remap),
-            count: remap_id(*count, remap),
+            base: map(*base),
+            insert: map(*insert),
+            offset: map(*offset),
+            count: map(*count),
         },
-        InstData::BitCount(v) => InstData::BitCount(remap_id(*v, remap)),
+        InstData::BitCount(v) => InstData::BitCount(map(*v)),
         InstData::Bitcast { value, target } => InstData::Bitcast {
-            value: remap_id(*value, remap),
+            value: map(*value),
             target: target.clone(),
         },
-        InstData::IsNan(v) => InstData::IsNan(remap_id(*v, remap)),
-        InstData::IsInf(v) => InstData::IsInf(remap_id(*v, remap)),
-        InstData::DPdx(v) => InstData::DPdx(remap_id(*v, remap)),
-        InstData::DPdy(v) => InstData::DPdy(remap_id(*v, remap)),
-        InstData::Fwidth(v) => InstData::Fwidth(remap_id(*v, remap)),
+        InstData::IsNan(v) => InstData::IsNan(map(*v)),
+        InstData::IsInf(v) => InstData::IsInf(map(*v)),
+        InstData::DPdx(v) => InstData::DPdx(map(*v)),
+        InstData::DPdy(v) => InstData::DPdy(map(*v)),
+        InstData::Fwidth(v) => InstData::Fwidth(map(*v)),
         InstData::LoadStageInput { var_index } => InstData::LoadStageInput {
             var_index: *var_index,
         },
         InstData::StoreStageOutput { var_index, value } => InstData::StoreStageOutput {
             var_index: *var_index,
-            value: remap_id(*value, remap),
+            value: map(*value),
         },
         InstData::StoreBuiltin { kind, value } => InstData::StoreBuiltin {
             kind: *kind,
-            value: remap_id(*value, remap),
+            value: map(*value),
         },
         InstData::DemoteToHelperInvocation => InstData::DemoteToHelperInvocation,
         InstData::RayQueryCandidateType(rq) => InstData::RayQueryCandidateType(*rq),
@@ -2519,7 +2512,7 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             t_hit,
         } => InstData::RayQueryGenerateIntersection {
             ray_query_id: *ray_query_id,
-            t_hit: remap_id(*t_hit, remap),
+            t_hit: map(*t_hit),
         },
         InstData::RayQueryCommittedT(rq) => InstData::RayQueryCommittedT(*rq),
         InstData::RayQueryCandidateT(rq) => InstData::RayQueryCandidateT(*rq),
@@ -2538,7 +2531,7 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         }
         InstData::RayQueryCommittedFrontFace(rq) => InstData::RayQueryCommittedFrontFace(*rq),
         InstData::ExtractComponent { vec, index } => InstData::ExtractComponent {
-            vec: remap_id(*vec, remap),
+            vec: map(*vec),
             index: *index,
         },
         InstData::TraceRayKhr {
@@ -2555,28 +2548,28 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             payload_var_index,
         } => InstData::TraceRayKhr {
             tlas_descriptor_index: *tlas_descriptor_index,
-            ray_flags: remap_id(*ray_flags, remap),
-            cull_mask: remap_id(*cull_mask, remap),
-            sbt_offset: remap_id(*sbt_offset, remap),
-            sbt_stride: remap_id(*sbt_stride, remap),
-            miss_index: remap_id(*miss_index, remap),
-            origin: remap_id(*origin, remap),
-            t_min: remap_id(*t_min, remap),
-            direction: remap_id(*direction, remap),
-            t_max: remap_id(*t_max, remap),
+            ray_flags: map(*ray_flags),
+            cull_mask: map(*cull_mask),
+            sbt_offset: map(*sbt_offset),
+            sbt_stride: map(*sbt_stride),
+            miss_index: map(*miss_index),
+            origin: map(*origin),
+            t_min: map(*t_min),
+            direction: map(*direction),
+            t_max: map(*t_max),
             payload_var_index: *payload_var_index,
         },
         InstData::IgnoreIntersectionKhr => InstData::IgnoreIntersectionKhr,
         InstData::TerminateRayKhr => InstData::TerminateRayKhr,
         InstData::ReportIntersectionKhr { hit_t, hit_kind } => InstData::ReportIntersectionKhr {
-            hit_t: remap_id(*hit_t, remap),
-            hit_kind: remap_id(*hit_kind, remap),
+            hit_t: map(*hit_t),
+            hit_kind: map(*hit_kind),
         },
         InstData::ExecuteCallableKhr {
             sbt_index,
             callable_var_index,
         } => InstData::ExecuteCallableKhr {
-            sbt_index: remap_id(*sbt_index, remap),
+            sbt_index: map(*sbt_index),
             callable_var_index: *callable_var_index,
         },
         InstData::EmitMeshTasksExt {
@@ -2585,17 +2578,17 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             group_z,
             payload_var_index,
         } => InstData::EmitMeshTasksExt {
-            group_x: remap_id(*group_x, remap),
-            group_y: remap_id(*group_y, remap),
-            group_z: remap_id(*group_z, remap),
+            group_x: map(*group_x),
+            group_y: map(*group_y),
+            group_z: map(*group_z),
             payload_var_index: *payload_var_index,
         },
         InstData::SetMeshOutputsExt {
             vertex_count,
             primitive_count,
         } => InstData::SetMeshOutputsExt {
-            vertex_count: remap_id(*vertex_count, remap),
-            primitive_count: remap_id(*primitive_count, remap),
+            vertex_count: map(*vertex_count),
+            primitive_count: map(*primitive_count),
         },
         InstData::EmitVertex => InstData::EmitVertex,
         InstData::EndPrimitive => InstData::EndPrimitive,
@@ -2604,7 +2597,7 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         },
         InstData::StoreStageVar { var_index, value } => InstData::StoreStageVar {
             var_index: *var_index,
-            value: remap_id(*value, remap),
+            value: map(*value),
         },
         InstData::HitObjectTraceRay {
             hit_object_id,
@@ -2622,15 +2615,15 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
         } => InstData::HitObjectTraceRay {
             hit_object_id: *hit_object_id,
             tlas_descriptor_index: *tlas_descriptor_index,
-            ray_flags: remap_id(*ray_flags, remap),
-            cull_mask: remap_id(*cull_mask, remap),
-            sbt_offset: remap_id(*sbt_offset, remap),
-            sbt_stride: remap_id(*sbt_stride, remap),
-            miss_index: remap_id(*miss_index, remap),
-            origin: remap_id(*origin, remap),
-            t_min: remap_id(*t_min, remap),
-            direction: remap_id(*direction, remap),
-            t_max: remap_id(*t_max, remap),
+            ray_flags: map(*ray_flags),
+            cull_mask: map(*cull_mask),
+            sbt_offset: map(*sbt_offset),
+            sbt_stride: map(*sbt_stride),
+            miss_index: map(*miss_index),
+            origin: map(*origin),
+            t_min: map(*t_min),
+            direction: map(*direction),
+            t_max: map(*t_max),
             payload_var_index: *payload_var_index,
         },
         InstData::HitObjectRecordEmpty(id) => InstData::HitObjectRecordEmpty(*id),
@@ -2645,8 +2638,8 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             payload_var_index: *payload_var_index,
         },
         InstData::ReorderThreadWithHint { hint, bits } => InstData::ReorderThreadWithHint {
-            hint: remap_id(*hint, remap),
-            bits: remap_id(*bits, remap),
+            hint: map(*hint),
+            bits: map(*bits),
         },
         InstData::ReorderThreadWithHitObject {
             hit_object_id,
@@ -2654,8 +2647,8 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             bits,
         } => InstData::ReorderThreadWithHitObject {
             hit_object_id: *hit_object_id,
-            hint: hint.map(|h| remap_id(h, remap)),
-            bits: bits.map(|b| remap_id(b, remap)),
+            hint: hint.map(map),
+            bits: bits.map(map),
         },
         InstData::RayQueryTriangleVertexPositions {
             ray_query_id,
@@ -2669,9 +2662,9 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             layout,
             stride,
         } => InstData::CoopMatrixLoad {
-            ptr: remap_id(*ptr, remap),
+            ptr: map(*ptr),
             layout: *layout,
-            stride: stride.map(|s| remap_id(s, remap)),
+            stride: stride.map(map),
         },
         InstData::CoopMatrixStore {
             ptr,
@@ -2679,10 +2672,10 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             layout,
             stride,
         } => InstData::CoopMatrixStore {
-            ptr: remap_id(*ptr, remap),
-            value: remap_id(*value, remap),
+            ptr: map(*ptr),
+            value: map(*value),
             layout: *layout,
-            stride: stride.map(|s| remap_id(s, remap)),
+            stride: stride.map(map),
         },
         InstData::CoopMatrixMulAdd {
             a,
@@ -2690,9 +2683,9 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             c,
             operands_mask,
         } => InstData::CoopMatrixMulAdd {
-            a: remap_id(*a, remap),
-            b: remap_id(*b, remap),
-            c: remap_id(*c, remap),
+            a: map(*a),
+            b: map(*b),
+            c: map(*c),
             operands_mask: *operands_mask,
         },
         InstData::CoopMatrixLength { mat_ty } => InstData::CoopMatrixLength {
@@ -2703,7 +2696,7 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             sample,
         } => InstData::SubpassLoad {
             descriptor_index: *descriptor_index,
-            sample: sample.map(|s| remap_id(s, remap)),
+            sample: sample.map(map),
         },
         InstData::ImageFetchMs {
             descriptor_index,
@@ -2711,14 +2704,14 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             sample,
         } => InstData::ImageFetchMs {
             descriptor_index: *descriptor_index,
-            coord: remap_id(*coord, remap),
-            sample: remap_id(*sample, remap),
+            coord: map(*coord),
+            sample: map(*sample),
         },
         InstData::BeginInvocationInterlockExt => InstData::BeginInvocationInterlockExt,
         InstData::EndInvocationInterlockExt => InstData::EndInvocationInterlockExt,
         InstData::DebugPrintf { format, args } => InstData::DebugPrintf {
             format: format.clone(),
-            args: args.iter().map(|&a| remap_id(a, remap)).collect(),
+            args: args.iter().map(|&a| map(a)).collect(),
         },
         InstData::DebugLine { line, col } => InstData::DebugLine {
             line: *line,
@@ -3305,6 +3298,7 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::RayQueryCommittedWorldToObject(_)
                     | InstData::RayQueryCommittedFrontFace(_)
                     | InstData::RayQueryCommittedBarycentrics(_)
+                    | InstData::RayQueryRead { .. }
                     | InstData::TraceRayKhr { .. }
                     | InstData::IgnoreIntersectionKhr
                     | InstData::TerminateRayKhr
@@ -4645,6 +4639,21 @@ fn mem2reg_stmts(
                     let resolved_val = mem2reg_resolve_inst(func, value, env, state, &mut visited);
                     env.insert(local_idx, resolved_val);
                     state.removed_insts.insert(id);
+                    // Preserve the definition site of the stored value. In particular,
+                    // loop latch values must remain visible to structured SPIR-V emission.
+                    if !matches!(
+                        func.insts[resolved_val].data,
+                        InstData::Phi { .. }
+                            | InstData::ConstBool(_)
+                            | InstData::ConstI32(_)
+                            | InstData::ConstU32(_)
+                            | InstData::ConstF32(_)
+                            | InstData::ConstF16(_)
+                            | InstData::ConstI64(_)
+                            | InstData::ConstU64(_)
+                    ) {
+                        out.push(StructuredStmt::Eval(resolved_val));
+                    }
                     continue;
                 }
                 if let InstData::LocalLoad { ptr } = func.insts[id].data
@@ -4806,8 +4815,9 @@ fn mem2reg_stmts(
                 if !body_term {
                     cont_entry_envs.push((env.clone(), 0));
                 }
-                for cont_env in inner_loop.continue_envs {
-                    let tag = cont_entry_envs.len() as u32;
+                for (index, cont_env) in inner_loop.continue_envs.into_iter().enumerate() {
+                    // Tag zero is reserved for normal fallthrough even if absent.
+                    let tag = index as u32 + 1;
                     cont_entry_envs.push((cont_env, tag));
                 }
 
@@ -5118,6 +5128,7 @@ fn is_licm_hoistable(func: &IrFunction, id: InstId) -> bool {
             | InstData::RayQueryCommittedWorldToObject(_)
             | InstData::RayQueryCommittedFrontFace(_)
             | InstData::RayQueryCommittedBarycentrics(_)
+            | InstData::RayQueryRead { .. }
             | InstData::LoadStageVar { .. }
             | InstData::HitObjectIsHit(_)
             | InstData::HitObjectGetRayTMax(_)
@@ -5580,6 +5591,7 @@ fn max_ray_query_id_plus_one(func: &IrFunction) -> u32 {
     for (_, inst) in func.insts.iter() {
         let rq = match inst.data {
             InstData::RayQueryInitialize { ray_query_id, .. }
+            | InstData::RayQueryRead { ray_query_id, .. }
             | InstData::RayQueryTriangleVertexPositions { ray_query_id, .. }
             | InstData::RayQueryGenerateIntersection { ray_query_id, .. } => Some(ray_query_id),
             InstData::RayQueryProceed(id)
@@ -5604,6 +5616,25 @@ fn max_ray_query_id_plus_one(func: &IrFunction) -> u32 {
         }
     }
     next_id
+}
+
+fn max_hit_object_id_plus_one(func: &IrFunction) -> u32 {
+    func.insts
+        .iter()
+        .filter_map(|(_, inst)| match inst.data {
+            InstData::HitObjectTraceRay { hit_object_id, .. }
+            | InstData::HitObjectExecuteShader { hit_object_id, .. }
+            | InstData::ReorderThreadWithHitObject { hit_object_id, .. }
+            | InstData::HitObjectRecordEmpty(hit_object_id)
+            | InstData::HitObjectIsHit(hit_object_id)
+            | InstData::HitObjectGetRayTMax(hit_object_id)
+            | InstData::HitObjectGetSbtRecordIndex(hit_object_id) => {
+                Some(hit_object_id.saturating_add(1))
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn can_merge_callee_resources(caller: &IrFunction, callee: &IrFunction) -> bool {
@@ -5669,6 +5700,7 @@ struct InlineResourceRemap {
     stage_io_remap: Vec<u32>,
     pc_field_remap: Vec<u32>,
     rq_offset: u32,
+    ho_offset: u32,
 }
 
 fn merge_callee_resources(caller: &mut IrFunction, callee: &IrFunction) -> InlineResourceRemap {
@@ -5749,6 +5781,7 @@ fn merge_callee_resources(caller: &mut IrFunction, callee: &IrFunction) -> Inlin
     }
 
     let rq_offset = max_ray_query_id_plus_one(caller);
+    let ho_offset = max_hit_object_id_plus_one(caller);
 
     InlineResourceRemap {
         local_offset,
@@ -5757,6 +5790,7 @@ fn merge_callee_resources(caller: &mut IrFunction, callee: &IrFunction) -> Inlin
         stage_io_remap,
         pc_field_remap,
         rq_offset,
+        ho_offset,
     }
 }
 
@@ -5864,14 +5898,25 @@ fn remap_inlined_resource_indices(data: &mut InstData, res: &InlineResourceRemap
             }
         }
         InstData::HitObjectTraceRay {
+            hit_object_id,
             tlas_descriptor_index,
             ..
         } => {
+            *hit_object_id += res.ho_offset;
             if let Some(&mapped) = res.desc_remap.get(*tlas_descriptor_index as usize) {
                 *tlas_descriptor_index = mapped;
             }
         }
-        InstData::RayQueryTriangleVertexPositions { ray_query_id, .. } => {
+        InstData::HitObjectExecuteShader { hit_object_id, .. }
+        | InstData::ReorderThreadWithHitObject { hit_object_id, .. }
+        | InstData::HitObjectRecordEmpty(hit_object_id)
+        | InstData::HitObjectIsHit(hit_object_id)
+        | InstData::HitObjectGetRayTMax(hit_object_id)
+        | InstData::HitObjectGetSbtRecordIndex(hit_object_id) => {
+            *hit_object_id += res.ho_offset;
+        }
+        InstData::RayQueryTriangleVertexPositions { ray_query_id, .. }
+        | InstData::RayQueryRead { ray_query_id, .. } => {
             *ray_query_id += res.rq_offset;
         }
         InstData::RayQueryGenerateIntersection { ray_query_id, .. } => {
@@ -5913,11 +5958,8 @@ fn inline_call_site(
     caller.required_caps |= callee.required_caps;
 
     let mut inst_remap: IndexMap<InstId, InstId> = IndexMap::new();
-    // Keep fresh IDs strictly above every callee ID: `remap_inst_data` uses transitive
-    // `remap_id`, which would otherwise cascade through overlapping source/target IDs.
-    for _ in caller.insts.len()..callee.insts.len() {
-        caller.emit_typed(IrType::Void, InstData::Nop);
-    }
+    // Callee IDs and caller IDs belong to different arenas. The mapping below
+    // is deliberately applied once, even when their numeric values overlap.
     // Pass 1: allocate placeholder slots for every non-Param callee instruction so forward
     // references (e.g. loop Phis) resolve cleanly.
     for (cid, cinst) in callee.insts.iter() {
@@ -5939,12 +5981,12 @@ fn inline_call_site(
             continue;
         }
         let target = inst_remap[&cid];
-        let mut data = remap_inst_data(&cinst.data, &inst_remap);
+        let mut data = map_inst_data(&cinst.data, &|id| inst_remap[&id]);
         remap_inlined_resource_indices(&mut data, &res_remap);
         caller.insts[target].data = data;
     }
 
-    let mut cloned_body = remap_stmts_ids(callee.body.clone(), &inst_remap);
+    let mut cloned_body = map_stmts_ids(callee.body.clone(), &|id| inst_remap[&id]);
     let ret_val = match cloned_body.last() {
         Some(StructuredStmt::Return(val)) => {
             let v = *val;
@@ -7345,6 +7387,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn inline_hit_objects_have_disjoint_function_local_ids() {
+        let mut helper = IrFunction::new("reset");
+        let reset = helper.emit(None, InstData::HitObjectRecordEmpty(0));
+        helper.body.push(StructuredStmt::Eval(reset));
+        let mut entry = IrFunction::new("main");
+        entry.stage = Some(vsl_mc::ShaderStage::RayGen);
+        let reset = entry.emit(None, InstData::HitObjectRecordEmpty(0));
+        entry.body.push(StructuredStmt::Eval(reset));
+        for _ in 0..2 {
+            let call = entry.emit_typed(
+                IrType::Void,
+                InstData::FunctionCall {
+                    callee: SmolStr::new_static("reset"),
+                    args: Vec::new(),
+                },
+            );
+            entry.body.push(StructuredStmt::Eval(call));
+        }
+        let mut module = IrModule {
+            name: SmolStr::new_static("hit_objects"),
+            functions: vec![helper, entry],
+        };
+        SelectiveInlinePass.run_module(&mut module);
+        let ids: Vec<_> = module.functions[1]
+            .insts
+            .iter()
+            .filter_map(|(_, inst)| {
+                if let InstData::HitObjectRecordEmpty(id) = inst.data {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 
     #[test]

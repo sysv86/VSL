@@ -18,8 +18,8 @@ use vsl_ir::{
     IrDescriptorVar, IrFunction, IrInterlockMode, IrInterpolation, IrLocalVar, IrModule, IrParam,
     IrPushConstantBlock, IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar,
     IrStorageClass, IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing,
-    IrTopology, IrType, IrWorkgroupVar, MemoryAccess, ScalarIrTy, StructuredStmt,
-    SubgroupClusteredOp,
+    IrTopology, IrType, IrWorkgroupVar, MemoryAccess, RayQueryIntersection,
+    RayQueryIntersectionProperty, RayQueryRead, ScalarIrTy, StructuredStmt, SubgroupClusteredOp,
 };
 use vsl_mc::{
     BuiltinStructDesc, DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS,
@@ -2391,6 +2391,22 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
     }
 
     fn lower_expr(&mut self, expr: &HirExpr, out: &mut Vec<StructuredStmt>) -> InstId {
+        let instruction_count = self.ir_fn.insts.len();
+        let id = self.lower_expr_inner(expr, out);
+        // Pin newly evaluated memory reads to their source evaluation point.
+        // An existing SSA binding is a captured value, not a fresh read.
+        if self.ir_fn.insts.len() > instruction_count
+            && self.ir_fn.insts[id].data.is_order_sensitive_read()
+            && !out
+                .iter()
+                .any(|stmt| matches!(stmt, StructuredStmt::Eval(previous) if *previous == id))
+        {
+            out.push(StructuredStmt::Eval(id));
+        }
+        id
+    }
+
+    fn lower_expr_inner(&mut self, expr: &HirExpr, out: &mut Vec<StructuredStmt>) -> InstId {
         let expr_ir_ty = self.ir_ty_of(expr.ty);
         match &expr.kind {
             HirExprKind::BoolLit(b) => self
@@ -4213,6 +4229,12 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         // `mc::params.<key>` / `params.<key>` / `pack::params.<key>`
         if let HirExprKind::Path { path, .. } = &receiver.kind
             && matches!(path.as_str(), "mc::params" | "params" | "pack::params")
+            && (path.as_str() != "params"
+                || (field_index.is_none()
+                    && !self.ssa_locals.contains_key(path)
+                    && !self.local_var_slots.contains_key(path)
+                    && !self.ptr_param_locals.contains_key(path)
+                    && self.push_constant_param.as_ref() != Some(path)))
         {
             return self.emit_pack_param_load(field.as_str(), expr_ir_ty, span);
         }
@@ -6135,6 +6157,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 | "cross"
                 | "normalize"
                 | "reflect"
+                | "refract"
                 | "pack_half_2x16"
                 | "unpack_half_2x16"
                 | "pack_unorm_4x8"
@@ -6223,6 +6246,7 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             "cross" => GlslStd450Op::Cross,
             "normalize" => GlslStd450Op::Normalize,
             "reflect" => GlslStd450Op::Reflect,
+            "refract" => GlslStd450Op::Refract,
             "pack_half_2x16" => GlslStd450Op::PackHalf2x16,
             "unpack_half_2x16" => GlslStd450Op::UnpackHalf2x16,
             "pack_unorm_4x8" => GlslStd450Op::PackUnorm4x8,
@@ -7244,6 +7268,21 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 span,
             ));
         };
+        if let Some(read) = ray_query_read_method(method) {
+            if !args.is_empty() {
+                return Some(self.emit_diag(
+                    "E0528",
+                    format!("`RayQuery::{method}` requires exactly 0 arguments"),
+                    span,
+                ));
+            }
+            let id = self.ir_fn.emit_typed(
+                read.result_type(),
+                InstData::RayQueryRead { ray_query_id, read },
+            );
+            out.push(StructuredStmt::Eval(id));
+            return Some(id);
+        }
         let id = match method {
             "initialize" => {
                 if args.len() != 7 {
@@ -7836,6 +7875,44 @@ const fn pack_param_type_to_scalar(ty: PackParamType) -> ScalarIrTy {
         PackParamType::U32 => ScalarIrTy::U32,
         PackParamType::F32 | PackParamType::Vec3 => ScalarIrTy::F32,
     }
+}
+
+fn ray_query_read_method(method: &str) -> Option<RayQueryRead> {
+    use RayQueryIntersection::{Candidate, Committed};
+    use RayQueryIntersectionProperty as P;
+    match method {
+        "ray_tmin" => return Some(RayQueryRead::RayTMin),
+        "ray_flags" => return Some(RayQueryRead::RayFlags),
+        "world_ray_origin" => return Some(RayQueryRead::WorldRayOrigin),
+        "world_ray_direction" => return Some(RayQueryRead::WorldRayDirection),
+        "candidate_aabb_opaque" => return Some(RayQueryRead::CandidateAabbOpaque),
+        _ => {}
+    }
+    let (intersection, name) = if let Some(name) = method.strip_prefix("candidate_") {
+        (Candidate, name)
+    } else {
+        (Committed, method.strip_prefix("committed_")?)
+    };
+    let property = match name {
+        "type" => P::Type,
+        "t" => P::T,
+        "instance_id" => P::InstanceId,
+        "instance_custom_index" => P::InstanceCustomIndex,
+        "sbt_record_offset" => P::SbtRecordOffset,
+        "geometry_index" => P::GeometryIndex,
+        "primitive_index" => P::PrimitiveIndex,
+        "barycentrics" => P::Barycentrics,
+        "front_face" => P::FrontFace,
+        "object_ray_origin" => P::ObjectRayOrigin,
+        "object_ray_direction" => P::ObjectRayDirection,
+        "object_to_world" => P::ObjectToWorld,
+        "world_to_object" => P::WorldToObject,
+        _ => return None,
+    };
+    Some(RayQueryRead::Intersection {
+        intersection,
+        property,
+    })
 }
 
 fn alloc_local_var(ir_fn: &mut IrFunction, name: SmolStr, ty: IrType) -> u32 {

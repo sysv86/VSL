@@ -240,6 +240,76 @@ pub struct SpannedToken {
     pub span: Span,
 }
 
+fn numeric_literal_error(token: &Token, source: &str, end: usize) -> Option<&'static str> {
+    let (Token::IntLit(raw) | Token::HexLit(raw) | Token::FloatLit(raw)) = token else {
+        return None;
+    };
+    if source
+        .as_bytes()
+        .get(end)
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    {
+        return Some("invalid numeric literal or suffix");
+    }
+    match token {
+        Token::IntLit(_) | Token::HexLit(_) => {
+            let is_32 = raw.ends_with("u32") || raw.ends_with("i32") || raw.ends_with(['u', 'i']);
+            let clean = raw
+                .trim_end_matches("u64")
+                .trim_end_matches("i64")
+                .trim_end_matches("u32")
+                .trim_end_matches("i32")
+                .trim_end_matches(['u', 'i'])
+                .replace('_', "");
+            let (digits, radix) = if let Some(rest) = clean
+                .strip_prefix("0x")
+                .or_else(|| clean.strip_prefix("0X"))
+            {
+                (rest, 16)
+            } else if let Some(rest) = clean
+                .strip_prefix("0b")
+                .or_else(|| clean.strip_prefix("0B"))
+            {
+                (rest, 2)
+            } else if let Some(rest) = clean
+                .strip_prefix("0o")
+                .or_else(|| clean.strip_prefix("0O"))
+            {
+                (rest, 8)
+            } else {
+                (clean.as_str(), 10)
+            };
+            match u64::from_str_radix(digits, radix) {
+                Ok(value) if is_32 && u32::try_from(value).is_err() => {
+                    Some("numeric literal exceeds 32-bit integer range")
+                }
+                Ok(_) => None,
+                Err(_) => Some("invalid or out-of-range 64-bit integer literal"),
+            }
+        }
+        Token::FloatLit(_) => {
+            let clean = raw
+                .trim_end_matches("f32")
+                .trim_end_matches("f16")
+                .trim_end_matches('f')
+                .replace('_', "");
+            // The manifest uses unsuffixed f64 values; explicit shader suffixes select f32/f16.
+            if raw.ends_with("f16") || raw.ends_with("f32") || raw.ends_with('f') {
+                if clean.parse::<f32>().is_ok_and(f32::is_finite) {
+                    None
+                } else {
+                    Some("invalid or out-of-range floating-point literal")
+                }
+            } else if clean.parse::<f64>().is_ok_and(f64::is_finite) {
+                None
+            } else {
+                Some("invalid or out-of-range floating-point literal")
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Tokenizes `source` into a flat vector of [`SpannedToken`]s and any lexical diagnostics.
 pub fn lex(file: FileId, source: &str) -> (Vec<SpannedToken>, Vec<Diagnostic>) {
     let mut tokens = Vec::new();
@@ -248,6 +318,9 @@ pub fn lex(file: FileId, source: &str) -> (Vec<SpannedToken>, Vec<Diagnostic>) {
     for (result, range) in Token::lexer(source).spanned() {
         let span = Span::from_range(file, &range);
         if let Ok(token) = result {
+            if let Some(message) = numeric_literal_error(&token, source, range.end) {
+                diagnostics.push(Diagnostic::error("E0001", message, span));
+            }
             tokens.push(SpannedToken { token, span });
         } else {
             let bad = source.get(span.to_range()).unwrap_or("");
@@ -268,6 +341,31 @@ pub fn lex(file: FileId, source: &str) -> (Vec<SpannedToken>, Vec<Diagnostic>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_malformed_numeric_literals_and_preserves_valid_boundaries() {
+        for source in [
+            "0x_",
+            "0b102",
+            "0o89",
+            "0x",
+            "1e+",
+            "10u128",
+            "1f32foo",
+            "4294967296u",
+            "18446744073709551616u64",
+            "1e100f32",
+        ] {
+            let (_, diagnostics) = lex(FileId(0), source);
+            assert!(!diagnostics.is_empty(), "{source}");
+        }
+        let (tokens, diagnostics) = lex(
+            FileId(0),
+            "0xffffffffu 0xffffffffffffffffu64 1e+1_0 1..2 0b1_0u 0o17i",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(tokens.iter().any(|token| token.token == Token::DotDot));
+    }
 
     #[test]
     fn lexes_vsl_attributes_and_literals() {

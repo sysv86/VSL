@@ -1,0 +1,15 @@
+// Two concrete instantiations of a reusable identity function.
+fn identity<T>(value: T) -> T { value }
+
+fn blend(a: f32, b: f32) -> f32 { a * 0.25 + b * 0.75 }
+
+@stage(compute(8, 1, 1))
+fn generic_values(
+    #[binding(set = 0, binding = 0)] output: RWBuffer<vec4>,
+    #[builtin(global_invocation_id)] gid: uvec3,
+) {
+    let index = identity::<u32>(gid.x);
+    let rgb = identity::<vec3>(vec3(0.25, 0.5, 0.75));
+    let alpha = blend(rgb.x, rgb.z);
+    output[index] = vec4(rgb, alpha);
+}

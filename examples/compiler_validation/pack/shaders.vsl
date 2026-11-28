@@ -1,0 +1,17 @@
+@stage(compute(8, 8, 1))
+fn fill_image(
+    out_source: RWImage2D<rgba16f>,
+    #[builtin(global_invocation_id)] gid: uvec3,
+) {
+    out_source.store(ivec2(gid.xy), vec4(0.2, 0.4, 0.6, 1.0));
+}
+
+@stage(compute(8, 8, 1))
+fn copy_image(
+    input: Texture2D<f32>,
+    out_result: RWImage2D<rgba16f>,
+    #[builtin(global_invocation_id)] gid: uvec3,
+) {
+    let pixel = ivec2(gid.xy);
+    out_result.store(pixel, input.fetch(pixel, 0));
+}

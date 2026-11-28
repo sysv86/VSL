@@ -206,6 +206,56 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_evaluator_values_instead_of_substituting_defaults() {
+        for (body, expected) in [
+            ("let value = 1 / 0;", "invalid operands"),
+            ("let value = 1.0 / 0.0;", "invalid operands"),
+            ("let value = 9223372036854775807 + 1;", "invalid operands"),
+            ("let value = 1 << 64;", "invalid operands"),
+            ("let mut value = 5; value /= 0;", "invalid assignment"),
+            ("if 1 { }", "if condition"),
+            ("while 1 { break; }", "while condition"),
+            ("let value = true && 1;", "boolean operands"),
+            ("let value = false || 1;", "boolean operands"),
+            ("let t = g.target::<rgba16f>(1);", "string literal name"),
+            ("let t = g.target::<rgba16f>(\"t\", scale = 0.0);", "scale"),
+            ("let t = g.target::<rgba16f>(\"t\", layers = -1);", "layers"),
+            (
+                "let t = g.target::<rgba16f>(\"t\", mip_levels = 1.5);",
+                "mip_levels",
+            ),
+            (
+                "let t = g.target::<rgba16f>(\"t\", temporal = 1);",
+                "temporal",
+            ),
+            (
+                "let t = g.target::<rgba16f>(\"t\", clear_color = 1);",
+                "clear_color",
+            ),
+        ] {
+            let source = format!(
+                "pack \"test\" {{ name: \"Test\" }} pipeline extend(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {{ {body} }}"
+            );
+            let parsed = parse_source(FileId(0), &source);
+            assert!(!parsed.has_errors(), "{body}: {:?}", parsed.diagnostics);
+            let (_, diagnostics) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
+            assert!(
+                diagnostics
+                    .as_slice()
+                    .iter()
+                    .any(|d| d.code == "E0430" && d.message.contains(expected)),
+                "{body}: {:?}",
+                diagnostics.as_slice()
+            );
+        }
+        let source = "pack \"test\" { name: \"Test\" } pipeline extend(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) { let a = false && (1 / 0 == 1); let b = true || (1 / 0 == 1); }";
+        let parsed = parse_source(FileId(0), source);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (_, diagnostics) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.as_slice());
+    }
+
+    #[test]
     fn evaluates_while_loop_break_continue_return_arith_hex_and_spec() {
         let src = r#"
             pack "ctrl-pack" { name: "Control Flow" }

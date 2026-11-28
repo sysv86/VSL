@@ -3,7 +3,10 @@
 pub mod emit;
 pub mod hook_bridge;
 
-pub use emit::{BindlessAbi, EmitOptions, emit_glsl_460, emit_glsl_460_with_options};
+pub use emit::{
+    BindlessAbi, EmitOptions, emit_glsl_460, emit_glsl_460_entry_with_options,
+    emit_glsl_460_with_options,
+};
 pub use hook_bridge::{
     emit_raster_gbuffer_hook_slot, emit_raster_gbuffer_hook_slot_from_unit,
     emit_raster_gbuffer_hook_slot_with_schema, emit_raster_gbuffer_hook_slot_with_types,
@@ -282,6 +285,10 @@ mod tests {
     }
 
     fn validate_glsl_if_available(label: &str, glsl: &str, check_omm_mode: bool) {
+        validate_glsl_stage(label, glsl, "comp", check_omm_mode);
+    }
+
+    fn validate_glsl_stage(label: &str, glsl: &str, stage: &str, check_omm_mode: bool) {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
@@ -291,7 +298,7 @@ mod tests {
             .args([
                 "--stdin",
                 "-S",
-                "comp",
+                stage,
                 "-V",
                 "--target-env",
                 "vulkan1.3",
@@ -362,6 +369,404 @@ mod tests {
     fn validates_generated_ray_query_extensions_with_khronos_tools() {
         let glsl = emit_standalone_test_shader(POSITION_FETCH_VSL);
         validate_glsl_if_available("ray_query_extensions", &glsl, true);
+    }
+
+    fn standalone_options() -> EmitOptions {
+        EmitOptions {
+            abi: vsl_mc::AbiProfile::Standalone,
+            ..EmitOptions::default()
+        }
+    }
+
+    fn selected_glsl(src: &str, entry: &str) -> Result<String, String> {
+        let parsed = parse_source(FileId(0), src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        emit_glsl_460_entry_with_options(&parsed.unit, entry, standalone_options())
+    }
+
+    const RT_STAGE_SOURCE: &str = r"
+        @raygen fn launch(
+            #[binding(set=0, binding=0)] scene: AccelerationStructure,
+            #[binding(set=0, binding=1)] image: RWImage2D<rgba16f>,
+            #[ray_payload(3)] inout color: vec4,
+            #[callable_data(2)] inout data: vec4,
+            #[builtin(launch_id)] pixel: uvec3,
+        ) {
+            color = vec4(1.0);
+            trace_ray(scene, 0u, 255u, 0u, 0u, 0u, vec3(0.0), 0.01, vec3(0.0, 0.0, 1.0), 32.0, color);
+            data = color;
+            execute_callable(0u, data);
+            image.store(ivec2(pixel.xy), data);
+        }
+        @stage(closest_hit) fn hit(
+            #[incoming_ray_payload(3)] inout color: vec4,
+            #[hit_attribute] uv: vec2,
+            #[builtin(ray_tmax)] distance: f32,
+            #[builtin(instance_custom_index)] instance: u32,
+        ) { color = vec4(uv.x, uv.y, distance + f32(instance), 1.0); }
+        @miss fn miss_color(#[incoming_ray_payload(3)] inout color: vec4) { color = vec4(0.0); }
+        @any_hit fn filter_hit(#[incoming_ray_payload(3)] inout color: vec4) {
+            if color.x < 0.0 { ignore_intersection(); } else { terminate_ray(); }
+        }
+        @intersection fn intersect(#[hit_attribute] out attribute_value: vec2) {
+            attribute_value = vec2(0.25);
+            let accepted = report_intersection(1.0, 0u);
+        }
+        @callable fn shade(#[incoming_callable_data(2)] inout data: vec4) { data = data.zyxw; }
+    ";
+
+    #[test]
+    fn emits_single_rt_entry_with_native_interfaces_and_shader_calls() {
+        for (entry, stage, expected) in [
+            (
+                "launch",
+                "rgen",
+                "layout(location = 3) rayPayloadEXT vec4 color;",
+            ),
+            (
+                "hit",
+                "rchit",
+                "layout(location = 3) rayPayloadInEXT vec4 color;",
+            ),
+            (
+                "miss_color",
+                "rmiss",
+                "layout(location = 3) rayPayloadInEXT vec4 color;",
+            ),
+            ("filter_hit", "rahit", "ignoreIntersectionEXT;"),
+            (
+                "intersect",
+                "rint",
+                "bool accepted = reportIntersectionEXT(1.0, 0u);",
+            ),
+            (
+                "shade",
+                "rcall",
+                "layout(location = 2) callableDataInEXT vec4 data;",
+            ),
+        ] {
+            let glsl = selected_glsl(RT_STAGE_SOURCE, entry).unwrap();
+            assert_eq!(glsl.matches("void main()").count(), 1, "{glsl}");
+            assert!(glsl.contains(expected), "missing {expected}:\n{glsl}");
+            assert!(glsl.contains("#extension GL_EXT_ray_tracing : require"));
+            if entry == "launch" {
+                assert!(glsl.contains("32.0, 3);"), "{glsl}");
+                assert!(glsl.contains("executeCallableEXT(0u, 2);"), "{glsl}");
+            }
+            validate_glsl_stage(entry, &glsl, stage, false);
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_entries_unsupported_stages_and_bad_rt_interface() {
+        let glsl = emit_standalone_test_shader(RT_STAGE_SOURCE);
+        assert!(glsl.contains("#error Multiple entry points"));
+        assert!(selected_glsl(RT_STAGE_SOURCE, "absent").is_err());
+        assert!(selected_glsl("@mesh fn mesh_main() {}", "mesh_main").is_err());
+        assert!(
+            selected_glsl(
+                "@raygen fn bad(#[incoming_ray_payload(0)] p: vec4) {}",
+                "bad"
+            )
+            .is_err()
+        );
+        assert!(
+            selected_glsl(
+                "@raygen fn bad(#[ray_payload(0)] p: vec4) { execute_callable(0u, p); }",
+                "bad"
+            )
+            .is_err()
+        );
+        assert!(selected_glsl("@raygen fn bad() { let hit: HitObject; }", "bad").is_err());
+        assert!(selected_glsl("#[cap(ser_nv, ser_ext)] @raygen fn bad() {}", "bad").is_err());
+    }
+
+    #[test]
+    fn emits_shader_record_block_and_position_fetch_builtin() {
+        let glsl = selected_glsl(
+            r"
+            #[layout(std430)] struct Coefficients { gain: vec4, bias: vec4 }
+            @raygen fn read_record(
+                #[binding(set=0,binding=0)] image: RWImage2D<rgba16f>,
+                #[shader_record] record: Coefficients,
+            ) { image.store(ivec2(0,0), record.gain + record.bias); }
+        ",
+            "read_record",
+        )
+        .unwrap();
+        assert!(
+            glsl.contains("layout(shaderRecordEXT, std430) buffer"),
+            "{glsl}"
+        );
+        validate_glsl_stage("shader_record", &glsl, "rgen", false);
+        let glsl = selected_glsl(
+            r"
+            #[cap(position_fetch)] @closest_hit fn fetch_vertices(
+                #[incoming_ray_payload(0)] inout color: vec4,
+                #[builtin(hit_triangle_vertex_positions)] positions: [vec3; 3],
+            ) { color = vec4(positions[0u], 1.0); }
+        ",
+            "fetch_vertices",
+        )
+        .unwrap();
+        assert!(glsl.contains("gl_HitTriangleVertexPositionsEXT"));
+        validate_glsl_stage("hit_positions", &glsl, "rchit", false);
+    }
+
+    #[test]
+    #[ignore = "requires glslang and SPIRV-Tools with NV and EXT SER support"]
+    fn validates_both_hit_object_profiles() {
+        for (cap, suffix) in [("ser_nv", "NV"), ("ser_ext", "EXT")] {
+            let src = format!(
+                r"
+                #[cap({cap})] @raygen fn deferred(
+                    #[binding(set=0,binding=0)] scene: AccelerationStructure,
+                    #[binding(set=0,binding=1)] image: RWImage2D<rgba16f>,
+                    #[ray_payload(4)] inout color: vec4,
+                ) {{
+                    let hit: HitObject;
+                    hit.record_empty();
+                    color = vec4(0.0);
+                    hit.trace_ray(scene, 0u, 255u, 0u, 0u, 0u, vec3(0.0), 0.01, vec3(0.0,0.0,1.0), 32.0, color);
+                    reorder_thread_with_hit_object(hit, 1u, 2u);
+                    if hit.is_hit() {{
+                        let distance = hit.ray_tmax();
+                        let record = hit.sbt_record_index();
+                        image.store(ivec2(0,0), vec4(distance + f32(record)));
+                    }}
+                    hit.execute_shader(color);
+                    reorder_thread_with_hint(0u, 1u);
+                    image.store(ivec2(1,0), color);
+                }}
+            "
+            );
+            let glsl = selected_glsl(&src, "deferred").unwrap();
+            assert!(
+                glsl.contains(&format!("hitObjectTraceRay{suffix}(hit,")),
+                "{glsl}"
+            );
+            assert!(
+                glsl.contains(&format!("hitObjectExecuteShader{suffix}(hit, 4);")),
+                "{glsl}"
+            );
+            validate_glsl_stage(cap, &glsl, "rgen", false);
+        }
+    }
+
+    #[test]
+    fn emits_all_ray_query_getters_with_native_result_types() {
+        let glsl = emit_standalone_test_shader(
+            r"
+            #[cap(ray_query)] @stage(compute(1,1,1)) fn query(
+                #[binding(set=0,binding=0)] scene: AccelerationStructure,
+                #[binding(set=0,binding=1)] image: RWImage2D<rgba16f>,
+            ) {
+                let mut rq: RayQuery;
+                rq.initialize(scene, 0u, 255u, vec3(0.0), 0.01, vec3(0.0,0.0,1.0), 32.0);
+                let flags = rq.ray_flags();
+                let tmin = rq.ray_tmin();
+                let origin = rq.world_ray_origin();
+                let direction = rq.world_ray_direction();
+                while rq.proceed() {
+                    let index = rq.candidate_instance_id();
+                    let custom = rq.candidate_instance_custom_index();
+                    let geom = rq.candidate_geometry_index();
+                    let prim = rq.candidate_primitive_index();
+                    let offset = rq.candidate_sbt_record_offset();
+                    let object_origin = rq.candidate_object_ray_origin();
+                    let object_direction = rq.candidate_object_ray_direction();
+                    let object_to_world = rq.candidate_object_to_world();
+                    let world_to_object = rq.candidate_world_to_object();
+                    let column = object_to_world[0u];
+                    if rq.candidate_type() == 0u {
+                        let front = rq.candidate_front_face();
+                        let uv = rq.candidate_barycentrics();
+                        let t = rq.candidate_t();
+                        if front { image.store(ivec2(0,0), vec4(uv, t, 1.0)); }
+                        rq.confirm_intersection();
+                    } else {
+                        let opaque = rq.candidate_aabb_opaque();
+                        if opaque { rq.generate_intersection(1.0); }
+                    }
+                }
+                if rq.committed_type() == 1u {
+                    let index = rq.committed_instance_id();
+                    let custom = rq.committed_instance_custom_index();
+                    let geom = rq.committed_geometry_index();
+                    let prim = rq.committed_primitive_index();
+                    let offset = rq.committed_sbt_record_offset();
+                    let object_origin = rq.committed_object_ray_origin();
+                    let object_direction = rq.committed_object_ray_direction();
+                    let object_to_world = rq.committed_object_to_world();
+                    let world_to_object = rq.committed_world_to_object();
+                    let column = world_to_object[0u];
+                    let front = rq.committed_front_face();
+                    let uv = rq.committed_barycentrics();
+                    let t = rq.committed_t();
+                    if front { image.store(ivec2(1,0), vec4(uv, t, 1.0)); }
+                }
+                image.store(ivec2(2,0), vec4(origin + direction, tmin + f32(flags)));
+            }
+        ",
+        );
+        for expected in [
+            "uint flags = rayQueryGetRayFlagsEXT(rq);",
+            "float tmin = rayQueryGetRayTMinEXT(rq);",
+            "vec3 origin = rayQueryGetWorldRayOriginEXT(rq);",
+            "vec3 direction = rayQueryGetWorldRayDirectionEXT(rq);",
+            "uint index = uint(rayQueryGetIntersectionInstanceIdEXT(rq, false));",
+            "uint offset = rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(rq, true);",
+            "mat4x3 object_to_world = rayQueryGetIntersectionObjectToWorldEXT(rq, false);",
+            "vec3 column = object_to_world[0u];",
+            "bool opaque = rayQueryGetIntersectionCandidateAABBOpaqueEXT(rq);",
+            "vec2 uv = rayQueryGetIntersectionBarycentricsEXT(rq, false);",
+        ] {
+            assert!(glsl.contains(expected), "missing {expected}:\n{glsl}");
+        }
+        validate_glsl_if_available("all_query_getters", &glsl, false);
+        assert!(selected_glsl("#[cap(ray_query)] @stage(compute(1,1,1)) fn bad() { let rq: RayQuery; rq.proceed(1u); }", "bad").is_err());
+        assert!(selected_glsl("#[cap(ray_query)] @stage(compute(1,1,1)) fn bad() { let rq: RayQuery; rq.unknown(); }", "bad").is_err());
+    }
+
+    #[test]
+    fn preserves_lazy_branches_and_while_condition_preludes() {
+        let glsl = selected_glsl(r"
+            @stage(compute(1,1,1)) fn control(
+                #[binding(set=0,binding=0)] result: RWBuffer<u32>,
+            ) {
+                let mut count = 0u;
+                let enabled = false;
+                let active = enabled && { count = count + 1u; count > 0u };
+                let alternative = enabled || { count = count + 2u; count > 0u };
+                let value: u32 = if active { { count = count + 4u; count } } else if { count = count + 8u; alternative } { 2u } else { 3u };
+                while { count = count + 1u; count < 20u } {
+                    if count == 15u { continue; }
+                }
+                result[0u] = count + value;
+            }
+        ", "control").unwrap();
+        let and_guard = glsl.find("if (_vsl_tmp_").unwrap();
+        let and_increment = glsl.find("count = (count + 1u);").unwrap();
+        assert!(and_guard < and_increment, "{glsl}");
+        assert!(glsl.contains("if (!_vsl_tmp_"), "{glsl}");
+        assert!(glsl.contains("} else {"), "{glsl}");
+        let loop_start = glsl.find("while (true)").unwrap();
+        assert!(
+            glsl[loop_start..].contains("count = (count + 1u);"),
+            "{glsl}"
+        );
+        validate_glsl_if_available("lazy_control", &glsl, false);
+    }
+
+    #[test]
+    fn rejects_invalid_rt_locations_and_mixed_shader_record_layouts() {
+        for source in [
+            "@raygen fn bad(#[ray_payload(-1)] p: vec4) {}",
+            "@raygen fn bad(#[ray_payload(0, 1)] p: vec4) {}",
+            "@raygen fn bad(#[ray_payload(0)] a: vec4, #[ray_payload(0)] b: vec4) {}",
+            "@raygen fn bad(#[shader_record] p: f32) {}",
+            "struct Record { value: bool } @raygen fn bad(#[shader_record] r: Record) {}",
+            "#[layout(std140)] struct Inner { value: f32 } struct Record { inner: Inner } @raygen fn bad(#[shader_record] r: Record) {}",
+            "@raygen fn bad(#[ray_payload(0)] p: vec4, #[binding(set=0,binding=0)] scene: AccelerationStructure) { { let p = vec4(0.0); trace_ray(scene, 0u, 255u, 0u, 0u, 0u, vec3(0.0), 0.01, vec3(0.0), 32.0, p); } }",
+        ] {
+            assert!(selected_glsl(source, "bad").is_err(), "{source}");
+        }
+        let glsl = selected_glsl(
+            r"
+            struct Record { scale: f32, direction: vec3, weights: [f32; 2] }
+            @raygen fn record_default(#[shader_record] record: Record) {
+                let value = record.direction;
+            }
+        ",
+            "record_default",
+        )
+        .unwrap();
+        assert!(
+            glsl.contains("layout(shaderRecordEXT, std430) buffer"),
+            "{glsl}"
+        );
+        validate_glsl_stage("record_default", &glsl, "rgen", false);
+    }
+
+    #[test]
+    fn writes_graphics_outputs_before_early_return() {
+        let glsl = selected_glsl(
+            r"
+            @stage(vertex) fn vertex_main(#[builtin(position)] out position: vec4) {
+                position = vec4(1.0);
+                if position.x > 0.0 { return; }
+                position = vec4(0.0);
+            }
+        ",
+            "vertex_main",
+        )
+        .unwrap();
+        let early_return = glsl.find("return;").unwrap();
+        assert!(
+            glsl[..early_return].contains("gl_Position = position;"),
+            "{glsl}"
+        );
+        validate_glsl_stage("early_return", &glsl, "vert", false);
+    }
+
+    #[test]
+    fn reserves_explicit_bindings_before_automatic_and_debug_resources() {
+        let glsl = selected_glsl(
+            r#"
+            @stage(compute(1,1,1)) fn bindings(
+                automatic: RWBuffer<u32>,
+                #[binding(set=0,binding=0)] explicit_zero: RWBuffer<u32>,
+                #[binding(set=0,binding=2)] explicit_two: RWBuffer<u32>,
+                #[pack_resource(7)] texture: Texture2D<f32>,
+            ) {
+                automatic[0u] = explicit_zero[0u] + explicit_two[0u];
+                mc::debug_write("diagnostic", ivec2(0,0), vec4(1.0));
+            }
+        "#,
+            "bindings",
+        )
+        .unwrap();
+        assert!(
+            glsl.contains("layout(set = 0, binding = 1, scalar) buffer VslBuf_automatic"),
+            "{glsl}"
+        );
+        assert!(glsl.contains("layout(set = 0, binding = 3, rgba16f) writeonly uniform image2D vsl_debug_diagnostic"), "{glsl}");
+        assert!(
+            glsl.contains("layout(set = 3, binding = 7) uniform texture2D texture;"),
+            "{glsl}"
+        );
+        validate_glsl_if_available("binding_plan", &glsl, false);
+        assert!(selected_glsl("@stage(compute(1,1,1)) fn bad(#[binding(set=0,binding=0)] a: RWBuffer<u32>, #[binding(set=0,binding=0)] b: RWBuffer<u32>) {}", "bad").is_err());
+    }
+
+    #[test]
+    fn evaluates_range_bounds_once_and_preserves_array_dimension_order() {
+        let glsl = selected_glsl(
+            r"
+            @stage(compute(1,1,1)) fn ranges(#[binding(set=0,binding=0)] result: RWBuffer<u32>) {
+                let mut limit = 4u;
+                let mut stride = 1u;
+                let mut sum = 0u;
+                for i in (0u..limit).step_by(stride) {
+                    limit = 0u;
+                    stride = 4u;
+                    sum = sum + i;
+                }
+                let values: [[u32; 3]; 2];
+                values[1u][2u] = sum;
+                let row = values[1u];
+                result[0u] = row[2u];
+            }
+        ",
+            "ranges",
+        )
+        .unwrap();
+        assert!(glsl.contains("uint values[2][3];"), "{glsl}");
+        assert!(glsl.contains("uint[3] row = values[1u];"), "{glsl}");
+        let loop_start = glsl.find("for (uint i").unwrap();
+        assert!(glsl[..loop_start].contains("uint(limit)"), "{glsl}");
+        assert!(glsl[..loop_start].contains("uint(stride)"), "{glsl}");
+        validate_glsl_if_available("range_array", &glsl, false);
     }
 
     #[test]

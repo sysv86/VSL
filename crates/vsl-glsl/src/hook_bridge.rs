@@ -239,6 +239,9 @@ fn emit_raster_gbuffer_hook_slot_inner(
     }
 
     emit_fn_decl_with_ctx(func, None, &mut ctx, &mut out);
+    if !ctx.errors.is_empty() {
+        return Err(ctx.errors.join("; "));
+    }
     out.push('\n');
 
     let ret_ty = fn_return_glsl_type(func);

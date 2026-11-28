@@ -764,6 +764,7 @@ pub enum GlslStd450Op {
     Cross,
     Normalize,
     Reflect,
+    Refract,
     Atan,
     Atan2,
     Asin,
@@ -826,6 +827,110 @@ pub struct IrPushConstantBlock {
     pub name: SmolStr,
     pub fields: Vec<IrPushConstantField>,
     pub total_size: u32,
+}
+
+/// Which intersection a ray query read refers to. The SPIR-V operand must be
+/// a constant; retaining this distinction in IR prevents accidental dynamic
+/// selectors and keeps both backends consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RayQueryIntersection {
+    Candidate,
+    Committed,
+}
+
+impl RayQueryIntersection {
+    #[must_use]
+    pub const fn spirv_value(self) -> u32 {
+        match self {
+            Self::Candidate => 0,
+            Self::Committed => 1,
+        }
+    }
+}
+
+/// Properties requiring a candidate or committed intersection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RayQueryIntersectionProperty {
+    Type,
+    T,
+    InstanceId,
+    InstanceCustomIndex,
+    SbtRecordOffset,
+    GeometryIndex,
+    PrimitiveIndex,
+    Barycentrics,
+    FrontFace,
+    ObjectRayOrigin,
+    ObjectRayDirection,
+    ObjectToWorld,
+    WorldToObject,
+}
+
+/// Typed read of traversal state under `SPV_KHR_ray_query`. Position fetch has
+/// its own instruction because it additionally requires a device feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RayQueryRead {
+    RayTMin,
+    RayFlags,
+    WorldRayOrigin,
+    WorldRayDirection,
+    CandidateAabbOpaque,
+    Intersection {
+        intersection: RayQueryIntersection,
+        property: RayQueryIntersectionProperty,
+    },
+}
+
+impl RayQueryRead {
+    #[must_use]
+    pub const fn result_type(self) -> IrType {
+        use RayQueryIntersectionProperty as P;
+        match self {
+            Self::RayTMin | Self::Intersection { property: P::T, .. } => {
+                IrType::Scalar(ScalarIrTy::F32)
+            }
+            Self::RayFlags
+            | Self::Intersection {
+                property:
+                    P::Type
+                    | P::InstanceId
+                    | P::InstanceCustomIndex
+                    | P::SbtRecordOffset
+                    | P::GeometryIndex
+                    | P::PrimitiveIndex,
+                ..
+            } => IrType::Scalar(ScalarIrTy::U32),
+            Self::CandidateAabbOpaque
+            | Self::Intersection {
+                property: P::FrontFace,
+                ..
+            } => IrType::Scalar(ScalarIrTy::Bool),
+            Self::Intersection {
+                property: P::Barycentrics,
+                ..
+            } => IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 2,
+            },
+            Self::WorldRayOrigin
+            | Self::WorldRayDirection
+            | Self::Intersection {
+                property: P::ObjectRayOrigin | P::ObjectRayDirection,
+                ..
+            } => IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 3,
+            },
+            Self::Intersection {
+                property: P::ObjectToWorld | P::WorldToObject,
+                ..
+            } => IrType::Matrix {
+                scalar: ScalarIrTy::F32,
+                cols: 4,
+                rows: 3,
+            },
+        }
+    }
 }
 
 /// Structured SSA instruction payload.
@@ -1304,6 +1409,11 @@ pub enum InstData {
     RayQueryCommittedFrontFace(u32),
     /// Queries the committed triangle barycentrics (`OpRayQueryGetIntersectionBarycentricsKHR`).
     RayQueryCommittedBarycentrics(u32),
+    /// A typed ray-query getter with a statically selected intersection.
+    RayQueryRead {
+        ray_query_id: u32,
+        read: RayQueryRead,
+    },
     /// Constructs a 2-component vector `(x, y)` (e.g., 2D image coordinates).
     MakeVec2(InstId, InstId),
     /// Constructs a 3-component vector `(x, y, z)`.
@@ -1471,6 +1581,17 @@ impl InstData {
         matches!(
             self,
             Self::LocalLoad { .. }
+                | Self::ResourceLoad { .. }
+                | Self::WorkgroupLoad { .. }
+                | Self::BdaLoad { .. }
+                | Self::ImageSample { .. }
+                | Self::ImageSampleImplicitLod { .. }
+                | Self::ImageSampleGrad { .. }
+                | Self::ImageSampleDrefExplicitLod { .. }
+                | Self::ImageGather { .. }
+                | Self::ImageFetchMs { .. }
+                | Self::SubpassLoad { .. }
+                | Self::CoopMatrixLoad { .. }
                 | Self::RayQueryCommittedType(_)
                 | Self::RayQueryCandidateType(_)
                 | Self::RayQueryCommittedT(_)
@@ -1483,6 +1604,7 @@ impl InstData {
                 | Self::RayQueryCommittedWorldToObject(_)
                 | Self::RayQueryCommittedFrontFace(_)
                 | Self::RayQueryCommittedBarycentrics(_)
+                | Self::RayQueryRead { .. }
                 | Self::RayQueryTriangleVertexPositions { .. }
                 | Self::HitObjectIsHit(_)
                 | Self::HitObjectGetRayTMax(_)
@@ -1778,6 +1900,7 @@ impl InstData {
             | Self::RayQueryCommittedWorldToObject(_)
             | Self::RayQueryCommittedFrontFace(_)
             | Self::RayQueryCommittedBarycentrics(_)
+            | Self::RayQueryRead { .. }
             | Self::IgnoreIntersectionKhr
             | Self::TerminateRayKhr
             | Self::EmitVertex
@@ -1962,6 +2085,7 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
             scalar: ScalarIrTy::U32,
             len: 4,
         },
+        InstData::RayQueryRead { read, .. } => read.result_type(),
         InstData::RayQueryCommittedBarycentrics(_) => IrType::Vector {
             scalar: ScalarIrTy::F32,
             len: 2,

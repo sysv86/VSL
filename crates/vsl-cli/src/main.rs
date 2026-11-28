@@ -152,6 +152,9 @@ enum Command {
         /// Optional output `.glsl` file path (prints to stdout when omitted).
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Select one shader entry when the source contains multiple stages.
+        #[arg(long)]
+        entry: Option<String>,
         /// Target descriptor ABI profile (`hyaloclast` or `standalone`).
         #[arg(long, value_enum, default_value_t = CliAbiProfile::Hyaloclast)]
         abi: CliAbiProfile,
@@ -484,13 +487,19 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::EmitGlsl { file, out, abi } => {
+        Command::EmitGlsl {
+            file,
+            out,
+            abi,
+            entry,
+        } => {
             let source = fs::read_to_string(&file)?;
             let mut compiler = VslCompiler::new();
-            let output = compiler.compile_shader_to_glsl_with_abi(
+            let output = compiler.compile_shader_to_glsl_entry(
                 file.display().to_string(),
                 &source,
                 abi.into(),
+                entry.as_deref(),
             );
             render_diagnostics(&compiler.sources, &output.diagnostics, &mut io::stderr())?;
             if output.has_errors() {

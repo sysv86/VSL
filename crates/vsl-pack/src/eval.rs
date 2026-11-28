@@ -507,6 +507,11 @@ struct Sandbox<'a> {
 }
 
 impl Sandbox<'_> {
+    fn invalid_value(&mut self, message: impl Into<String>, span: Span) -> HandleValue {
+        self.diags.push(Diagnostic::error("E0430", message, span));
+        HandleValue::Unit
+    }
+
     fn tick(&mut self, span: Span) -> bool {
         if self.aborted {
             return false;
@@ -724,8 +729,16 @@ impl Sandbox<'_> {
                             ControlFlow::Normal(v) => v,
                             other => return other,
                         };
-                        if !matches!(cond_val, HandleValue::Bool(true)) {
-                            break;
+                        match cond_val {
+                            HandleValue::Bool(true) => {}
+                            HandleValue::Bool(false) => break,
+                            _ => {
+                                self.invalid_value(
+                                    "while condition must evaluate to bool",
+                                    cond.span(),
+                                );
+                                break;
+                            }
                         }
                         iters += 1;
                         if iters > MAX_LOOP_ITERS {
@@ -819,11 +832,21 @@ impl Sandbox<'_> {
         }
         match expr {
             Expr::BoolLit(b, _) => ControlFlow::Normal(HandleValue::Bool(*b)),
-            Expr::IntLit(_, _) => {
-                ControlFlow::Normal(HandleValue::Int(eval_const_i64(expr).unwrap_or(0)))
-            }
+            Expr::IntLit(_, _) => ControlFlow::Normal(match eval_const_i64(expr) {
+                Some(value) => HandleValue::Int(value),
+                None => self.invalid_value(
+                    "integer literal exceeds the evaluator's signed 64-bit range",
+                    expr.span(),
+                ),
+            }),
             Expr::FloatLit(_, _) => {
-                ControlFlow::Normal(HandleValue::Float(eval_const_f32(expr).unwrap_or(0.0)))
+                ControlFlow::Normal(match eval_const_f32(expr).filter(|v| v.is_finite()) {
+                    Some(value) => HandleValue::Float(value),
+                    None => self.invalid_value(
+                        "floating-point literal must be finite and representable",
+                        expr.span(),
+                    ),
+                })
             }
             Expr::Path { path, span, .. } => {
                 if path.segments.len() == 1 {
@@ -902,12 +925,15 @@ impl Sandbox<'_> {
                     ControlFlow::Normal(v) => v,
                     other => return other,
                 };
-                if matches!(c, HandleValue::Bool(true)) {
-                    self.eval_block(then_branch)
-                } else if let Some(eb) = else_branch {
-                    self.eval_expr(eb)
-                } else {
-                    ControlFlow::Normal(HandleValue::Unit)
+                match c {
+                    HandleValue::Bool(true) => self.eval_block(then_branch),
+                    HandleValue::Bool(false) => match else_branch {
+                        Some(eb) => self.eval_expr(eb),
+                        None => ControlFlow::Normal(HandleValue::Unit),
+                    },
+                    _ => ControlFlow::Normal(
+                        self.invalid_value("if condition must evaluate to bool", cond.span()),
+                    ),
                 }
             }
             Expr::Block(block) => self.eval_block(block),
@@ -929,16 +955,32 @@ impl Sandbox<'_> {
                 ControlFlow::Normal(HandleValue::Bool(false)) => {
                     ControlFlow::Normal(HandleValue::Bool(false))
                 }
-                ControlFlow::Normal(HandleValue::Bool(true)) => self.eval_expr(rhs),
-                ControlFlow::Normal(_) => ControlFlow::Normal(HandleValue::Unit),
+                ControlFlow::Normal(HandleValue::Bool(true)) => match self.eval_expr(rhs) {
+                    ControlFlow::Normal(v @ HandleValue::Bool(_)) => ControlFlow::Normal(v),
+                    ControlFlow::Normal(_) => ControlFlow::Normal(
+                        self.invalid_value("logical and requires boolean operands", rhs.span()),
+                    ),
+                    other => other,
+                },
+                ControlFlow::Normal(_) => ControlFlow::Normal(
+                    self.invalid_value("logical and requires boolean operands", lhs.span()),
+                ),
                 other => other,
             },
             BinaryOp::Or => match self.eval_expr(lhs) {
                 ControlFlow::Normal(HandleValue::Bool(true)) => {
                     ControlFlow::Normal(HandleValue::Bool(true))
                 }
-                ControlFlow::Normal(HandleValue::Bool(false)) => self.eval_expr(rhs),
-                ControlFlow::Normal(_) => ControlFlow::Normal(HandleValue::Unit),
+                ControlFlow::Normal(HandleValue::Bool(false)) => match self.eval_expr(rhs) {
+                    ControlFlow::Normal(v @ HandleValue::Bool(_)) => ControlFlow::Normal(v),
+                    ControlFlow::Normal(_) => ControlFlow::Normal(
+                        self.invalid_value("logical or requires boolean operands", rhs.span()),
+                    ),
+                    other => other,
+                },
+                ControlFlow::Normal(_) => ControlFlow::Normal(
+                    self.invalid_value("logical or requires boolean operands", lhs.span()),
+                ),
                 other => other,
             },
             BinaryOp::Assign
@@ -978,7 +1020,13 @@ impl Sandbox<'_> {
                         BinaryOp::BitXorAssign => apply_bitwise(BinaryOp::BitXor, existing, r),
                         _ => HandleValue::Unit,
                     };
-                    self.env.insert(name.clone(), updated);
+                    if matches!(updated, HandleValue::Unit) {
+                        self.invalid_value(format!("invalid assignment operands for {op:?}"), span);
+                    } else {
+                        self.env.insert(name.clone(), updated);
+                    }
+                } else {
+                    self.invalid_value("assignment requires a local variable", lhs.span());
                 }
                 ControlFlow::Normal(HandleValue::Unit)
             }
@@ -1051,7 +1099,13 @@ impl Sandbox<'_> {
                     BinaryOp::Ne => HandleValue::Bool(!handle_values_equal(&l, &r)),
                     _ => HandleValue::Unit,
                 };
-                ControlFlow::Normal(val)
+                if matches!(val, HandleValue::Unit) {
+                    ControlFlow::Normal(
+                        self.invalid_value(format!("invalid operands or result for {op:?}"), span),
+                    )
+                } else {
+                    ControlFlow::Normal(val)
+                }
             }
         }
     }
@@ -1384,10 +1438,12 @@ impl Sandbox<'_> {
                     }
                     None => ImageFormat::Rgba16f,
                 };
-                let name = match args.first().map(|a| &a.value) {
-                    Some(Expr::StringLit(s, _)) => s.clone(),
-                    _ => SmolStr::new_static("unnamed_target"),
+                let Some(Expr::StringLit(name, _)) = args.first().map(|a| &a.value) else {
+                    return ControlFlow::Normal(
+                        self.invalid_value("target requires a string literal name", span),
+                    );
                 };
+                let name = name.clone();
                 let mut scale = 1.0f32;
                 let mut layers = 1u32;
                 let mut mip_levels = 1u32;
@@ -1402,36 +1458,55 @@ impl Sandbox<'_> {
                         };
                         match key.name.as_str() {
                             "scale" => match evaluated {
-                                HandleValue::Float(f) => scale = f,
-                                HandleValue::Int(i) => scale = i as f32,
-                                _ => {}
+                                HandleValue::Float(f) if f.is_finite() && f > 0.0 => scale = f,
+                                HandleValue::Int(i) if i > 0 => scale = i as f32,
+                                _ => {
+                                    self.invalid_value(
+                                        "target scale must be finite and positive",
+                                        arg.span,
+                                    );
+                                }
                             },
                             "layers" => match evaluated {
-                                HandleValue::Int(v) => {
-                                    layers = u32::try_from(v.max(1)).unwrap_or(1);
+                                HandleValue::Int(v)
+                                    if v > 0
+                                        && let Ok(value) = u32::try_from(v) =>
+                                {
+                                    layers = value;
                                 }
-                                HandleValue::Float(f) => {
-                                    layers = u32::try_from((f as i64).max(1)).unwrap_or(1);
+                                _ => {
+                                    self.invalid_value(
+                                        "target layers must be a positive u32 integer",
+                                        arg.span,
+                                    );
                                 }
-                                _ => {}
                             },
                             "mip_levels" => match evaluated {
-                                HandleValue::Int(v) => {
-                                    mip_levels = u32::try_from(v.max(1)).unwrap_or(1);
+                                HandleValue::Int(v)
+                                    if v > 0
+                                        && let Ok(value) = u32::try_from(v) =>
+                                {
+                                    mip_levels = value;
                                 }
-                                HandleValue::Float(f) => {
-                                    mip_levels = u32::try_from((f as i64).max(1)).unwrap_or(1);
+                                _ => {
+                                    self.invalid_value(
+                                        "target mip_levels must be a positive u32 integer",
+                                        arg.span,
+                                    );
                                 }
-                                _ => {}
                             },
                             "temporal" => {
                                 if let HandleValue::Bool(b) = evaluated {
                                     temporal = b;
+                                } else {
+                                    self.invalid_value("target temporal must be boolean", arg.span);
                                 }
                             }
                             "clear_color" => {
                                 if let HandleValue::Vec4(c) = evaluated {
                                     clear_color = Some(c);
+                                } else {
+                                    self.invalid_value("target clear_color must be vec4", arg.span);
                                 }
                             }
                             other => {
@@ -2003,19 +2078,19 @@ impl Sandbox<'_> {
 fn apply_arith(op: BinaryOp, lhs: HandleValue, rhs: HandleValue) -> HandleValue {
     match (op, lhs, rhs) {
         (BinaryOp::Add, HandleValue::Int(a), HandleValue::Int(b)) => {
-            HandleValue::Int(a.saturating_add(b))
+            a.checked_add(b).map_or(HandleValue::Unit, HandleValue::Int)
         }
         (BinaryOp::Sub, HandleValue::Int(a), HandleValue::Int(b)) => {
-            HandleValue::Int(a.saturating_sub(b))
+            a.checked_sub(b).map_or(HandleValue::Unit, HandleValue::Int)
         }
         (BinaryOp::Mul, HandleValue::Int(a), HandleValue::Int(b)) => {
-            HandleValue::Int(a.saturating_mul(b))
+            a.checked_mul(b).map_or(HandleValue::Unit, HandleValue::Int)
         }
         (BinaryOp::Div, HandleValue::Int(a), HandleValue::Int(b)) => {
-            HandleValue::Int(if b == 0 { 0 } else { a.saturating_div(b) })
+            a.checked_div(b).map_or(HandleValue::Unit, HandleValue::Int)
         }
         (BinaryOp::Rem, HandleValue::Int(a), HandleValue::Int(b)) => {
-            HandleValue::Int(if b == 0 { 0 } else { a.wrapping_rem(b) })
+            a.checked_rem(b).map_or(HandleValue::Unit, HandleValue::Int)
         }
         (op, HandleValue::Int(a), HandleValue::Float(b)) => {
             apply_arith(op, HandleValue::Float(a as f32), HandleValue::Float(b))
@@ -2023,16 +2098,20 @@ fn apply_arith(op: BinaryOp, lhs: HandleValue, rhs: HandleValue) -> HandleValue 
         (op, HandleValue::Float(a), HandleValue::Int(b)) => {
             apply_arith(op, HandleValue::Float(a), HandleValue::Float(b as f32))
         }
-        (BinaryOp::Add, HandleValue::Float(a), HandleValue::Float(b)) => HandleValue::Float(a + b),
-        (BinaryOp::Sub, HandleValue::Float(a), HandleValue::Float(b)) => HandleValue::Float(a - b),
-        (BinaryOp::Mul, HandleValue::Float(a), HandleValue::Float(b)) => HandleValue::Float(a * b),
-        (BinaryOp::Div, HandleValue::Float(a), HandleValue::Float(b)) => {
-            HandleValue::Float(if float_eq(b, 0.0) { 0.0 } else { a / b })
-        }
-        (BinaryOp::Rem, HandleValue::Float(a), HandleValue::Float(b)) => {
-            HandleValue::Float(if float_eq(b, 0.0) { 0.0 } else { a % b })
-        }
+        (BinaryOp::Add, HandleValue::Float(a), HandleValue::Float(b)) => finite_float(a + b),
+        (BinaryOp::Sub, HandleValue::Float(a), HandleValue::Float(b)) => finite_float(a - b),
+        (BinaryOp::Mul, HandleValue::Float(a), HandleValue::Float(b)) => finite_float(a * b),
+        (BinaryOp::Div, HandleValue::Float(a), HandleValue::Float(b)) => finite_float(a / b),
+        (BinaryOp::Rem, HandleValue::Float(a), HandleValue::Float(b)) => finite_float(a % b),
         _ => HandleValue::Unit,
+    }
+}
+
+fn finite_float(value: f32) -> HandleValue {
+    if value.is_finite() {
+        HandleValue::Float(value)
+    } else {
+        HandleValue::Unit
     }
 }
 
@@ -2041,14 +2120,14 @@ fn apply_bitwise(op: BinaryOp, lhs: HandleValue, rhs: HandleValue) -> HandleValu
         (BinaryOp::BitAnd, HandleValue::Int(a), HandleValue::Int(b)) => HandleValue::Int(a & b),
         (BinaryOp::BitOr, HandleValue::Int(a), HandleValue::Int(b)) => HandleValue::Int(a | b),
         (BinaryOp::BitXor, HandleValue::Int(a), HandleValue::Int(b)) => HandleValue::Int(a ^ b),
-        (BinaryOp::Shl, HandleValue::Int(a), HandleValue::Int(b)) => {
-            let shift = u32::try_from(b.clamp(0, 63)).unwrap_or(0);
-            HandleValue::Int(a.wrapping_shl(shift))
-        }
-        (BinaryOp::Shr, HandleValue::Int(a), HandleValue::Int(b)) => {
-            let shift = u32::try_from(b.clamp(0, 63)).unwrap_or(0);
-            HandleValue::Int(a.wrapping_shr(shift))
-        }
+        (BinaryOp::Shl, HandleValue::Int(a), HandleValue::Int(b)) => u32::try_from(b)
+            .ok()
+            .and_then(|shift| a.checked_shl(shift))
+            .map_or(HandleValue::Unit, HandleValue::Int),
+        (BinaryOp::Shr, HandleValue::Int(a), HandleValue::Int(b)) => u32::try_from(b)
+            .ok()
+            .and_then(|shift| a.checked_shr(shift))
+            .map_or(HandleValue::Unit, HandleValue::Int),
         _ => HandleValue::Unit,
     }
 }

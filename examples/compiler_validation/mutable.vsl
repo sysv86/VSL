@@ -1,0 +1,11 @@
+@stage(compute(8, 1, 1))
+fn mutable_values(
+    #[binding(set = 0, binding = 0)] result: RWBuffer<uvec2>,
+    #[builtin(global_invocation_id)] gid: uvec3,
+) {
+    let mut total = gid.x;
+    total = total + 3u;
+    let mut values: [u32; 2] = [total, 2u];
+    values[0u] = values[0u] + values[1u];
+    result[gid.x] = uvec2(values[0u], values[1u]);
+}

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
@@ -68,6 +68,7 @@ fn semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
 struct OpenDocument {
     uri: Uri,
     text: String,
+    version: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +170,7 @@ impl AnalysisCache {
 #[derive(Debug)]
 struct VslLanguageServer {
     client: Client,
+    analysis_lock: Mutex<()>,
     documents: RwLock<HashMap<String, OpenDocument>>,
     cache: RwLock<AnalysisCache>,
 }
@@ -177,20 +179,26 @@ impl VslLanguageServer {
     fn new(client: Client) -> Self {
         Self {
             client,
+            analysis_lock: Mutex::new(()),
             documents: RwLock::new(HashMap::new()),
             cache: RwLock::new(AnalysisCache::new(DEFAULT_ANALYSIS_CACHE_CAPACITY)),
         }
     }
 
-    async fn publish_file_diagnostics(&self, uri: Uri, text: &str) {
+    async fn publish_file_diagnostics(&self, uri: Uri, text: &str, version: i32, is_open: bool) {
+        let _guard = self.analysis_lock.lock().await;
         let norm_key = normalize_uri_key(uri.as_str());
         let open_snapshot: HashMap<String, OpenDocument> = {
             let mut docs = self.documents.write().await;
+            if !accept_document_update(docs.get(&norm_key), version, is_open) {
+                return;
+            }
             docs.insert(
                 norm_key.clone(),
                 OpenDocument {
                     uri: uri.clone(),
                     text: text.to_owned(),
+                    version,
                 },
             );
             docs.clone()
@@ -199,19 +207,26 @@ impl VslLanguageServer {
         let (analysis, lsp_diags) = analyze_document(&uri, text, &open_snapshot);
         self.cache.write().await.insert(norm_key.clone(), analysis);
         self.client
-            .publish_diagnostics(uri.clone(), lsp_diags, None)
+            .publish_diagnostics(uri.clone(), lsp_diags, Some(version))
             .await;
 
-        // When `pack.vsl` changes, re-validate all open sibling `.vsl` files in the same directory
-        // so updated `PackSchema` parameters, spec constants, and resource slots take effect live.
-        if is_pack_vsl_uri(uri.as_str())
-            && let Some(pack_dir) =
-                uri_to_path(uri.as_str()).and_then(|p| p.parent().map(Path::to_path_buf))
+        self.refresh_siblings(&uri, &norm_key, &open_snapshot).await;
+    }
+
+    async fn refresh_siblings(
+        &self,
+        uri: &Uri,
+        norm_key: &str,
+        open_snapshot: &HashMap<String, OpenDocument>,
+    ) {
+        // Sibling edits affect both pack schemas and cross-module diagnostics.
+        if let Some(pack_dir) =
+            uri_to_path(uri.as_str()).and_then(|p| p.parent().map(Path::to_path_buf))
         {
             let siblings: Vec<(String, OpenDocument)> = open_snapshot
                 .iter()
                 .filter(|(k, doc)| {
-                    k.as_str() != norm_key.as_str()
+                    k.as_str() != norm_key
                         && !is_pack_vsl_uri(doc.uri.as_str())
                         && uri_to_path(doc.uri.as_str())
                             .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -223,16 +238,17 @@ impl VslLanguageServer {
 
             for (sib_key, sib_doc) in siblings {
                 let (sib_analysis, sib_diags) =
-                    analyze_document(&sib_doc.uri, &sib_doc.text, &open_snapshot);
+                    analyze_document(&sib_doc.uri, &sib_doc.text, open_snapshot);
                 self.cache.write().await.insert(sib_key, sib_analysis);
                 self.client
-                    .publish_diagnostics(sib_doc.uri, sib_diags, None)
+                    .publish_diagnostics(sib_doc.uri, sib_diags, Some(sib_doc.version))
                     .await;
             }
         }
     }
 
     async fn ensure_cached(&self, uri: &Uri) -> Option<CachedAnalysis> {
+        let _guard = self.analysis_lock.lock().await;
         let norm_key = normalize_uri_key(uri.as_str());
         if let Some(cached) = self.cache.read().await.get(&norm_key).cloned() {
             return Some(cached);
@@ -242,6 +258,14 @@ impl VslLanguageServer {
         let (analysis, _) = analyze_document(&doc.uri, &doc.text, &open_snapshot);
         self.cache.write().await.insert(norm_key, analysis.clone());
         Some(analysis)
+    }
+}
+
+fn accept_document_update(previous: Option<&OpenDocument>, version: i32, is_open: bool) -> bool {
+    if is_open {
+        previous.is_none()
+    } else {
+        previous.is_some_and(|doc| version > doc.version)
     }
 }
 
@@ -328,17 +352,12 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
 
 /// Discovers sibling `pack.vsl` and `.vsl` files in `doc_dir`, preferring in-memory editor buffers.
 fn discover_workspace_context(
-    target_key: &str,
     target_path: Option<&Path>,
     open_docs: &HashMap<String, OpenDocument>,
 ) -> (Option<PackSchema>, Vec<(String, String)>) {
     let Some(doc_dir) = target_path.and_then(Path::parent) else {
         return (None, Vec::new());
     };
-    if !doc_dir.is_dir() {
-        return (None, Vec::new());
-    }
-
     let mut pack_schema = None;
     let pack_path = doc_dir.join("pack.vsl");
     let pack_text = find_open_text_for_path(&pack_path, open_docs)
@@ -373,12 +392,26 @@ fn discover_workspace_context(
             }
         }
     }
+    for doc in open_docs.values() {
+        if let Some(path) = uri_to_path(doc.uri.as_str())
+            && path.parent() == Some(doc_dir)
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("vsl"))
+            && !is_pack_vsl_uri(doc.uri.as_str())
+        {
+            sibling_paths.push(path);
+        }
+    }
     sibling_paths.sort();
+    sibling_paths.dedup();
 
     let mut siblings = Vec::new();
     for path in sibling_paths {
         let path_key = normalize_uri_key(&path.display().to_string());
-        if target_key.ends_with(&path_key) || path_key.ends_with(target_key) {
+        if target_path
+            .is_some_and(|target| normalize_uri_key(&target.display().to_string()) == path_key)
+        {
             continue;
         }
         let content =
@@ -419,6 +452,22 @@ fn analyze_document(
     let mut all_diags = parsed.diagnostics;
 
     if is_pack_vsl_uri(uri.as_str()) {
+        if all_diags.iter().any(Diagnostic::is_error) {
+            let lsp_diags = all_diags
+                .iter()
+                .map(|d| to_lsp_diagnostic(&source_file, d))
+                .collect();
+            return (
+                CachedAnalysis {
+                    source: source_file,
+                    hir: None,
+                    pack_schema: None,
+                    symbols: Vec::new(),
+                    tokens: Vec::new(),
+                },
+                lsp_diags,
+            );
+        }
         let (ir, eval_diags) = evaluate_pack_vsl(&parsed.unit, &EvalConfig::default());
         all_diags.extend(eval_diags.into_vec());
         if let Err(sched_errors) = validate_and_schedule(&ir) {
@@ -441,10 +490,8 @@ fn analyze_document(
         return (analysis, lsp_diags);
     }
 
-    let norm_key = normalize_uri_key(uri.as_str());
     let doc_path = uri_to_path(uri.as_str());
-    let (pack_schema, sibling_files) =
-        discover_workspace_context(&norm_key, doc_path.as_deref(), open_docs);
+    let (pack_schema, sibling_files) = discover_workspace_context(doc_path.as_deref(), open_docs);
 
     // Lower current file with full capabilities across all tiers so editor hover/goto/rename
     // and diagnostics cover tier-gated functions without pruning.
@@ -484,8 +531,10 @@ fn analyze_document(
 
     let symbols = index_hir_symbols(&hir, &source_file);
     let tokens = build_semantic_tokens(&symbols, &source_file);
+    let mut seen_diagnostics = HashSet::new();
     let lsp_diags = all_diags
         .iter()
+        .filter(|d| seen_diagnostics.insert((d.primary_span, d.code.clone(), d.message.clone())))
         .map(|d| to_lsp_diagnostic(&source_file, d))
         .collect();
 
@@ -694,29 +743,24 @@ fn format_struct_hover(hir: &HirModule, st: &HirStruct) -> String {
 
 /// Narrow a declaration span to the exact byte span of `ident` inside `source_file` when possible.
 fn find_ident_span_within(source: &SourceFile, enclosing: Span, ident: &str) -> Span {
-    if ident.is_empty() || enclosing.file == FileId::SYNTHETIC {
-        return enclosing;
+    let missing = Span::new(enclosing.file, enclosing.start, enclosing.start);
+    if ident.is_empty() || enclosing.file != source.id || enclosing.start > enclosing.end {
+        return missing;
     }
-    let slice = source.slice(enclosing);
-    let bytes = slice.as_bytes();
-    let ident_bytes = ident.as_bytes();
-    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-
-    let mut offset = 0usize;
-    while offset + ident_bytes.len() <= bytes.len() {
-        if &bytes[offset..offset + ident_bytes.len()] == ident_bytes {
-            let left_ok = offset == 0 || !is_ident_byte(bytes[offset - 1]);
-            let right_ok = offset + ident_bytes.len() == bytes.len()
-                || !is_ident_byte(bytes[offset + ident_bytes.len()]);
-            if left_ok && right_ok {
-                let start = enclosing.start.saturating_add(offset as u32);
-                let end = start.saturating_add(ident_bytes.len() as u32);
-                return Span::new(enclosing.file, start, end);
-            }
+    let Some(slice) = source.text.get(enclosing.to_range()) else {
+        return missing;
+    };
+    let (tokens, _) = vsl_syntax::lex(source.id, slice);
+    for token in tokens {
+        if slice.get(token.span.to_range()) == Some(ident) {
+            return Span::new(
+                enclosing.file,
+                enclosing.start + token.span.start,
+                enclosing.start + token.span.end,
+            );
         }
-        offset += 1;
     }
-    enclosing
+    missing
 }
 
 fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol> {
@@ -846,6 +890,12 @@ fn index_hir_symbols(hir: &HirModule, source: &SourceFile) -> Vec<IndexedSymbol>
         }
     }
 
+    out.retain(|symbol| {
+        symbol.span.file == source.id
+            && symbol.def_span.file == source.id
+            && symbol.span.start < symbol.span.end
+            && symbol.def_span.start < symbol.def_span.end
+    });
     out
 }
 
@@ -968,7 +1018,7 @@ fn index_hir_expr(
     match &expr.kind {
         HirExprKind::Path { path, .. } => {
             let short = path.rsplit("::").next().unwrap_or(path.as_str());
-            if let Some((kind, def_span, ty_str)) = scope.get(short) {
+            if let Some((kind, def_span, ty_str)) = scope.get(path.as_str()) {
                 let ref_span = find_ident_span_within(source, expr.span, short);
                 out.push(IndexedSymbol {
                     name: short.to_owned(),
@@ -1029,7 +1079,11 @@ fn index_hir_expr(
                 let target_fn = &hir.functions[*fn_id];
                 let def_span =
                     find_ident_span_within(source, target_fn.span, target_fn.name.as_str());
-                let m_span = find_ident_span_within(source, expr.span, method.as_str());
+                let m_span = find_ident_span_within(
+                    source,
+                    Span::new(expr.span.file, receiver.span.end, expr.span.end),
+                    method.as_str(),
+                );
                 out.push(IndexedSymbol {
                     name: method.to_string(),
                     kind: IndexedSymbolKind::Function,
@@ -1047,12 +1101,20 @@ fn index_hir_expr(
             receiver, field, ..
         } => {
             index_hir_expr(hir, source, receiver, scope, out);
-            if let Type::Struct { name: st_name, .. } = hir.types.get(receiver.ty)
+            let receiver_ty = match hir.types.get(receiver.ty) {
+                Type::Pointer { pointee, .. } => *pointee,
+                _ => receiver.ty,
+            };
+            if let Type::Struct { name: st_name, .. } = hir.types.get(receiver_ty)
                 && let Some(st) = hir.find_struct(st_name.as_str())
                 && let Some(sf) = st.fields.iter().find(|f| f.name == *field)
             {
                 let def_span = find_ident_span_within(source, sf.span, sf.name.as_str());
-                let ref_span = find_ident_span_within(source, expr.span, field.as_str());
+                let ref_span = find_ident_span_within(
+                    source,
+                    Span::new(expr.span.file, receiver.span.end, expr.span.end),
+                    field.as_str(),
+                );
                 out.push(IndexedSymbol {
                     name: field.to_string(),
                     kind: IndexedSymbolKind::Field,
@@ -1169,7 +1231,7 @@ fn position_to_byte_offset(source: &SourceFile, pos: Position) -> Option<u32> {
         line_start += line.len();
         cur_line += 1;
     }
-    if cur_line == pos.line {
+    if cur_line == pos.line && (source.text.is_empty() || source.text.ends_with('\n')) {
         return Some(source.text.len() as u32);
     }
     None
@@ -1179,15 +1241,13 @@ fn symbol_at_offset(symbols: &[IndexedSymbol], byte_offset: u32) -> Option<&Inde
     // Prefer the narrowest span containing `byte_offset`.
     symbols
         .iter()
-        .filter(|s| {
-            s.span.start <= byte_offset && byte_offset <= s.span.end && s.span.start < s.span.end
-        })
+        .filter(|s| s.span.start <= byte_offset && byte_offset < s.span.end)
         .min_by_key(|s| s.span.end - s.span.start)
 }
 
 fn span_to_lsp_range(source: &SourceFile, span: Span) -> Range {
     let start = source.line_col_utf16(span.start);
-    let end = source.line_col_utf16(span.end);
+    let end = source.line_col_utf16(span.end.max(span.start));
     Range {
         start: Position {
             line: start.line,
@@ -1220,7 +1280,7 @@ fn to_lsp_diagnostic(file: &SourceFile, diag: &Diagnostic) -> LspDiagnostic {
 fn utf16_col_to_byte_offset(line: &str, utf16_col: u32) -> usize {
     let mut utf16_seen = 0u32;
     for (byte_idx, ch) in line.char_indices() {
-        if utf16_seen >= utf16_col {
+        if utf16_seen >= utf16_col || utf16_seen + ch.len_utf16() as u32 > utf16_col {
             return byte_idx;
         }
         utf16_seen = utf16_seen.saturating_add(ch.len_utf16() as u32);
@@ -1229,7 +1289,10 @@ fn utf16_col_to_byte_offset(line: &str, utf16_col: u32) -> usize {
 }
 
 fn byte_offset_to_utf16_col(line: &str, byte_offset: usize) -> u32 {
-    let clamped = byte_offset.min(line.len());
+    let mut clamped = byte_offset.min(line.len());
+    while !line.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
     line[..clamped].chars().map(char::len_utf16).sum::<usize>() as u32
 }
 
@@ -1320,12 +1383,9 @@ fn make_completion_item(
 }
 
 fn is_valid_vsl_ident(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let (tokens, diagnostics) = vsl_syntax::lex(FileId(0), name);
+    diagnostics.is_empty()
+        && matches!(tokens.as_slice(), [token] if matches!(&token.token, vsl_syntax::Token::Ident(ident) if ident.as_str() == name))
 }
 
 impl LanguageServer for VslLanguageServer {
@@ -1377,23 +1437,43 @@ impl LanguageServer for VslLanguageServer {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.publish_file_diagnostics(params.text_document.uri, &params.text_document.text)
-            .await;
+        self.publish_file_diagnostics(
+            params.text_document.uri,
+            &params.text_document.text,
+            params.text_document.version,
+            true,
+        )
+        .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        if let Some(change) = params.content_changes.into_iter().last() {
-            self.publish_file_diagnostics(params.text_document.uri, &change.text)
-                .await;
+        if let Some(change) = params.content_changes.into_iter().last()
+            && change.range.is_none()
+        {
+            self.publish_file_diagnostics(
+                params.text_document.uri,
+                &change.text,
+                params.text_document.version,
+                false,
+            )
+            .await;
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let _guard = self.analysis_lock.lock().await;
         let norm_key = normalize_uri_key(params.text_document.uri.as_str());
-        self.documents.write().await.remove(&norm_key);
+        let snapshot = {
+            let mut documents = self.documents.write().await;
+            documents.remove(&norm_key);
+            documents.clone()
+        };
         self.cache.write().await.remove(&norm_key);
         self.client
-            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
+            .publish_diagnostics(params.text_document.uri.clone(), Vec::new(), None)
+            .await;
+        // Revert sibling analysis to on-disk contents when an unsaved editor is closed.
+        self.refresh_siblings(&params.text_document.uri, &norm_key, &snapshot)
             .await;
     }
 
@@ -1993,6 +2073,102 @@ mod tests {
         assert_eq!(
             normalize_uri_key("C:\\Packs\\Sunlit\\reflections.vsl"),
             "c:/Packs/Sunlit/reflections.vsl"
+        );
+    }
+
+    #[test]
+    fn rejects_stale_document_versions_and_changes_to_closed_documents() {
+        let document = OpenDocument {
+            uri: "file:///example.vsl".parse().unwrap(),
+            text: String::new(),
+            version: 8,
+        };
+        assert!(!accept_document_update(None, 9, false));
+        assert!(accept_document_update(None, 1, true));
+        assert!(!accept_document_update(Some(&document), 8, false));
+        assert!(!accept_document_update(Some(&document), 7, false));
+        assert!(accept_document_update(Some(&document), 9, false));
+        assert!(!accept_document_update(Some(&document), 10, true));
+    }
+
+    #[test]
+    fn handles_utf16_boundaries_and_nonexistent_lines() {
+        let file = SourceFile::new(FileId(0), "test.vsl", "a😀é\r\nb");
+        for (column, offset) in [(0, 0), (1, 1), (2, 1), (3, 5), (4, 7), (99, 7)] {
+            assert_eq!(
+                position_to_byte_offset(&file, Position::new(0, column)),
+                Some(offset)
+            );
+        }
+        assert_eq!(position_to_byte_offset(&file, Position::new(1, 0)), Some(9));
+        assert_eq!(position_to_byte_offset(&file, Position::new(2, 0)), None);
+        assert_eq!(byte_offset_to_utf16_col("a😀", 3), 1);
+        let empty_line = SourceFile::new(FileId(0), "test.vsl", "a\n");
+        assert_eq!(
+            position_to_byte_offset(&empty_line, Position::new(1, 0)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn indexes_field_occurrences_without_matching_receiver_or_comment() {
+        let source = "struct S { value: u32 } fn /* read */ read(value: S) -> u32 { value.value }";
+        let file = SourceFile::new(FileId(0), "test.vsl", source);
+        let parsed = parse_source(FileId(0), source);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (hir, diags) = lower_unit(&parsed.unit, RenderTier::Tier2RayQuery, HardwareCaps::all());
+        assert!(!diags.has_errors(), "{diags:?}");
+        let symbols = index_hir_symbols(&hir, &file);
+        let access = source.rfind("value.value").unwrap() as u32;
+        let receiver = symbol_at_offset(&symbols, access).unwrap();
+        let member = symbol_at_offset(&symbols, access + 6).unwrap();
+        assert_eq!(receiver.kind, IndexedSymbolKind::Param);
+        assert_eq!(member.kind, IndexedSymbolKind::Field);
+        assert_ne!(receiver.def_span, member.def_span);
+        assert!(symbol_at_offset(&symbols, access + 5).is_none());
+        let function = symbols
+            .iter()
+            .find(|s| s.name == "read" && s.is_definition)
+            .unwrap();
+        assert_eq!(
+            function.span.start as usize,
+            source.find("read(value").unwrap()
+        );
+        assert!(!is_valid_vsl_ident("fn"));
+        assert!(is_valid_vsl_ident("new_name"));
+    }
+
+    #[test]
+    fn discovers_unsaved_sibling_documents() {
+        let target: Uri = "file:///nonexistent-vsl-lsp-test/current.vsl"
+            .parse()
+            .unwrap();
+        let sibling: Uri = "file:///nonexistent-vsl-lsp-test/other.vsl"
+            .parse()
+            .unwrap();
+        let documents = HashMap::from([
+            (
+                normalize_uri_key(target.as_str()),
+                OpenDocument {
+                    uri: target.clone(),
+                    text: "fn current() {}".to_owned(),
+                    version: 1,
+                },
+            ),
+            (
+                normalize_uri_key(sibling.as_str()),
+                OpenDocument {
+                    uri: sibling,
+                    text: "fn other() {}".to_owned(),
+                    version: 1,
+                },
+            ),
+        ]);
+        let (_, siblings) =
+            discover_workspace_context(uri_to_path(target.as_str()).as_deref(), &documents);
+        assert_eq!(
+            siblings,
+            vec![("other.vsl".to_owned(), "fn other() {}".to_owned())]
         );
     }
 

@@ -175,7 +175,8 @@ pub enum PassBindingRef {
     },
 }
 
-/// Advisory pass metadata carried from v1 manifests. Tier gating is enforced by the engine:
+/// Legacy pass metadata. Reads and writes naming declared custom resources participate in
+/// scheduling; other names remain advisory engine metadata. Tier gating is enforced by the engine:
 /// `tiers` is forwarded to engine pipeline construction and is not checked by the deterministic
 /// `pack.vsl` evaluator or the schedule validator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

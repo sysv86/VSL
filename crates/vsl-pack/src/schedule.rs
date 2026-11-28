@@ -111,12 +111,26 @@ where
         chain.push(parent_ir);
     }
 
+    for layer in &chain {
+        validate_inheritance_assets(layer)?;
+    }
     let mut iter = chain.into_iter().rev();
     let Some(mut merged) = iter.next() else {
         return Ok(child.clone());
     };
+    // Serialized parent IR can use sparse or out-of-order slots. Normalize the
+    // root once and rewrite its references before index-based overlay allocation.
+    let mut remap = IndexMap::new();
+    for (index, texture) in merged.resource_textures.iter_mut().enumerate() {
+        let slot = u32::try_from(index).unwrap_or(u32::MAX);
+        remap.insert(texture.slot, slot);
+        texture.slot = slot;
+    }
+    for pass in &mut merged.passes {
+        remap_texture_bindings(pass, &remap);
+    }
     for overlay in iter {
-        merged = merge_pack_ir(merged, overlay);
+        merged = merge_pack_ir(merged, overlay)?;
     }
     merged.metadata.extends = None;
 
@@ -130,7 +144,54 @@ where
     Ok(merged)
 }
 
-fn merge_pack_ir(mut base: PipelineIr, child: PipelineIr) -> PipelineIr {
+fn validate_inheritance_assets(layer: &PipelineIr) -> Result<(), Vec<String>> {
+    let mut slots = IndexSet::new();
+    let mut names = IndexSet::new();
+    let mut errors = Vec::new();
+    for texture in &layer.resource_textures {
+        if texture.slot >= PACK_RESOURCE_SLOTS || !slots.insert(texture.slot) {
+            errors.push(format!(
+                "pack `{}` has invalid or duplicate texture slot {}",
+                layer.metadata.id, texture.slot
+            ));
+        }
+        if !texture.name.is_empty() && !names.insert(texture.name.as_str()) {
+            errors.push(format!(
+                "pack `{}` has duplicate texture name `{}`",
+                layer.metadata.id, texture.name
+            ));
+        }
+    }
+    for pass in &layer.passes {
+        for binding in pass.bindings.values() {
+            if let PassBindingRef::ResourceTexture { slot } = binding
+                && !slots.contains(slot)
+            {
+                errors.push(format!(
+                    "pack `{}` pass `{}` references undeclared local texture slot {slot}",
+                    layer.metadata.id, pass.name
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn remap_texture_bindings(pass: &mut PassNode, remap: &IndexMap<u32, u32>) {
+    for binding in pass.bindings.values_mut() {
+        if let PassBindingRef::ResourceTexture { slot } = binding
+            && let Some(&new_slot) = remap.get(slot)
+        {
+            *slot = new_slot;
+        }
+    }
+}
+
+fn merge_pack_ir(mut base: PipelineIr, child: PipelineIr) -> Result<PipelineIr, Vec<String>> {
     let mut merged_caps = base.metadata.capabilities;
     for cap in &child.metadata.capabilities {
         if !merged_caps.contains(cap) {
@@ -165,13 +226,24 @@ fn merge_pack_ir(mut base: PipelineIr, child: PipelineIr) -> PipelineIr {
     let mut child_slot_remap: IndexMap<u32, u32> = IndexMap::new();
     for mut tex in child.resource_textures {
         let old_slot = tex.slot;
-        let match_idx = base.resource_textures.iter().position(|existing| {
-            if !existing.name.is_empty() && !tex.name.is_empty() {
-                existing.name == tex.name
-            } else {
-                existing.path == tex.path
-            }
-        });
+        let mut matches = base
+            .resource_textures
+            .iter()
+            .enumerate()
+            .filter(|(_, existing)| {
+                if !existing.name.is_empty() && !tex.name.is_empty() {
+                    existing.name == tex.name
+                } else {
+                    existing.path == tex.path
+                }
+            });
+        let match_idx = matches.next().map(|(idx, _)| idx);
+        if matches.next().is_some() {
+            return Err(vec![format!(
+                "ambiguous inherited texture `{}` ({})",
+                tex.name, tex.path
+            )]);
+        }
         if let Some(idx) = match_idx {
             let slot = u32::try_from(idx).unwrap_or(u32::MAX);
             tex.slot = slot;
@@ -194,13 +266,7 @@ fn merge_pack_ir(mut base: PipelineIr, child: PipelineIr) -> PipelineIr {
     }
 
     for mut pass in child.passes {
-        for binding in pass.bindings.values_mut() {
-            if let PassBindingRef::ResourceTexture { slot } = binding
-                && let Some(&remapped) = child_slot_remap.get(slot)
-            {
-                *slot = remapped;
-            }
-        }
+        remap_texture_bindings(&mut pass, &child_slot_remap);
         if let Some(existing) = base.passes.iter_mut().find(|p| p.name == pass.name) {
             *existing = pass;
         } else {
@@ -208,7 +274,7 @@ fn merge_pack_ir(mut base: PipelineIr, child: PipelineIr) -> PipelineIr {
         }
     }
 
-    base
+    Ok(base)
 }
 
 /// Validates pass declarations and computes a deterministic topological execution schedule
@@ -221,13 +287,13 @@ fn merge_pack_ir(mut base: PipelineIr, child: PipelineIr) -> PipelineIr {
 /// - No two custom passes `.replaces(...)` the same [`CanonicalPass`].
 /// - Every `dispatch_target` / `PassDispatch::ForTarget` target exists in `ir.targets`,
 ///   `PassDispatch::Explicit([x, y, z])` has all dimensions `> 0`, and `PassDispatch::Indirect`
-///   has a non-empty buffer/target name (and resolves to `ir.buffers` when custom buffers are
-///   declared).
+///   has a non-empty buffer name and resolves to an indirect-capable buffer when custom buffers
+///   are declared. Legacy manifests without buffer declarations may name host-provided buffers.
 /// - Every `CustomTarget` referenced in `bindings` exists in `ir.targets`, `history: true`
 ///   bindings reference a target declared with `temporal == true`, and every `CustomBuffer`
 ///   exists in `ir.buffers`.
 /// - Every `PassRef` in `after` / `before` resolves to an active canonical or declared custom pass.
-/// - Two writers to the same `CustomTarget` or `CustomBuffer` without a transitive ordering are
+/// - Two writers to the same `CustomTarget` or `CustomBuffer` without a transitive dependency ordering are
 ///   rejected as a write-after-write (WAW) hazard.
 /// - Write-to-read edges between custom passes sharing a `CustomTarget` (`history: false`),
 ///   `CustomBuffer`, or `PassDispatch::Indirect` buffer are inferred automatically.
@@ -236,6 +302,53 @@ fn merge_pack_ir(mut base: PipelineIr, child: PipelineIr) -> PipelineIr {
 /// - The combined pass constraint graph is acyclic.
 pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String>> {
     let mut errors = Vec::new();
+    let mut resource_slots = IndexSet::new();
+    let mut texture_names = IndexSet::new();
+    for texture in &ir.resource_textures {
+        if texture.slot >= PACK_RESOURCE_SLOTS || !resource_slots.insert(texture.slot) {
+            errors.push(format!(
+                "invalid or duplicate pack texture slot {}",
+                texture.slot
+            ));
+        }
+        if !texture.name.is_empty() && !texture_names.insert(&texture.name) {
+            errors.push(format!("duplicate pack texture name `{}`", texture.name));
+        }
+        if texture.path.trim().is_empty() {
+            errors.push(format!(
+                "pack texture slot {} has an empty path",
+                texture.slot
+            ));
+        }
+    }
+    for (name, target) in &ir.targets {
+        if name.trim().is_empty() || target.name != *name {
+            errors.push(format!("invalid target identity `{name}`"));
+        }
+        if !target.scale.is_finite()
+            || target.scale <= 0.0
+            || target.layers == 0
+            || target.mip_levels == 0
+            || target
+                .clear_color
+                .is_some_and(|color| color.iter().any(|v| !v.is_finite()))
+        {
+            errors.push(format!(
+                "target `{name}` has invalid scale, dimensions or clear color"
+            ));
+        }
+        if ir.buffers.contains_key(name) {
+            errors.push(format!("target and buffer share resource name `{name}`"));
+        }
+    }
+    for (name, buffer) in &ir.buffers {
+        if name.trim().is_empty() || buffer.name != *name {
+            errors.push(format!("invalid buffer identity `{name}`"));
+        }
+        if buffer.count == Some(0) || buffer.size_bytes == Some(0) {
+            errors.push(format!("buffer `{name}` has zero allocation size"));
+        }
+    }
 
     // (a) Non-empty entry_fn (except Transfer passes), duplicate custom pass names, duplicate
     //     `.replaces(...)`, dispatch configuration, and custom target/buffer binding checks.
@@ -243,6 +356,9 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
     let mut replaced_by: IndexMap<CanonicalPass, usize> = IndexMap::new();
 
     for (idx, pass) in ir.passes.iter().enumerate() {
+        if pass.name.trim().is_empty() {
+            errors.push("pass name cannot be empty".to_owned());
+        }
         if pass.kind != PassKind::Transfer && pass.entry_fn.trim().is_empty() {
             errors.push(format!("pass `{}` has an empty `entry_fn`", pass.name));
         }
@@ -268,6 +384,14 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
             }
         }
 
+        if let (Some(target), Some(dispatch)) = (&pass.dispatch_target, &pass.dispatch)
+            && !matches!(dispatch, PassDispatch::ForTarget(other) if other == target)
+        {
+            errors.push(format!(
+                "pass `{}` has conflicting dispatch modes",
+                pass.name
+            ));
+        }
         let mut checked_for_target: Option<&str> = None;
         if let Some(ref dispatch) = pass.dispatch {
             match dispatch {
@@ -294,7 +418,21 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
                             "pass `{}` has an empty indirect dispatch buffer/target name",
                             pass.name
                         ));
-                    } else if !ir.buffers.is_empty() && !ir.buffers.contains_key(buf) {
+                    } else if let Some(buffer) = ir.buffers.get(buf) {
+                        if !buffer.indirect {
+                            errors.push(format!(
+                                "pass `{}` dispatch buffer `{buf}` was not declared indirect",
+                                pass.name
+                            ));
+                        }
+                        if pass.kind == PassKind::Compute
+                            && (buffer.size_bytes.is_some_and(|size| size < 12)
+                                || (buffer.element_type == "u32"
+                                    && buffer.count.is_some_and(|count| count < 3)))
+                        {
+                            errors.push(format!("pass `{}` indirect dispatch buffer `{buf}` cannot hold three u32 dimensions", pass.name));
+                        }
+                    } else if !ir.buffers.is_empty() || ir.targets.contains_key(buf) {
                         errors.push(format!(
                             "pass `{}` references undeclared indirect dispatch buffer `{buf}`",
                             pass.name
@@ -316,7 +454,17 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
 
         for (bind_key, binding) in &pass.bindings {
             match binding {
-                PassBindingRef::CustomTarget { name, history, .. } => {
+                PassBindingRef::CustomTarget {
+                    name,
+                    history,
+                    is_write,
+                } => {
+                    if *history && *is_write {
+                        errors.push(format!(
+                            "pass `{}` binding `{bind_key}` writes read-only history of `{name}`",
+                            pass.name
+                        ));
+                    }
                     if let Some(target_decl) = ir.targets.get(name) {
                         if *history && !target_decl.temporal {
                             errors.push(format!(
@@ -339,7 +487,12 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
                         ));
                     }
                 }
-                PassBindingRef::BuiltinTarget { .. } | PassBindingRef::ResourceTexture { .. } => {}
+                PassBindingRef::ResourceTexture { slot } => {
+                    if !resource_slots.contains(slot) {
+                        errors.push(format!("pass `{}` binding `{bind_key}` references undeclared pack texture slot {slot}", pass.name));
+                    }
+                }
+                PassBindingRef::BuiltinTarget { .. } => {}
             }
         }
     }
@@ -535,6 +688,25 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
             }
         }
 
+        for (names, accesses) in [
+            (&pass.meta.reads, &mut resource_readers),
+            (&pass.meta.writes, &mut resource_writers),
+        ] {
+            for name in names {
+                let key = if ir.targets.contains_key(name) {
+                    ResourceKey::Target(name)
+                } else if ir.buffers.contains_key(name) {
+                    ResourceKey::Buffer(name)
+                } else {
+                    continue;
+                };
+                let list = accesses.entry(key).or_default();
+                if !list.contains(&node) {
+                    list.push(node);
+                }
+            }
+        }
+
         if let Some(PassDispatch::Indirect(buf_name)) = &pass.dispatch {
             let key = if ir.buffers.contains_key(buf_name) {
                 ResourceKey::Buffer(buf_name.as_str())
@@ -550,28 +722,9 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
         }
     }
 
-    // Detect ambiguous multi-writer WAW hazards before inferring RAW edges.
-    for (&res_key, writers) in &resource_writers {
-        if writers.len() > 1 {
-            for (i, &w1) in writers.iter().enumerate() {
-                for &w2 in &writers[i + 1..] {
-                    if w1 != w2 && !is_reachable(&adj, w1, w2) && !is_reachable(&adj, w2, w1) {
-                        errors.push(format!(
-                            "write-after-write (WAW) hazard on resource `{}`: passes `{}` and `{}` both write `{}` without explicit ordering",
-                            res_key.name(),
-                            node_names[w1],
-                            node_names[w2],
-                            res_key.name()
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    if !errors.is_empty() {
-        return Err(errors);
-    }
+    // Explicit WAR constraints refer to the pre-inference graph. An inferred dependency
+    // must never silently reverse another inferred dependency (implicit feedback cycle).
+    let explicit_adj = adj.clone();
 
     // Infer write -> read (RAW) and write -> indirect-dispatch dependency edges.
     for (&res_key, writers) in &resource_writers {
@@ -579,7 +732,7 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
             for &writer_node in writers {
                 for &reader_node in readers {
                     if writer_node != reader_node
-                        && !is_reachable(&adj, reader_node, writer_node)
+                        && !is_reachable(&explicit_adj, reader_node, writer_node)
                         && seen_edges.insert((writer_node, reader_node))
                     {
                         adj[writer_node].push(reader_node);
@@ -592,7 +745,7 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
             for &writer_node in writers {
                 for &ind_node in ind_readers {
                     if writer_node != ind_node
-                        && !is_reachable(&adj, ind_node, writer_node)
+                        && !is_reachable(&explicit_adj, ind_node, writer_node)
                         && seen_edges.insert((writer_node, ind_node))
                     {
                         adj[writer_node].push(ind_node);
@@ -635,6 +788,29 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
             "dependency cycle detected in render-graph pass schedule involving: {}",
             cycle_nodes.join(", ")
         )]);
+    }
+
+    // Detect ambiguous multi-writer WAW hazards after inferring RAW edges.
+    for (&res_key, writers) in &resource_writers {
+        if writers.len() > 1 {
+            for (i, &w1) in writers.iter().enumerate() {
+                for &w2 in &writers[i + 1..] {
+                    if w1 != w2 && !is_reachable(&adj, w1, w2) && !is_reachable(&adj, w2, w1) {
+                        errors.push(format!(
+                            "write-after-write (WAW) hazard on resource `{}`: passes `{}` and `{}` both write `{}` without dependency ordering",
+                            res_key.name(),
+                            node_names[w1],
+                            node_names[w2],
+                            res_key.name()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
     }
 
     // Build position lookup and emit concrete RAW, WAW, WAR, and IndirectDispatch barriers.
@@ -742,6 +918,26 @@ pub fn validate_and_schedule(ir: &PipelineIr) -> Result<SchedulePlan, Vec<String
     })
 }
 
+fn validate_sample_scalar(
+    pass: &PassNode,
+    key: &str,
+    desc: &DescriptorBinding,
+    format: vsl_mc::ImageFormat,
+    errors: &mut Vec<String>,
+) {
+    use vsl_mc::{ImageFormat, SampleScalar};
+    let expected = match format {
+        ImageFormat::R32ui => SampleScalar::U32,
+        ImageFormat::R32i => SampleScalar::I32,
+        _ => SampleScalar::F32,
+    };
+    if let Some(actual) = desc.sample_scalar
+        && actual != expected
+    {
+        errors.push(format!("pass `{}` binding `{key}` has format `{}` requiring {expected:?} sampled scalar, but shader declares {actual:?}", pass.name, format.as_str()));
+    }
+}
+
 fn is_debug_channel_descriptor(desc: &DescriptorBinding, unit: &CompiledShaderUnit) -> bool {
     unit.debug_channels
         .iter()
@@ -809,7 +1005,20 @@ pub fn validate_pass_bindings_against_shader(
     let mut errors = Vec::new();
 
     let mut pass_local_descs: IndexMap<&str, &DescriptorBinding> = IndexMap::new();
+    let mut seen_slots = IndexSet::new();
     for desc in &unit.descriptors {
+        if !seen_slots.insert((desc.set, desc.binding)) {
+            errors.push(format!(
+                "pass `{}` shader `{}` declares duplicate descriptor set {} binding {}",
+                pass.name, unit.entry_point, desc.set, desc.binding
+            ));
+        }
+        if desc.set == DESCRIPTOR_SET_PACK_RESOURCES && desc.binding >= PACK_RESOURCE_SLOTS {
+            errors.push(format!(
+                "pass `{}` shader `{}` exceeds Set 3 slot limit at binding {}",
+                pass.name, unit.entry_point, desc.binding
+            ));
+        }
         if !is_debug_channel_descriptor(desc, unit)
             && desc.set == DESCRIPTOR_SET_PER_PASS
             && desc.binding > MAX_PASS_TARGET_BINDING
@@ -866,6 +1075,9 @@ pub fn validate_pass_bindings_against_shader(
             continue;
         };
 
+        if desc.is_unsized || desc.count.is_some_and(|count| count != 1) {
+            errors.push(format!("pass `{}` binding `{bind_key}` cannot satisfy a descriptor array with one resource", pass.name));
+        }
         match binding_ref {
             PassBindingRef::ResourceTexture { slot } => {
                 if desc.set != DESCRIPTOR_SET_PACK_RESOURCES {
@@ -889,7 +1101,14 @@ pub fn validate_pass_bindings_against_shader(
                         pass.name, unit.entry_point, desc.set, desc.binding
                     ));
                 }
-                if !pipeline.resource_textures.iter().any(|r| r.slot == *slot) {
+                if desc.access != DescriptorAccess::ReadOnly
+                    || desc.dim.is_some_and(|dim| dim != TextureDim::Dim2D)
+                {
+                    errors.push(format!("pass `{}` resource texture binding `{bind_key}` requires a read-only 2D sampled image", pass.name));
+                }
+                if let Some(texture) = pipeline.resource_textures.iter().find(|r| r.slot == *slot) {
+                    validate_sample_scalar(pass, bind_key, desc, texture.format, &mut errors);
+                } else {
                     errors.push(format!(
                         "pass `{}` resource texture binding `{bind_key}` references undeclared Set {DESCRIPTOR_SET_PACK_RESOURCES} slot {slot}",
                         pass.name
@@ -934,16 +1153,21 @@ pub fn validate_pass_bindings_against_shader(
                         pass.name, unit.entry_point, desc.kind
                     ));
                 }
-                if *is_write && desc.access == DescriptorAccess::ReadOnly {
+                if (*is_write || is_write_binding_key(bind_key))
+                    && desc.access == DescriptorAccess::ReadOnly
+                {
                     errors.push(format!(
                         "pass `{}` write buffer binding `{bind_key}` (buffer `{name}`) cannot bind to `ReadOnly` descriptor in shader `{}`",
                         pass.name, unit.entry_point
                     ));
                 }
-                if !*is_write && desc.access == DescriptorAccess::WriteOnly {
+                if !*is_write
+                    && !is_write_binding_key(bind_key)
+                    && desc.access != DescriptorAccess::ReadOnly
+                {
                     errors.push(format!(
-                        "pass `{}` read buffer binding `{bind_key}` (buffer `{name}`) cannot bind to `WriteOnly` descriptor in shader `{}`",
-                        pass.name, unit.entry_point
+                        "pass `{}` read buffer binding `{bind_key}` (buffer `{name}`) cannot bind to `{:?}` descriptor in shader `{}`",
+                        pass.name, desc.access, unit.entry_point
                     ));
                 }
                 if !pipeline.buffers.contains_key(name) {
@@ -988,20 +1212,27 @@ pub fn validate_pass_bindings_against_shader(
                         pass.name, desc.access, unit.entry_point
                     ));
                 }
-                if *is_write && desc.access == DescriptorAccess::ReadOnly {
+                if (*is_write || is_write_binding_key(bind_key))
+                    && desc.access == DescriptorAccess::ReadOnly
+                {
                     errors.push(format!(
                         "pass `{}` write binding `{bind_key}` (target `{name}`) cannot bind to `ReadOnly` descriptor in shader `{}`",
                         pass.name, unit.entry_point
                     ));
                 }
-                if !*is_write && desc.access == DescriptorAccess::WriteOnly {
+                if !*history
+                    && !*is_write
+                    && !is_write_binding_key(bind_key)
+                    && desc.access != DescriptorAccess::ReadOnly
+                {
                     errors.push(format!(
-                        "pass `{}` read binding `{bind_key}` (target `{name}`) cannot bind to `WriteOnly` descriptor in shader `{}`",
-                        pass.name, unit.entry_point
+                        "pass `{}` read binding `{bind_key}` (target `{name}`) cannot bind to `{:?}` descriptor in shader `{}`",
+                        pass.name, desc.access, unit.entry_point
                     ));
                 }
 
                 if let Some(target) = pipeline.targets.get(name) {
+                    validate_sample_scalar(pass, bind_key, desc, target.format, &mut errors);
                     if desc.kind == DescriptorKind::StorageImage
                         && let Some(shader_fmt) = desc.image_format
                         && target.format != shader_fmt
@@ -1041,4 +1272,327 @@ pub fn validate_pass_bindings_against_shader(
     }
 
     errors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::toml_desugar::desugar_pack_toml;
+
+    const HEADER: &str = "[pack]\nid = 'graph'\nname = 'Graph'\n[pipeline]\nmode = 'custom'\n";
+
+    fn graph(source: &str) -> PipelineIr {
+        desugar_pack_toml(&format!("{HEADER}{source}")).expect("valid graph manifest")
+    }
+
+    #[test]
+    fn rejects_implicit_feedback_independent_of_pass_order() {
+        let mut ir = graph(
+            r"
+[targets.a]
+[targets.b]
+[[passes]]
+name = 'first'
+shader = 'first'
+[passes.bindings]
+input_b = 'b'
+out_a = 'a'
+[[passes]]
+name = 'second'
+shader = 'second'
+[passes.bindings]
+input_a = 'a'
+out_b = 'b'
+",
+        );
+        for _ in 0..2 {
+            let errors = validate_and_schedule(&ir).unwrap_err();
+            assert!(errors.iter().any(|e| e.contains("cycle")), "{errors:?}");
+            ir.passes.reverse();
+        }
+        // Explicit ordering permits reading the previous contents of b, followed by a write.
+        ir.passes[1].after.push(PassRef::Custom("first".into()));
+        let plan = validate_and_schedule(&ir).unwrap();
+        assert_eq!(plan.ordered_passes, ["first", "second"]);
+        assert!(
+            plan.barriers
+                .iter()
+                .any(|b| b.resource == "a" && b.kind == BarrierKind::Raw)
+        );
+        assert!(
+            plan.barriers
+                .iter()
+                .any(|b| b.resource == "b" && b.kind == BarrierKind::War)
+        );
+    }
+
+    #[test]
+    fn history_reads_do_not_create_current_frame_dependencies() {
+        let ir = graph(
+            r"
+[targets.history]
+temporal = true
+[targets.current]
+[[passes]]
+name = 'accumulate'
+shader = 'accumulate'
+[passes.bindings]
+previous = 'history.history'
+out_current = 'current'
+[[passes]]
+name = 'update'
+shader = 'update'
+[passes.bindings]
+input = 'current'
+out_history = 'history'
+",
+        );
+        let plan = validate_and_schedule(&ir).unwrap();
+        assert_eq!(plan.ordered_passes, ["accumulate", "update"]);
+        assert_eq!(plan.barriers.len(), 1);
+        assert_eq!(plan.barriers[0].resource, "current");
+        assert_eq!(plan.barriers[0].kind, BarrierKind::Raw);
+    }
+
+    #[test]
+    fn infers_legacy_metadata_dependencies_and_transitive_writer_order() {
+        let ir = graph(
+            r"
+[targets.shared]
+[targets.dependency]
+[[passes]]
+name = 'last_writer'
+shader = 'last_writer'
+reads = ['dependency']
+writes = ['shared']
+[[passes]]
+name = 'first_writer'
+shader = 'first_writer'
+writes = ['dependency', 'shared']
+",
+        );
+        let plan = validate_and_schedule(&ir).unwrap();
+        assert_eq!(plan.ordered_passes, ["first_writer", "last_writer"]);
+        assert!(
+            plan.barriers
+                .iter()
+                .any(|b| b.resource == "dependency" && b.kind == BarrierKind::Raw)
+        );
+        assert!(
+            plan.barriers
+                .iter()
+                .any(|b| b.resource == "shared" && b.kind == BarrierKind::Waw)
+        );
+    }
+
+    #[test]
+    fn validates_indirect_buffer_contract_and_reports_indirect_barrier() {
+        let mut ir = graph(
+            r"
+[buffers.args]
+element_type = 'u32'
+count = 2
+[[passes]]
+name = 'dispatch'
+shader = 'dispatch'
+dispatch_indirect = 'args'
+[[passes]]
+name = 'producer'
+shader = 'producer'
+[passes.bindings]
+out = 'buffer:args'
+",
+        );
+        let errors = validate_and_schedule(&ir).unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("not declared indirect")));
+        assert!(errors.iter().any(|e| e.contains("three u32")));
+        let buffer = ir.buffers.get_mut("args").unwrap();
+        buffer.indirect = true;
+        buffer.count = Some(3);
+        let plan = validate_and_schedule(&ir).unwrap();
+        assert_eq!(plan.ordered_passes, ["producer", "dispatch"]);
+        assert!(
+            plan.barriers
+                .iter()
+                .any(|b| b.kind == BarrierKind::IndirectDispatch && b.resource == "args")
+        );
+    }
+
+    #[test]
+    fn inherited_sparse_slots_remap_parent_and_child_bindings_without_aliasing() {
+        let mut base = graph(
+            r"
+[[resources]]
+name = 'noise'
+path = 'noise.png'
+[[passes]]
+name = 'base_pass'
+shader = 'base_pass'
+[passes.bindings]
+noise = 'resource:noise'
+",
+        );
+        base.metadata.id = "base".into();
+        base.resource_textures[0].slot = 9;
+        base.passes[0]
+            .bindings
+            .insert("noise".into(), PassBindingRef::ResourceTexture { slot: 9 });
+        let mut child = graph(
+            r"
+[[resources]]
+name = 'lookup'
+path = 'lookup.png'
+[[passes]]
+name = 'child_pass'
+shader = 'child_pass'
+[passes.bindings]
+lookup = 'resource:lookup'
+",
+        );
+        child.metadata.extends = Some("base".into());
+        let merged = resolve_pack_inheritance(&child, |_| Ok(base.clone())).unwrap();
+        assert_eq!(merged.resource_textures[0].slot, 0);
+        assert_eq!(merged.resource_textures[1].slot, 1);
+        assert_eq!(
+            merged.passes[0].bindings["noise"],
+            PassBindingRef::ResourceTexture { slot: 0 }
+        );
+        assert_eq!(
+            merged.passes[1].bindings["lookup"],
+            PassBindingRef::ResourceTexture { slot: 1 }
+        );
+        validate_and_schedule(&merged).unwrap();
+        child.passes[0]
+            .bindings
+            .insert("lookup".into(), PassBindingRef::ResourceTexture { slot: 9 });
+        assert!(
+            resolve_pack_inheritance(&child, |_| Ok(base.clone()))
+                .unwrap_err()
+                .iter()
+                .any(|e| e.contains("undeclared local texture slot"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_resource_identities_in_direct_ir() {
+        let mut ir = graph(
+            r"
+[targets.history]
+temporal = true
+[[resources]]
+name = 'noise'
+path = 'noise.png'
+[[passes]]
+name = 'bad'
+shader = 'bad'
+[passes.bindings]
+previous = 'history.history'
+noise = 'resource:noise'
+",
+        );
+        let mut duplicate = ir.resource_textures[0].clone();
+        duplicate.name = "duplicate".into();
+        ir.resource_textures.push(duplicate);
+        ir.passes[0].bindings.insert(
+            "previous".into(),
+            PassBindingRef::CustomTarget {
+                name: "history".into(),
+                history: true,
+                is_write: true,
+            },
+        );
+        ir.passes[0]
+            .bindings
+            .insert("noise".into(), PassBindingRef::ResourceTexture { slot: 99 });
+        let errors = validate_and_schedule(&ir).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("duplicate pack texture slot"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("writes read-only history"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("undeclared pack texture slot"))
+        );
+    }
+
+    #[test]
+    fn shader_access_and_sample_type_match_graph_hazards() {
+        use vsl_mc::{HardwareCaps, ImageFormat, SampleScalar, ShaderStage};
+        let ir = graph(
+            r"
+[buffers.data]
+count = 4
+element_type = 'u32'
+[targets.integer]
+format = 'r32ui'
+[[passes]]
+name = 'consume'
+shader = 'consume'
+[passes.bindings]
+input = 'buffer:data'
+image = 'integer'
+",
+        );
+        let mut unit = CompiledShaderUnit {
+            entry_point: "consume".into(),
+            stage: ShaderStage::Compute,
+            spirv: vec![],
+            descriptors: vec![
+                DescriptorBinding {
+                    name: "input".into(),
+                    set: 0,
+                    binding: 1,
+                    kind: DescriptorKind::StorageBuffer,
+                    dim: None,
+                    sample_scalar: None,
+                    image_format: None,
+                    access: DescriptorAccess::ReadWrite,
+                    is_unsized: false,
+                    count: None,
+                },
+                DescriptorBinding {
+                    name: "image".into(),
+                    set: 0,
+                    binding: 2,
+                    kind: DescriptorKind::SampledImage,
+                    dim: Some(TextureDim::Dim2D),
+                    sample_scalar: Some(SampleScalar::F32),
+                    image_format: Some(ImageFormat::R32ui),
+                    access: DescriptorAccess::ReadOnly,
+                    is_unsized: false,
+                    count: Some(2),
+                },
+            ],
+            push_constants: vec![],
+            push_constant_size: 0,
+            workgroup_size: Some([1, 1, 1]),
+            required_caps: HardwareCaps::empty(),
+            used_specs: vec![],
+            used_params: vec![],
+            debug_channels: vec![],
+            ray_interfaces: vec![],
+            cache_key: [0; 32],
+        };
+        let errors = validate_pass_bindings_against_shader(&ir.passes[0], &unit, &ir);
+        assert!(errors.iter().any(|e| e.contains("ReadWrite")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("U32 sampled scalar")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("descriptor array")),
+            "{errors:?}"
+        );
+        unit.descriptors[0].access = DescriptorAccess::ReadOnly;
+        unit.descriptors[1].sample_scalar = Some(SampleScalar::U32);
+        unit.descriptors[1].count = None;
+        assert!(validate_pass_bindings_against_shader(&ir.passes[0], &unit, &ir).is_empty());
+    }
 }

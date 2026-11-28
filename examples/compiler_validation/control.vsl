@@ -1,0 +1,22 @@
+@stage(compute(8, 1, 1))
+fn control_flow(
+    #[binding(set = 0, binding = 0)] output: RWBuffer<u32>,
+    #[builtin(global_invocation_id)] gid: uvec3,
+) {
+    let mut sum = 0u;
+    for i in (0u..8u).step_by(2u) {
+        if i != 2u { sum = sum + i; }
+    }
+    let mut count = gid.x & 3u;
+    while count > 0u {
+        sum = sum + count;
+        count = count - 1u;
+    }
+    switch gid.x & 3u {
+        case 0u: { sum = sum + 1u; }
+        case 1u: { sum = sum + 2u; }
+        default: { sum = sum + 3u; }
+    }
+    let result = if gid.x > 4u { sum * 2u } else { sum };
+    output[gid.x] = result;
+}

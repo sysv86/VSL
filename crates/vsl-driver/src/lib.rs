@@ -18,8 +18,8 @@ use smol_str::SmolStr;
 use std::path::PathBuf;
 use vsl_diagnostics::{Diagnostic, FileId, SourceDatabase, Span};
 use vsl_glsl::{
-    BindlessAbi, EmitOptions as GlslEmitOptions, emit_glsl_460_with_options,
-    emit_raster_gbuffer_hook_slot_with_schema,
+    BindlessAbi, EmitOptions as GlslEmitOptions, emit_glsl_460_entry_with_options,
+    emit_glsl_460_with_options, emit_raster_gbuffer_hook_slot_with_schema,
 };
 use vsl_hir::module::{L1ModuleHash, ModuleGraph, compute_l2_artifact_hash};
 use vsl_hir::{
@@ -800,6 +800,17 @@ impl VslCompiler {
         source: &str,
         abi: AbiProfile,
     ) -> GlslCompileOutput {
+        self.compile_shader_to_glsl_entry(file_name, source, abi, None)
+    }
+
+    /// Compile a selected shader entry to GLSL; reject backend errors as diagnostics.
+    pub fn compile_shader_to_glsl_entry(
+        &mut self,
+        file_name: impl Into<String>,
+        source: &str,
+        abi: AbiProfile,
+        entry: Option<&str>,
+    ) -> GlslCompileOutput {
         let file = self.sources.add_file(file_name, source);
         let parsed = parse_source(file, source);
         let mut diagnostics = parsed.diagnostics;
@@ -814,14 +825,32 @@ impl VslCompiler {
                 AbiProfile::Hyaloclast => BindlessAbi::Hyaloclast4096,
                 AbiProfile::Standalone => BindlessAbi::UpstreamUnsized,
             };
-            emit_glsl_460_with_options(
-                &parsed.unit,
-                GlslEmitOptions {
-                    route_params_to_vs_motion: false,
-                    bindless_abi,
-                    abi,
-                },
-            )
+            let options = GlslEmitOptions {
+                route_params_to_vs_motion: false,
+                bindless_abi,
+                abi,
+            };
+            let emitted = match entry {
+                Some(name) => emit_glsl_460_entry_with_options(&parsed.unit, name, options),
+                None => {
+                    let source = emit_glsl_460_with_options(&parsed.unit, options);
+                    match source.lines().find_map(|line| line.strip_prefix("#error ")) {
+                        Some(error) => Err(error.to_owned()),
+                        None => Ok(source),
+                    }
+                }
+            };
+            match emitted {
+                Ok(source) => source,
+                Err(error) => {
+                    diagnostics.push(Diagnostic::error(
+                        "E0530",
+                        error,
+                        vsl_diagnostics::Span::synthetic(),
+                    ));
+                    String::new()
+                }
+            }
         };
 
         GlslCompileOutput {
@@ -3206,6 +3235,114 @@ mod tests {
                 .contains("layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;")
         );
         assert!(!glsl.glsl.contains("WorldUBO"));
+    }
+
+    #[test]
+    fn glsl_entry_selection_reports_ambiguous_and_missing_entries() {
+        let mut compiler = VslCompiler::new();
+        let source = "@raygen fn launch() {} @miss fn miss() {}";
+        let ambiguous =
+            compiler.compile_shader_to_glsl_with_abi("multi.vsl", source, AbiProfile::Standalone);
+        assert!(ambiguous.has_errors());
+        assert!(ambiguous.glsl.is_empty());
+        for entry in ["launch", "miss"] {
+            let result = compiler.compile_shader_to_glsl_entry(
+                "multi.vsl",
+                source,
+                AbiProfile::Standalone,
+                Some(entry),
+            );
+            assert!(!result.has_errors(), "{:?}", result.diagnostics);
+            assert_eq!(result.glsl.matches("void main(").count(), 1);
+        }
+        let missing = compiler.compile_shader_to_glsl_entry(
+            "multi.vsl",
+            source,
+            AbiProfile::Standalone,
+            Some("unknown"),
+        );
+        assert!(missing.has_errors());
+        assert!(missing.glsl.is_empty());
+    }
+
+    #[test]
+    fn ray_query_extended_getters_emit_typed_spirv() {
+        let units = compile_standalone_and_validate(
+            "extended_ray_query",
+            r"
+            #[cap(ray_query)]
+            @stage(compute(1,1,1))
+            fn main(
+                #[binding(set=0,binding=0)] scene: AccelerationStructure,
+                #[binding(set=0,binding=1)] result: RWBuffer<u32>,
+            ) {
+                let rq: RayQuery;
+                rq.initialize(scene, 0u, 255u, vec3(0.0), 0.01, vec3(0.0,0.0,1.0), 32.0);
+                let mut total = rq.ray_flags() + u32(rq.ray_tmin() + rq.world_ray_origin().x + rq.world_ray_direction().z);
+                while rq.proceed() {
+                    total += rq.candidate_instance_id() + rq.candidate_instance_custom_index()
+                        + rq.candidate_geometry_index() + rq.candidate_primitive_index() + rq.candidate_sbt_record_offset();
+                    let m = rq.candidate_object_to_world();
+                    let n = rq.candidate_world_to_object();
+                    total += u32(m[0u].x + n[0u].x + rq.candidate_object_ray_origin().x + rq.candidate_object_ray_direction().z);
+                    if rq.candidate_type() == 0u {
+                        if rq.candidate_front_face() { total += 1u; }
+                        total += u32(rq.candidate_barycentrics().x + rq.candidate_t());
+                        rq.confirm_intersection();
+                    } else {
+                        if rq.candidate_aabb_opaque() { total += 1u; }
+                        rq.generate_intersection(1.0);
+                    }
+                }
+                if rq.committed_type() == 1u {
+                    total += rq.committed_instance_id() + rq.committed_instance_custom_index()
+                        + rq.committed_geometry_index() + rq.committed_primitive_index() + rq.committed_sbt_record_offset();
+                    let m = rq.committed_object_to_world();
+                    let n = rq.committed_world_to_object();
+                    total += u32(m[0u].x + n[0u].x + rq.committed_object_ray_origin().x + rq.committed_object_ray_direction().z);
+                    if rq.committed_front_face() { total += 1u; }
+                    total += u32(rq.committed_barycentrics().x + rq.committed_t());
+                }
+                result[0u] = total;
+            }
+            ",
+            false,
+        );
+        let instructions: Vec<_> = spirv_instructions(&units[0].spirv).collect();
+        for opcode in [
+            4479, 6016, 6017, 6018, 6019, 6020, 6021, 6022, 6023, 6024, 6025, 6026, 6027, 6028,
+            6029, 6030, 6031, 6032,
+        ] {
+            assert!(
+                instructions.iter().any(|(op, _)| *op == opcode),
+                "missing ray query opcode {opcode}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_resource_reads_precede_later_expression_stores() {
+        let units = compile_standalone_and_validate(
+            "resource_read_order",
+            r"
+            @stage(compute(1,1,1))
+            fn main(#[binding(set=0,binding=0)] data: RWBuffer<u32>) {
+                data[0u] = 41u;
+                let value = data[0u] + { data[0u] = 9u; 1u };
+                data[1u] = value;
+            }
+            ",
+            false,
+        );
+        let memory_ops: Vec<_> = spirv_instructions(&units[0].spirv)
+            .filter(|(op, _)| matches!(op, 61 | 62))
+            .map(|(op, _)| op)
+            .collect();
+        assert_eq!(
+            memory_ops,
+            vec![62, 61, 62, 62],
+            "read must precede mutation of the same element"
+        );
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub fn parse_source(file: FileId, source: &str) -> ParseResult {
         tokens,
         pos: 0,
         allow_struct_lit: true,
+        source_end: source.len() as u32,
+        nesting: 0,
         diagnostics: Vec::new(),
     };
     let unit = parser.parse_unit();
@@ -47,10 +49,28 @@ struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
     allow_struct_lit: bool,
+    source_end: u32,
+    nesting: usize,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl Parser {
+    // Bound recursive grammar entry points before allocating or dropping a deeply nested AST.
+    fn with_nesting<T>(&mut self, parse: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if self.nesting >= 64 {
+            self.diagnostics.push(Diagnostic::error(
+                "E0110",
+                "syntax nesting limit exceeded",
+                self.current_span(),
+            ));
+            return None;
+        }
+        self.nesting += 1;
+        let result = parse(self);
+        self.nesting -= 1;
+        result
+    }
+
     fn is_eof(&self) -> bool {
         self.pos >= self.tokens.len()
     }
@@ -66,10 +86,8 @@ impl Parser {
     fn current_span(&self) -> Span {
         if let Some(tok) = self.tokens.get(self.pos) {
             tok.span
-        } else if let Some(last) = self.tokens.last() {
-            Span::new(self.file, last.span.end, last.span.end)
         } else {
-            Span::new(self.file, 0, 0)
+            Span::new(self.file, self.source_end, self.source_end)
         }
     }
 
@@ -136,7 +154,14 @@ impl Parser {
 
     /// Parses an identifier, also permitting contextual keywords used as field/param names.
     fn parse_ident(&mut self) -> Option<Ident> {
-        let tok = self.tokens.get(self.pos)?;
+        let Some(tok) = self.tokens.get(self.pos) else {
+            self.diagnostics.push(Diagnostic::error(
+                "E0101",
+                "expected identifier",
+                self.current_span(),
+            ));
+            return None;
+        };
         let name = match &tok.token {
             Token::Ident(s) => s.clone(),
             Token::KwPack => SmolStr::new_static("pack"),
@@ -666,6 +691,10 @@ impl Parser {
     }
 
     fn parse_type_expr(&mut self) -> Option<TypeExpr> {
+        self.with_nesting(Self::parse_type_expr_inner)
+    }
+
+    fn parse_type_expr_inner(&mut self) -> Option<TypeExpr> {
         if let Some(start) = self.eat(&Token::LBracket) {
             let element = self.parse_type_expr()?;
             self.expect(&Token::Semi, "`;`")?;
@@ -733,11 +762,30 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Option<Block> {
+        self.with_nesting(Self::parse_block_inner)
+    }
+
+    fn parse_block_inner(&mut self) -> Option<Block> {
         let start = self.expect(&Token::LBrace, "`{`")?;
         let mut stmts = Vec::new();
         let mut tail_expr = None;
 
         while !self.is_eof() && self.peek() != Some(&Token::RBrace) {
+            if matches!(
+                self.peek(),
+                Some(
+                    Token::KwFn
+                        | Token::KwPub
+                        | Token::KwStruct
+                        | Token::KwTrait
+                        | Token::KwImpl
+                        | Token::KwConst
+                        | Token::KwModule
+                        | Token::KwImport
+                )
+            ) {
+                break;
+            }
             let before = self.pos;
             match self.parse_stmt(true) {
                 Some(ParsedStmt::Stmt(stmt)) => stmts.push(stmt),
@@ -847,6 +895,9 @@ impl Parser {
                 if allow_tail && !has_semi && self.peek() == Some(&Token::RBrace) {
                     return Some(ParsedStmt::TailExpr(expr));
                 }
+                if !has_semi {
+                    self.expect(&Token::Semi, "`;`");
+                }
                 let span = expr.span();
                 Some(ParsedStmt::Stmt(Stmt::Expr {
                     expr,
@@ -871,6 +922,13 @@ impl Parser {
         } else {
             None
         };
+        if ty.is_none() && init.is_none() {
+            self.diagnostics.push(Diagnostic::error(
+                "E0100",
+                "local declaration requires a type or initializer",
+                name.span,
+            ));
+        }
         let end = self.expect(&Token::Semi, "`;`").unwrap_or(name.span);
         Some(Stmt::Let {
             is_mut,
@@ -947,7 +1005,16 @@ impl Parser {
                 cases.push(SwitchCase { value, body, span });
             } else if let Some(def_start) = self.eat(&Token::KwDefault) {
                 self.expect(&Token::Colon, "`:`")?;
-                default = self.parse_switch_arm_body(def_start);
+                let body = self.parse_switch_arm_body(def_start);
+                if default.is_some() {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E0108",
+                        "duplicate default arm in switch",
+                        def_start,
+                    ));
+                } else {
+                    default = body;
+                }
             } else {
                 let span = self.current_span();
                 self.diagnostics.push(Diagnostic::error(
@@ -1009,12 +1076,34 @@ impl Parser {
     }
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Option<Expr> {
-        let lhs = self.parse_prefix_expr()?;
-        self.parse_expr_bp_with_lhs(lhs, min_bp)
+        self.with_nesting(|parser| {
+            let lhs = parser.parse_prefix_expr()?;
+            parser.parse_expr_bp_with_lhs(lhs, min_bp)
+        })
     }
 
     fn parse_expr_bp_with_lhs(&mut self, mut lhs: Expr, min_bp: u8) -> Option<Expr> {
+        let mut chain_length = 0;
         loop {
+            let continues = matches!(
+                self.peek(),
+                Some(Token::Dot | Token::LParen | Token::LBracket)
+            ) || self
+                .peek()
+                .and_then(infix_binding_power)
+                .is_some_and(|(_, bp, _)| bp >= min_bp);
+            if !continues {
+                break;
+            }
+            if chain_length >= 256 {
+                self.diagnostics.push(Diagnostic::error(
+                    "E0110",
+                    "expression chain limit exceeded",
+                    self.current_span(),
+                ));
+                return None;
+            }
+            chain_length += 1;
             match self.peek() {
                 Some(Token::Dot) => {
                     self.bump();
@@ -1265,6 +1354,10 @@ impl Parser {
     }
 
     fn parse_if_expr(&mut self) -> Option<Expr> {
+        self.with_nesting(Self::parse_if_expr_inner)
+    }
+
+    fn parse_if_expr_inner(&mut self) -> Option<Expr> {
         let start = self.expect(&Token::KwIf, "`if`")?;
         let cond = self.parse_expr_no_struct_lit()?;
         let then_branch = self.parse_block()?;
@@ -1599,6 +1692,48 @@ fn infix_binding_power(token: &Token) -> Option<(BinaryOp, u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_incomplete_declarations_and_recovers_following_functions() {
+        let parsed = parse_source(FileId(0), "fn   ");
+        assert!(parsed.has_errors());
+        assert_eq!(
+            parsed.diagnostics[0].primary_span,
+            Span::new(FileId(0), 5, 5)
+        );
+
+        let parsed = parse_source(FileId(0), "fn first() { let x = 1u; fn second() {}");
+        assert!(parsed.has_errors());
+        assert!(
+            parsed
+                .unit
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Function(f) if f.name.name == "second"))
+        );
+
+        for source in [
+            "fn bad() { 1u 2u; }",
+            "fn bad() { let a; }",
+            "fn bad(x: u32) { switch x { default: break; default: break; } }",
+        ] {
+            assert!(parse_source(FileId(0), source).has_errors(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_deeply_nested_and_unbounded_expression_chains() {
+        let deep = format!(
+            "fn f() {{ let a = {}1u{}; }}",
+            "(".repeat(500),
+            ")".repeat(500)
+        );
+        let chain = format!("fn f() {{ let a = 0u{}; }}", " + 1u".repeat(500));
+        for source in [deep, chain] {
+            let parsed = parse_source(FileId(0), &source);
+            assert!(parsed.diagnostics.iter().any(|diag| diag.code == "E0110"));
+        }
+    }
 
     #[test]
     fn parses_rayquery_compute_shader() {

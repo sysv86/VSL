@@ -17,6 +17,6 @@ pub use ssa::{
     IrInterlockMode, IrInterpolation, IrLocalVar, IrModule, IrParam, IrPushConstantBlock,
     IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
     IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,
-    IrType, IrWorkgroupVar, MemoryAccess, ScalarIrTy, SpecConstantOpKind, StructuredStmt,
-    SubgroupClusteredOp,
+    IrType, IrWorkgroupVar, MemoryAccess, RayQueryIntersection, RayQueryIntersectionProperty,
+    RayQueryRead, ScalarIrTy, SpecConstantOpKind, StructuredStmt, SubgroupClusteredOp,
 };

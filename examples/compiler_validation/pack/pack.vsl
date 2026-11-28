@@ -1,0 +1,25 @@
+pack "compiler-validation" {
+    name: "Compiler Validation",
+    version: "1.0.0",
+    tiers: 0..=3,
+}
+settings {
+    category "Graph" {
+        param include_copy: bool = true { label: "Include Copy" }
+    }
+}
+presets {
+    preset minimal (order = 0, label: "Minimal") { include_copy = false; }
+}
+pipeline custom(g: mut mc::GraphBuilder, cfg: mc::PipelineConfig) {
+    let source = g.target::<rgba16f>("source");
+    let result = g.target::<rgba16f>("result");
+    if cfg.param(include_copy) {
+        g.compute_pass("copy", copy_image)
+            .bind(input = source, out_result = result.write())
+            .dispatch_for(result);
+    }
+    g.compute_pass("fill", fill_image)
+        .bind(out_source = source.write())
+        .dispatch_for(source);
+}

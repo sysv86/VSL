@@ -1,0 +1,16 @@
+#[push_constant, layout(std430)]
+struct Parameters {
+    gain: f32,
+}
+
+@stage(compute(8, 8, 1))
+fn filter_image(
+    #[binding(set = 1, binding = 2)] input: Texture2D<f32>,
+    #[binding(set = 1, binding = 5)] output: RWImage2D<rgba16f>,
+    #[push_constant] params: Parameters,
+    #[builtin(global_invocation_id)] gid: uvec3,
+) {
+    let pixel = ivec2(gid.xy);
+    let color = input.fetch(pixel, 0);
+    output.store(pixel, vec4(color.xyz * params.gain, color.w));
+}

@@ -6,8 +6,8 @@ use vsl_mc::{
     AbiProfile, BINDLESS_IMAGE_COUNT, BuiltinFieldType, BuiltinStructDesc, DESCRIPTOR_SET_BINDLESS,
     DESCRIPTOR_SET_PACK_RESOURCES, DESCRIPTOR_SET_PER_PASS, DESCRIPTOR_SET_SCENE_GLOBALS,
     EMISSIVE_LIGHT_LAYOUT, EMISSIVE_LIGHT_SSBO_LAYOUT, INSTANCE_META_LAYOUT, ImageFormat,
-    RESTIR_RESERVOIR_LAYOUT, RESTIR_RESERVOIR_SSBO_LAYOUT, SHARC_CONFIG_UBO_LAYOUT,
-    WORLD_UBO_LAYOUT,
+    RESTIR_RESERVOIR_LAYOUT, RESTIR_RESERVOIR_SSBO_LAYOUT, RayInterfaceKind,
+    SHARC_CONFIG_UBO_LAYOUT, ShaderStage, WORLD_UBO_LAYOUT,
 };
 use vsl_syntax::ast::{
     Attribute, BinaryOp, Block, CallArg, ConstDecl, Expr, FnDecl, FnParam, GenericParam, Ident,
@@ -124,6 +124,9 @@ pub(crate) struct FeatureScan {
     pub pack_param_types: IndexMap<SmolStr, String>,
     pub debug_channels: IndexSet<String>,
     pub next_per_pass_binding: u32,
+    occupied_bindings: BTreeSet<(u32, u32)>,
+    entry_bindings: IndexMap<SmolStr, (u32, u32)>,
+    binding_errors: Vec<String>,
     pub mc_helpers: BTreeSet<&'static str>,
 }
 
@@ -144,8 +147,13 @@ pub(crate) struct EmitCtx {
     pub imported_mc_world: bool,
     pub shadowed_world: bool,
     pub tmp_counter: u32,
+    entry_bindings: IndexMap<SmolStr, (u32, u32)>,
     position_fetch_helpers_emitted: bool,
     opacity_micromap_mode_emitted: bool,
+    ser_suffix: Option<&'static str>,
+    rt_interfaces: IndexMap<SmolStr, (RayInterfaceKind, Option<u32>)>,
+    pub(crate) errors: Vec<String>,
+    builtin_writebacks: Vec<(&'static str, String)>,
 }
 
 impl EmitCtx {
@@ -165,8 +173,13 @@ impl EmitCtx {
             imported_mc_world: false,
             shadowed_world: false,
             tmp_counter: 0,
+            entry_bindings: IndexMap::new(),
             position_fetch_helpers_emitted: false,
             opacity_micromap_mode_emitted: false,
+            ser_suffix: None,
+            rt_interfaces: IndexMap::new(),
+            errors: Vec::new(),
+            builtin_writebacks: Vec::new(),
         }
     }
 
@@ -208,16 +221,45 @@ pub fn emit_glsl_460(unit: &SourceUnit) -> String {
 
 /// Emits a Stage A GLSL 460 oracle shader source string with explicit [`EmitOptions`].
 pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> String {
+    let entry_count = unit
+        .items
+        .iter()
+        .filter(|item| matches!(item, Item::Function(f) if extract_entry_stage(&f.attrs).is_some()))
+        .count();
+    if entry_count > 1 {
+        return "#version 460 core\n#error Multiple entry points: select one with emit_glsl_460_entry_with_options\n".to_owned();
+    }
     let mut scan = FeatureScan {
         generic_instantiations: collect_generic_instantiations(unit),
         ..FeatureScan::default()
     };
     scan_unit_with_options(unit, opts, &mut scan);
+    plan_entry_bindings(unit, opts, &mut scan);
     // Canonical `WorldUBO` carries `uint64_t pack_params_bda` for every entry point.
     scan.extensions
         .insert("GL_EXT_shader_explicit_arithmetic_types_int64");
+    // The standalone ABI uses separate texture objects, including samplerless
+    // texelFetch and textureSize operations on those objects.
+    if matches!(opts.bindless_abi, BindlessAbi::UpstreamUnsized) {
+        scan.extensions
+            .insert("GL_EXT_samplerless_texture_functions");
+    }
 
     let mut ctx = EmitCtx::new(opts);
+    ctx.entry_bindings.clone_from(&scan.entry_bindings);
+    ctx.errors.append(&mut scan.binding_errors);
+    let nv = scan.extensions.contains("GL_NV_shader_invocation_reorder");
+    let ext = scan.extensions.contains("GL_EXT_shader_invocation_reorder");
+    ctx.ser_suffix = match (nv, ext) {
+        (true, false) => Some("NV"),
+        (false, true) => Some("EXT"),
+        (true, true) => {
+            ctx.errors
+                .push("Mixed NV and EXT SER profiles in one GLSL translation unit".to_owned());
+            None
+        }
+        (false, false) => None,
+    };
     ctx.imported_mc_world = scan.imported_mc_world;
     for bda in &scan.bda_refs {
         ctx.bda_types.insert(bda.type_name(), bda.clone());
@@ -239,7 +281,7 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
             Item::Struct(s) => {
                 let layout_mode = extract_layout_attr(&s.attrs)
                     .and_then(LayoutMode::from_attr_str)
-                    .unwrap_or(LayoutMode::Scalar);
+                    .unwrap_or(LayoutMode::Std430);
                 if s.generics.is_empty() {
                     let mut fields = IndexMap::new();
                     let mut dims = IndexMap::new();
@@ -439,6 +481,18 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
         }
     }
 
+    for item in &unit.items {
+        if let Item::Function(f) = item
+            && extract_entry_stage(&f.attrs).is_none()
+            && f.generics.is_empty()
+        {
+            let ret = fn_return_glsl_type(f);
+            let name = escape_glsl_ident(&f.name.name);
+            let params = format_param_list(&f.params);
+            let _ = writeln!(out, "{ret} {name}({params});");
+        }
+    }
+
     // 5. Trait interfaces and `impl` methods (concrete impls before monomorphized generic impls
     //    so trait method definitions precede monomorphized callers in GLSL).
     for item in &unit.items {
@@ -468,7 +522,37 @@ pub fn emit_glsl_460_with_options(unit: &SourceUnit, opts: EmitOptions) -> Strin
         }
     }
 
+    if !ctx.errors.is_empty() {
+        let mut diagnostics = String::new();
+        for error in &ctx.errors {
+            let _ = writeln!(diagnostics, "#error {error}");
+        }
+        out.insert_str("#version 460 core\n".len(), &diagnostics);
+    }
     out
+}
+
+/// Emit one entry point from a module containing multiple independent shader stages.
+/// The other entry points are excluded from the resulting GLSL translation unit.
+/// Invalid or ambiguous selections produce an error instead of emitting multiple main functions.
+pub fn emit_glsl_460_entry_with_options(
+    unit: &SourceUnit,
+    entry: &str,
+    opts: EmitOptions,
+) -> Result<String, String> {
+    let count = unit.items.iter().filter(|item| matches!(item, Item::Function(f) if f.name.name == entry && extract_entry_stage(&f.attrs).is_some())).count();
+    if count != 1 {
+        return Err(format!(
+            "Expected one shader entry named `{entry}`, found {count}"
+        ));
+    }
+    let mut selected = unit.clone();
+    selected.items.retain(|item| !matches!(item, Item::Function(f) if f.name.name != entry && extract_entry_stage(&f.attrs).is_some()));
+    let glsl = emit_glsl_460_with_options(&selected, opts);
+    if let Some(error) = glsl.lines().find_map(|line| line.strip_prefix("#error ")) {
+        return Err(error.to_owned());
+    }
+    Ok(glsl)
 }
 
 fn builtin_field_glsl_type(ty: BuiltinFieldType) -> (String, &'static str) {
@@ -573,12 +657,17 @@ fn emit_mc_global_decls(scan: &FeatureScan, opts: EmitOptions, out: &mut String)
         out.push_str("} mc_world;\n\n");
     }
     // Set 0, ascending bindings after pass resource parameters: debug output images from `mc::debug_write(...)`.
+    let mut occupied_bindings = scan.occupied_bindings.clone();
     let mut next_free_binding = if emit_world_ubo {
         scan.next_per_pass_binding.max(1)
     } else {
         scan.next_per_pass_binding
     };
     for channel in &scan.debug_channels {
+        while occupied_bindings.contains(&(DESCRIPTOR_SET_PER_PASS, next_free_binding)) {
+            next_free_binding += 1;
+        }
+        occupied_bindings.insert((DESCRIPTOR_SET_PER_PASS, next_free_binding));
         let _ = writeln!(
             out,
             "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {next_free_binding}, rgba16f) writeonly uniform image2D vsl_debug_{channel};"
@@ -593,7 +682,10 @@ fn emit_mc_global_decls(scan: &FeatureScan, opts: EmitOptions, out: &mut String)
     // placed at `max(next_free_binding, MAX_PASS_TARGET_BINDING)` so it never collides with
     // per-pass resource parameters or debug channels.
     if scan.uses_sampled_textures {
-        let sampler_binding = next_free_binding.max(MAX_PASS_TARGET_BINDING);
+        let mut sampler_binding = next_free_binding.max(MAX_PASS_TARGET_BINDING);
+        while occupied_bindings.contains(&(DESCRIPTOR_SET_PER_PASS, sampler_binding)) {
+            sampler_binding += 1;
+        }
         let _ = writeln!(
             out,
             "layout(set = {DESCRIPTOR_SET_PER_PASS}, binding = {sampler_binding}) uniform sampler vsl_default_sampler;\n"
@@ -736,6 +828,7 @@ fn emit_ray_query_support(scan: &FeatureScan, ctx: &mut EmitCtx, out: &mut Strin
     if scan
         .extensions
         .contains("GL_EXT_ray_tracing_position_fetch")
+        && scan.extensions.contains("GL_EXT_ray_query")
         && !ctx.position_fetch_helpers_emitted
     {
         // The GLSL builtin writes an array through an out argument. Wrappers preserve
@@ -1087,7 +1180,7 @@ pub(crate) fn emit_concrete_struct_decl(
     let layout_mode = extract_layout_attr(&decl.attrs);
 
     if is_push_constant {
-        let layout_qual = layout_mode.unwrap_or("scalar");
+        let layout_qual = layout_mode.unwrap_or("std430");
         let _ = writeln!(
             out,
             "layout(push_constant, {layout_qual}) uniform {glsl_name} {{"
@@ -1122,25 +1215,276 @@ enum EntryStage {
     Compute(u32, u32, u32),
     Vertex,
     Fragment,
+    RayTracing(ShaderStage),
+    Unsupported,
+}
+
+fn rt_stage(name: &str) -> Option<ShaderStage> {
+    match name {
+        "raygen" => Some(ShaderStage::RayGen),
+        "closest_hit" => Some(ShaderStage::ClosestHit),
+        "any_hit" => Some(ShaderStage::AnyHit),
+        "miss" => Some(ShaderStage::Miss),
+        "intersection" => Some(ShaderStage::Intersection),
+        "callable" => Some(ShaderStage::Callable),
+        _ => None,
+    }
+}
+
+fn rt_interface_kind(name: &str) -> Option<RayInterfaceKind> {
+    Some(match name {
+        "ray_payload" => RayInterfaceKind::RayPayload,
+        "incoming_ray_payload" => RayInterfaceKind::IncomingRayPayload,
+        "callable_data" => RayInterfaceKind::CallableData,
+        "incoming_callable_data" => RayInterfaceKind::IncomingCallableData,
+        "hit_attribute" => RayInterfaceKind::HitAttribute,
+        "shader_record" | "shader_record_buffer" => RayInterfaceKind::ShaderRecord,
+        _ => return None,
+    })
+}
+
+fn rt_interface(attrs: &[Attribute]) -> Option<(RayInterfaceKind, Option<u32>)> {
+    for entry in attrs.iter().flat_map(|attr| &attr.entries) {
+        let Some(kind) = rt_interface_kind(&entry.name.name) else {
+            continue;
+        };
+        let location = kind
+            .has_location()
+            .then(|| entry.args.first().and_then(parse_u32_lit).unwrap_or(0));
+        return Some((kind, location));
+    }
+    None
+}
+
+// GLSL applies one layout rule throughout a block. The native backend allows a
+// nested record to select a stricter rule; refusing that case avoids an ABI mismatch.
+fn record_layout_compatible(
+    name: &str,
+    layout: LayoutMode,
+    ctx: &EmitCtx,
+    visiting: &mut BTreeSet<String>,
+) -> bool {
+    let rank = |mode| match mode {
+        LayoutMode::Scalar => 0,
+        LayoutMode::Std430 => 1,
+        LayoutMode::Std140 => 2,
+    };
+    if !visiting.insert(name.to_owned()) {
+        return false;
+    }
+    let compatible = ctx.struct_fields.get(name).is_none_or(|fields| {
+        fields.values().all(|field| {
+            let child = field.split('[').next().unwrap_or(field);
+            if matches!(child, "bool" | "bvec2" | "bvec3" | "bvec4") {
+                return false;
+            }
+            if let Some(&child_layout) = ctx.struct_layouts.get(child) {
+                rank(child_layout) <= rank(layout)
+                    && record_layout_compatible(child, layout, ctx, visiting)
+            } else {
+                true
+            }
+        })
+    });
+    visiting.remove(name);
+    compatible
+}
+
+fn emit_rt_interface(param: &FnParam, stage: EntryStage, ctx: &mut EmitCtx, out: &mut String) {
+    let Some((kind, location)) = rt_interface(&param.attrs) else {
+        return;
+    };
+    let mut attrs = param
+        .attrs
+        .iter()
+        .flat_map(|attr| &attr.entries)
+        .filter(|entry| rt_interface_kind(&entry.name.name).is_some());
+    if let Some(attr) = attrs.next() {
+        let valid = if kind.has_location() {
+            matches!(attr.args.as_slice(), [])
+                || matches!(attr.args.as_slice(), [arg] if parse_u32_lit(arg).is_some())
+        } else {
+            attr.args.is_empty()
+        };
+        if !valid || attrs.next().is_some() {
+            ctx.errors.push(format!(
+                "Invalid RT interface attribute for {}",
+                param.name.name
+            ));
+            return;
+        }
+    }
+    if ctx
+        .rt_interfaces
+        .values()
+        .any(|(existing_kind, existing_location)| {
+            *existing_kind == kind && (!kind.allows_multiple() || *existing_location == location)
+        })
+    {
+        ctx.errors
+            .push(format!("Duplicate RT interface {kind:?} at {location:?}"));
+        return;
+    }
+    let Some(ty) = &param.ty else {
+        ctx.errors
+            .push(format!("Missing RT interface type for {}", param.name.name));
+        return;
+    };
+    if !matches!(stage, EntryStage::RayTracing(rt) if kind.allows_stage(rt)) {
+        ctx.errors
+            .push(format!("Invalid RT interface {kind:?} for stage {stage:?}"));
+        return;
+    }
+    let (base, suffix) = type_to_glsl(ty);
+    let name = escape_glsl_ident(&param.name.name);
+    let qualifier = match kind {
+        RayInterfaceKind::RayPayload => "rayPayloadEXT",
+        RayInterfaceKind::IncomingRayPayload => "rayPayloadInEXT",
+        RayInterfaceKind::CallableData => "callableDataEXT",
+        RayInterfaceKind::IncomingCallableData => "callableDataInEXT",
+        RayInterfaceKind::HitAttribute => "hitAttributeEXT",
+        RayInterfaceKind::ShaderRecord => "",
+    };
+    if kind == RayInterfaceKind::ShaderRecord {
+        let layout = ctx
+            .struct_layouts
+            .get(base.as_str())
+            .copied()
+            .unwrap_or(LayoutMode::Std430);
+        if !ctx.struct_fields.contains_key(base.as_str()) || !suffix.is_empty() {
+            ctx.errors
+                .push("Shader record requires a struct type".to_owned());
+            return;
+        }
+        if !record_layout_compatible(&base, layout, ctx, &mut BTreeSet::new()) {
+            ctx.errors.push("Shader record has nested layout stricter than the enclosing GLSL block; explicit native layout is required".to_owned());
+            return;
+        }
+        let layout = layout.as_glsl();
+        let _ = writeln!(
+            out,
+            "layout(shaderRecordEXT, {layout}) buffer _vsl_Record_{name} {{ {base} {name}{suffix}; }};"
+        );
+    } else if let Some(loc) = location {
+        let _ = writeln!(
+            out,
+            "layout(location = {loc}) {qualifier} {base} {name}{suffix};"
+        );
+    } else {
+        let _ = writeln!(out, "{qualifier} {base} {name}{suffix};");
+    }
+    ctx.local_types
+        .insert(param.name.name.clone(), format!("{base}{suffix}"));
+    ctx.rt_interfaces
+        .insert(param.name.name.clone(), (kind, location));
+}
+
+fn entry_resource_param(param: &FnParam) -> bool {
+    param.ty.is_some()
+        && extract_builtin_attr(&param.attrs).is_none()
+        && extract_location_attr(&param.attrs).is_none()
+        && !has_attr(&param.attrs, "push_constant")
+        && rt_interface(&param.attrs).is_none()
+}
+
+fn pack_resource_slot(attrs: &[Attribute]) -> Option<u32> {
+    attrs
+        .iter()
+        .flat_map(|attr| &attr.entries)
+        .find(|entry| entry.name.name == "pack_resource")
+        .and_then(|entry| entry.args.first())
+        .and_then(parse_u32_lit)
+}
+
+fn reserve_entry_binding(param: &FnParam, slot: (u32, u32), scan: &mut FeatureScan) {
+    if !scan.occupied_bindings.insert(slot) {
+        scan.binding_errors.push(format!(
+            "Duplicate descriptor binding set {} binding {}",
+            slot.0, slot.1
+        ));
+    }
+    scan.entry_bindings.insert(param.name.name.clone(), slot);
+}
+
+fn plan_entry_bindings(unit: &SourceUnit, opts: EmitOptions, scan: &mut FeatureScan) {
+    let world_reserved = opts.abi == AbiProfile::Hyaloclast
+        || scan.imported_mc_world
+        || !scan.pack_param_keys.is_empty();
+    if world_reserved {
+        scan.occupied_bindings.insert((DESCRIPTOR_SET_PER_PASS, 0));
+    }
+    for (used, set, binding) in [
+        (scan.uses_tlas, DESCRIPTOR_SET_SCENE_GLOBALS, 0),
+        (scan.uses_instances, DESCRIPTOR_SET_SCENE_GLOBALS, 1),
+        (scan.uses_sharc_config, DESCRIPTOR_SET_SCENE_GLOBALS, 2),
+        (scan.uses_lights, DESCRIPTOR_SET_SCENE_GLOBALS, 3),
+        (scan.uses_restir_reservoir, DESCRIPTOR_SET_SCENE_GLOBALS, 4),
+        (scan.uses_bindless, DESCRIPTOR_SET_BINDLESS, 0),
+    ] {
+        if used {
+            scan.occupied_bindings.insert((set, binding));
+        }
+    }
+    let Some(func) = unit.items.iter().find_map(|item| match item {
+        Item::Function(f) if extract_entry_stage(&f.attrs).is_some() => Some(f),
+        _ => None,
+    }) else {
+        return;
+    };
+    for param in func.params.iter().filter(|p| entry_resource_param(p)) {
+        if let Some(slot) = extract_binding_attr(&param.attrs) {
+            reserve_entry_binding(param, slot, scan);
+        } else if let Some(slot) = pack_resource_slot(&param.attrs) {
+            reserve_entry_binding(param, (DESCRIPTOR_SET_PACK_RESOURCES, slot), scan);
+        } else if has_attr(&param.attrs, "binding") {
+            scan.binding_errors.push(format!(
+                "Invalid explicit descriptor binding on {}",
+                param.name.name
+            ));
+        }
+    }
+    let mut pass_slot = u32::from(world_reserved);
+    let mut pack_slot = 0;
+    for param in func.params.iter().filter(|p| entry_resource_param(p)) {
+        if scan.entry_bindings.contains_key(&param.name.name) {
+            continue;
+        }
+        let (set, next) = if has_attr(&param.attrs, "pack_resource") {
+            (DESCRIPTOR_SET_PACK_RESOURCES, &mut pack_slot)
+        } else {
+            (DESCRIPTOR_SET_PER_PASS, &mut pass_slot)
+        };
+        while scan.occupied_bindings.contains(&(set, *next)) {
+            *next += 1;
+        }
+        reserve_entry_binding(param, (set, *next), scan);
+        *next += 1;
+    }
+    scan.next_per_pass_binding = pass_slot;
 }
 
 fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
     if let Some(stage) = extract_entry_stage(&func.attrs) {
+        if stage == EntryStage::Unsupported {
+            ctx.errors.push(format!(
+                "Unsupported GLSL entry stage for {}",
+                func.name.name
+            ));
+            return;
+        }
         let saved_locals = ctx.local_types.clone();
         let saved_shadowed_world = ctx.shadowed_world;
 
-        let world_reserved = ctx.opts.abi == AbiProfile::Hyaloclast || ctx.imported_mc_world;
-        let mut binding_slot = u32::from(world_reserved);
-        let mut pack_resource_slot = 0u32;
         let mut builtin_inits: Vec<(String, String, Option<&'static str>)> = Vec::new();
-        let mut builtin_writebacks: Vec<(&'static str, String)> = Vec::new();
-
         for param in &func.params {
-            if let Some(builtin) = extract_builtin_attr(&param.attrs) {
-                let (ty_str, _) = param
+            if rt_interface(&param.attrs).is_some() {
+                emit_rt_interface(param, stage, ctx, out);
+            } else if let Some(builtin) = extract_builtin_attr(&param.attrs) {
+                let (base, suffix) = param
                     .ty
                     .as_ref()
                     .map_or_else(|| ("uvec3".to_owned(), String::new()), type_to_glsl);
+                let ty_str = format!("{base}{suffix}");
                 ctx.local_types
                     .insert(param.name.name.clone(), ty_str.clone());
                 if let Some(gl_builtin) = map_builtin_var(builtin) {
@@ -1148,16 +1492,19 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
                     match param.mode {
                         ParamMode::Out => {
                             builtin_inits.push((ty_str, local_name.clone(), None));
-                            builtin_writebacks.push((gl_builtin, local_name));
+                            ctx.builtin_writebacks.push((gl_builtin, local_name));
                         }
                         ParamMode::InOut | ParamMode::Mut => {
                             builtin_inits.push((ty_str, local_name.clone(), Some(gl_builtin)));
-                            builtin_writebacks.push((gl_builtin, local_name));
+                            ctx.builtin_writebacks.push((gl_builtin, local_name));
                         }
                         ParamMode::In => {
                             builtin_inits.push((ty_str, local_name, Some(gl_builtin)));
                         }
                     }
+                } else {
+                    ctx.errors
+                        .push(format!("Unsupported GLSL builtin {builtin}"));
                 }
             } else if let Some(location) = extract_location_attr(&param.attrs) {
                 if let Some(ref ty) = param.ty {
@@ -1179,41 +1526,19 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
                     ctx.local_types
                         .insert(param.name.name.clone(), type_to_glsl(ty).0);
                 }
-            } else if let Some((set, binding)) = extract_binding_attr(&param.attrs) {
-                if let Some(ref ty) = param.ty {
+            } else if let Some(ref ty) = param.ty {
+                if let Some(&(set, binding)) = ctx.entry_bindings.get(&param.name.name) {
+                    let (base, suffix) = type_to_glsl(ty);
                     ctx.local_types
-                        .insert(param.name.name.clone(), type_to_glsl(ty).0);
+                        .insert(param.name.name.clone(), format!("{base}{suffix}"));
                     let escaped_name = escape_glsl_ident(&param.name.name);
                     emit_entry_resource_binding(set, binding, &escaped_name, ty, ctx, out);
+                } else {
+                    ctx.errors.push(format!(
+                        "Missing descriptor binding for {}",
+                        param.name.name
+                    ));
                 }
-            } else if has_attr(&param.attrs, "pack_resource") {
-                if let Some(ref ty) = param.ty {
-                    ctx.local_types
-                        .insert(param.name.name.clone(), type_to_glsl(ty).0);
-                    let escaped_name = escape_glsl_ident(&param.name.name);
-                    emit_entry_resource_binding(
-                        DESCRIPTOR_SET_PACK_RESOURCES,
-                        pack_resource_slot,
-                        &escaped_name,
-                        ty,
-                        ctx,
-                        out,
-                    );
-                    pack_resource_slot += 1;
-                }
-            } else if let Some(ref ty) = param.ty {
-                ctx.local_types
-                    .insert(param.name.name.clone(), type_to_glsl(ty).0);
-                let escaped_name = escape_glsl_ident(&param.name.name);
-                emit_entry_resource_binding(
-                    DESCRIPTOR_SET_PER_PASS,
-                    binding_slot,
-                    &escaped_name,
-                    ty,
-                    ctx,
-                    out,
-                );
-                binding_slot += 1;
             }
         }
 
@@ -1230,6 +1555,10 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
             EntryStage::Fragment => {
                 out.push_str("// stage: fragment\n");
             }
+            EntryStage::RayTracing(rt) => {
+                let _ = writeln!(out, "// stage: {rt:?}");
+            }
+            EntryStage::Unsupported => unreachable!(),
         }
         if has_attr(&func.attrs, "maximally_reconverges") {
             out.push_str("// maximally_reconverges\n");
@@ -1238,7 +1567,21 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
         out.push_str("void main() {\n");
         for (ty_str, local_name, gl_var) in builtin_inits {
             if let Some(var) = gl_var {
-                let _ = writeln!(out, "    {ty_str} {local_name} = {var};");
+                let val = if matches!(
+                    var,
+                    "gl_InstanceCustomIndexEXT"
+                        | "gl_GeometryIndexEXT"
+                        | "gl_PrimitiveID"
+                        | "gl_InstanceID"
+                        | "gl_VertexIndex"
+                        | "gl_InstanceIndex"
+                ) && ty_str == "uint"
+                {
+                    format!("uint({var})")
+                } else {
+                    var.to_owned()
+                };
+                let _ = writeln!(out, "    {ty_str} {local_name} = {val};");
             } else {
                 let _ = writeln!(out, "    {ty_str} {local_name};");
             }
@@ -1246,9 +1589,9 @@ fn emit_fn_item(func: &FnDecl, ctx: &mut EmitCtx, out: &mut String) {
         if let Some(ref body) = func.body {
             emit_block_contents(body, 1, false, ctx, out);
         }
-        for (gl_var, local_name) in builtin_writebacks {
-            let _ = writeln!(out, "    {gl_var} = {local_name};");
-        }
+        emit_builtin_writebacks(ctx, 1, out);
+        ctx.builtin_writebacks.clear();
+        ctx.rt_interfaces.clear();
         out.push_str("}\n\n");
 
         ctx.local_types = saved_locals;
@@ -1369,6 +1712,7 @@ fn emit_block_contents(
     out: &mut String,
 ) {
     let saved_locals = ctx.local_types.clone();
+    let saved_rt_interfaces = ctx.rt_interfaces.clone();
     let saved_shadowed_world = ctx.shadowed_world;
     for stmt in &block.stmts {
         emit_stmt(stmt, indent, ctx, out);
@@ -1419,22 +1763,48 @@ fn emit_block_contents(
         }
     }
     ctx.local_types = saved_locals;
+    ctx.rt_interfaces = saved_rt_interfaces;
     ctx.shadowed_world = saved_shadowed_world;
 }
 
-fn if_expr_needs_hoisting(then_branch: &Block, else_branch: Option<&Expr>) -> bool {
-    if !then_branch.stmts.is_empty() {
-        return true;
-    }
-    match else_branch {
-        Some(Expr::Block(b)) => !b.stmts.is_empty(),
-        Some(Expr::If {
-            then_branch: et,
-            else_branch: ee,
+fn expr_needs_hoisting(expr: &Expr) -> bool {
+    match expr {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
             ..
-        }) => if_expr_needs_hoisting(et, ee.as_deref()),
+        } => {
+            expr_needs_hoisting(cond) || if_expr_needs_hoisting(then_branch, else_branch.as_deref())
+        }
+        Expr::Block(block) => {
+            !block.stmts.is_empty() || block.tail_expr.as_deref().is_some_and(expr_needs_hoisting)
+        }
+        Expr::Binary { lhs, rhs, .. } => expr_needs_hoisting(lhs) || expr_needs_hoisting(rhs),
+        Expr::Unary { operand, .. } => expr_needs_hoisting(operand),
+        Expr::Call { callee, args, .. } => {
+            expr_needs_hoisting(callee) || args.iter().any(|a| expr_needs_hoisting(&a.value))
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            expr_needs_hoisting(receiver) || args.iter().any(|a| expr_needs_hoisting(&a.value))
+        }
+        Expr::Field { receiver, .. } => expr_needs_hoisting(receiver),
+        Expr::Index {
+            receiver, index, ..
+        } => expr_needs_hoisting(receiver) || expr_needs_hoisting(index),
+        Expr::ArrayLit { elements, .. } => elements.iter().any(expr_needs_hoisting),
+        Expr::StructLit { fields, .. } => fields.iter().any(|(_, e)| expr_needs_hoisting(e)),
         _ => false,
     }
+}
+
+fn if_expr_needs_hoisting(then_branch: &Block, else_branch: Option<&Expr>) -> bool {
+    !then_branch.stmts.is_empty()
+        || then_branch
+            .tail_expr
+            .as_deref()
+            .is_some_and(expr_needs_hoisting)
+        || else_branch.is_some_and(expr_needs_hoisting)
 }
 
 fn emit_hoisted_if_assign(
@@ -1467,10 +1837,17 @@ fn emit_hoisted_if_assign(
                 else_branch: ee,
                 ..
             } => {
-                out.push_str("} else ");
-                let mut nested = String::new();
-                emit_hoisted_if_assign(target, ec, et, ee.as_deref(), indent, ctx, &mut nested);
-                out.push_str(nested.trim_start());
+                if expr_needs_hoisting(ec) {
+                    out.push_str("} else {\n");
+                    emit_hoisted_if_assign(target, ec, et, ee.as_deref(), indent + 1, ctx, out);
+                    write_indent(indent, out);
+                    out.push_str("}\n");
+                } else {
+                    out.push_str("} else ");
+                    let mut nested = String::new();
+                    emit_hoisted_if_assign(target, ec, et, ee.as_deref(), indent, ctx, &mut nested);
+                    out.push_str(nested.trim_start());
+                }
             }
             other => {
                 out.push_str("} else {\n");
@@ -1497,6 +1874,7 @@ fn emit_branch_assign(
     out: &mut String,
 ) {
     let saved_locals = ctx.local_types.clone();
+    let saved_rt_interfaces = ctx.rt_interfaces.clone();
     let saved_shadowed_world = ctx.shadowed_world;
     for stmt in &block.stmts {
         emit_stmt(stmt, indent, ctx, out);
@@ -1509,19 +1887,35 @@ fn emit_branch_assign(
         let _ = writeln!(out, "{target} = {val_str};");
     }
     ctx.local_types = saved_locals;
+    ctx.rt_interfaces = saved_rt_interfaces;
     ctx.shadowed_world = saved_shadowed_world;
+}
+
+fn emit_builtin_writebacks(ctx: &EmitCtx, indent: usize, out: &mut String) {
+    for (gl_var, local_name) in &ctx.builtin_writebacks {
+        write_indent(indent, out);
+        let _ = writeln!(out, "{gl_var} = {local_name};");
+    }
 }
 
 fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
     match stmt {
         Stmt::Let { name, ty, init, .. } => {
-            let (ty_str, arr_suffix) = if let Some(t) = ty {
+            let (mut ty_str, arr_suffix) = if let Some(t) = ty {
                 type_to_glsl_with_subst(t, &ctx.generic_subst)
             } else if let Some(e) = init {
                 (infer_glsl_type(e, ctx), String::new())
             } else {
                 ("float".to_owned(), String::new())
             };
+            if ty_str == "HitObject" {
+                if let Some(suffix) = ctx.ser_suffix {
+                    ty_str = format!("hitObject{suffix}");
+                } else {
+                    ctx.errors
+                        .push("HitObject requires exactly one GLSL SER profile".to_owned());
+                }
+            }
             let local_ty = format!("{ty_str}{arr_suffix}");
             let glsl_name = escape_glsl_ident(&name.name);
 
@@ -1544,6 +1938,7 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
                     ctx,
                     out,
                 );
+                ctx.rt_interfaces.shift_remove(&name.name);
                 ctx.local_types.insert(name.name.clone(), local_ty);
                 if name.name == "world" {
                     ctx.shadowed_world = true;
@@ -1561,12 +1956,16 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
                 write_indent(indent, out);
                 let _ = writeln!(out, "{ty_str} {glsl_name}{arr_suffix};");
             }
+            ctx.rt_interfaces.shift_remove(&name.name);
             ctx.local_types.insert(name.name.clone(), local_ty);
             if name.name == "world" {
                 ctx.shadowed_world = true;
             }
         }
         Stmt::Return { value, .. } => {
+            if value.is_none() {
+                emit_builtin_writebacks(ctx, indent, out);
+            }
             if let Some(Expr::If {
                 cond,
                 then_branch,
@@ -1613,10 +2012,8 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
             ..
         } => {
             let saved_locals = ctx.local_types.clone();
+            let saved_rt_interfaces = ctx.rt_interfaces.clone();
             let saved_shadowed_world = ctx.shadowed_world;
-            if binding.name == "world" {
-                ctx.shadowed_world = true;
-            }
             let var_name = if binding.name == "_" {
                 "_vsl_iter".to_owned()
             } else {
@@ -1626,26 +2023,41 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
             let header = if let Some((start, end, inclusive, step)) = decompose_range_iter(iter) {
                 let cmp = if inclusive { "<=" } else { "<" };
                 let iter_ty = infer_range_type(start, end, ctx);
+                // The native IR evaluates range bounds and step before entering the loop.
+                let start_s = emit_expr_with_hoist(start, indent, ctx, &mut pre);
+                let start_tmp = ctx.next_tmp();
+                write_indent(indent, &mut pre);
+                let _ = writeln!(pre, "{iter_ty} {start_tmp} = {iter_ty}({start_s});");
+                let end_s = emit_expr_with_hoist(end, indent, ctx, &mut pre);
+                let end_tmp = ctx.next_tmp();
+                write_indent(indent, &mut pre);
+                let _ = writeln!(pre, "{iter_ty} {end_tmp} = {iter_ty}({end_s});");
+                let step_clause = if let Some(step) = step {
+                    let step_s = emit_expr_with_hoist(step, indent, ctx, &mut pre);
+                    let step_tmp = ctx.next_tmp();
+                    write_indent(indent, &mut pre);
+                    let _ = writeln!(pre, "{iter_ty} {step_tmp} = {iter_ty}({step_s});");
+                    format!("{var_name} += {step_tmp}")
+                } else {
+                    format!("++{var_name}")
+                };
                 ctx.local_types
                     .insert(binding.name.clone(), iter_ty.to_owned());
-                let start_s = emit_expr_with_hoist(start, indent, ctx, &mut pre);
-                let end_s = emit_expr_with_hoist(end, indent, ctx, &mut pre);
-                let step_clause = step.map_or_else(
-                    || format!("++{var_name}"),
-                    |s| {
-                        let s_str = emit_expr_with_hoist(s, indent, ctx, &mut pre);
-                        format!("{var_name} += {s_str}")
-                    },
-                );
                 format!(
-                    "for ({iter_ty} {var_name} = {start_s}; {var_name} {cmp} {end_s}; {step_clause}) {{"
+                    "for ({iter_ty} {var_name} = {start_tmp}; {var_name} {cmp} {end_tmp}; {step_clause}) {{"
                 )
             } else {
+                ctx.errors.push(
+                    "Unsupported GLSL for-loop iterator; expected an integer range".to_owned(),
+                );
                 ctx.local_types
                     .insert(binding.name.clone(), "uint".to_owned());
-                let iter_s = emit_expr_with_hoist(iter, indent, ctx, &mut pre);
-                format!("for (uint {var_name} = 0u; {var_name} < {iter_s}; ++{var_name}) {{")
+                format!("for (uint {var_name} = 0u; false; ++{var_name}) {{")
             };
+            if binding.name == "world" {
+                ctx.shadowed_world = true;
+            }
+            ctx.rt_interfaces.shift_remove(&binding.name);
             out.push_str(&pre);
             write_indent(indent, out);
             if has_attr(attrs, "unroll") {
@@ -1656,14 +2068,24 @@ fn emit_stmt(stmt: &Stmt, indent: usize, ctx: &mut EmitCtx, out: &mut String) {
             write_indent(indent, out);
             out.push_str("}\n");
             ctx.local_types = saved_locals;
+            ctx.rt_interfaces = saved_rt_interfaces;
             ctx.shadowed_world = saved_shadowed_world;
         }
         Stmt::While { cond, body, .. } => {
             let mut pre = String::new();
             let cond_s = emit_expr_with_hoist(cond, indent, ctx, &mut pre);
-            out.push_str(&pre);
             write_indent(indent, out);
-            let _ = writeln!(out, "while ({cond_s}) {{");
+            if pre.is_empty() {
+                let _ = writeln!(out, "while ({cond_s}) {{");
+            } else {
+                out.push_str("while (true) {\n");
+                // Re-emit the condition prelude inside the loop; continue must retest it.
+                for line in pre.lines() {
+                    let _ = writeln!(out, "    {line}");
+                }
+                write_indent(indent + 1, out);
+                let _ = writeln!(out, "if (!({cond_s})) {{ break; }}");
+            }
             emit_block_contents(body, indent + 1, false, ctx, out);
             write_indent(indent, out);
             out.push_str("}\n");
@@ -1806,10 +2228,17 @@ fn emit_if_stmt(
                 else_branch: ee,
                 ..
             } => {
-                out.push_str("} else ");
-                let mut nested = String::new();
-                emit_if_stmt(ec, et, ee.as_deref(), indent, ctx, &mut nested);
-                out.push_str(nested.trim_start());
+                if expr_needs_hoisting(ec) {
+                    out.push_str("} else {\n");
+                    emit_if_stmt(ec, et, ee.as_deref(), indent + 1, ctx, out);
+                    write_indent(indent, out);
+                    out.push_str("}\n");
+                } else {
+                    out.push_str("} else ");
+                    let mut nested = String::new();
+                    emit_if_stmt(ec, et, ee.as_deref(), indent, ctx, &mut nested);
+                    out.push_str(nested.trim_start());
+                }
             }
             other => {
                 out.push_str("} else {\n");
@@ -1899,7 +2328,29 @@ fn emit_expr_with_hoist(
         }
         Expr::Binary { op, lhs, rhs, .. } => {
             let l = emit_expr_with_hoist(lhs, indent, ctx, pre_stmts);
-            let r = emit_expr_with_hoist(rhs, indent, ctx, pre_stmts);
+            let mut rhs_pre = String::new();
+            let r = emit_expr_with_hoist(rhs, indent, ctx, &mut rhs_pre);
+            if matches!(op, BinaryOp::And | BinaryOp::Or) && !rhs_pre.is_empty() {
+                let tmp = ctx.next_tmp();
+                write_indent(indent, pre_stmts);
+                let _ = writeln!(pre_stmts, "bool {tmp} = {l};");
+                write_indent(indent, pre_stmts);
+                let guard = if *op == BinaryOp::And {
+                    tmp.clone()
+                } else {
+                    format!("!{tmp}")
+                };
+                let _ = writeln!(pre_stmts, "if ({guard}) {{");
+                for line in rhs_pre.lines() {
+                    let _ = writeln!(pre_stmts, "    {line}");
+                }
+                write_indent(indent + 1, pre_stmts);
+                let _ = writeln!(pre_stmts, "{tmp} = {r};");
+                write_indent(indent, pre_stmts);
+                pre_stmts.push_str("}\n");
+                return tmp;
+            }
+            pre_stmts.push_str(&rhs_pre);
             let op_str = binary_op_glsl(*op);
             if is_assignment_op(*op) {
                 format!("{l} {op_str} {r}")
@@ -2061,6 +2512,9 @@ fn emit_call_expr_with_hoist(
             return "VsMotion.packParams".to_owned();
         }
 
+        if let Some(result) = emit_rt_call(&joined, args, indent, ctx, pre_stmts) {
+            return result;
+        }
         let mapped = map_call_name(&joined);
         let is_atomic = matches!(
             joined.as_str(),
@@ -2094,6 +2548,85 @@ fn emit_call_expr_with_hoist(
         .map(|a| emit_expr_with_hoist(&a.value, indent, ctx, pre_stmts))
         .collect();
     format!("{c}({})", rendered_args.join(", "))
+}
+
+// GLSL shader-call intrinsics take the interface location, not the payload value.
+fn rt_call_location(arg: &Expr, ctx: &mut EmitCtx, allowed: &[RayInterfaceKind]) -> String {
+    if let Expr::Path { path, .. } = arg
+        && path.segments.len() == 1
+        && let Some((kind, Some(location))) = ctx.rt_interfaces.get(&path.segments[0].name)
+        && allowed.contains(kind)
+    {
+        return location.to_string();
+    }
+    ctx.errors
+        .push("Shader call requires a compatible RT interface variable".to_owned());
+    "_vsl_invalid_rt_interface".to_owned()
+}
+
+fn emit_rt_call(
+    name: &str,
+    args: &[CallArg],
+    indent: usize,
+    ctx: &mut EmitCtx,
+    pre_stmts: &mut String,
+) -> Option<String> {
+    use RayInterfaceKind::{CallableData, IncomingCallableData, IncomingRayPayload, RayPayload};
+    let (mapped, arity, interface): (String, usize, &[RayInterfaceKind]) = match name {
+        "trace_ray" => (
+            "traceRayEXT".to_owned(),
+            11,
+            &[RayPayload, IncomingRayPayload],
+        ),
+        "execute_callable" => (
+            "executeCallableEXT".to_owned(),
+            2,
+            &[CallableData, IncomingCallableData],
+        ),
+        "report_intersection" => ("reportIntersectionEXT".to_owned(), 2, &[]),
+        "terminate_ray" => ("terminateRayEXT".to_owned(), 0, &[]),
+        "ignore_intersection" => ("ignoreIntersectionEXT".to_owned(), 0, &[]),
+        "reorder_thread_with_hit_object" | "reorder_thread_with_hint" => {
+            let Some(suffix) = ctx.ser_suffix else {
+                ctx.errors
+                    .push("Invocation reordering requires exactly one GLSL SER profile".to_owned());
+                return Some("_vsl_invalid_reorder()".to_owned());
+            };
+            let valid = if name == "reorder_thread_with_hit_object" {
+                matches!(args.len(), 1 | 3)
+            } else {
+                args.len() == 2
+            };
+            if !valid {
+                ctx.errors
+                    .push(format!("Invalid argument count for {name}"));
+            }
+            (format!("reorderThread{suffix}"), args.len(), &[])
+        }
+        _ => return None,
+    };
+    if args.len() != arity {
+        ctx.errors.push(format!(
+            "Invalid argument count for {name}: expected {arity}"
+        ));
+        return Some("_vsl_invalid_rt_call()".to_owned());
+    }
+    if matches!(name, "terminate_ray" | "ignore_intersection") {
+        // In EXT ray tracing these are jump statements, not functions.
+        return Some(mapped);
+    }
+    let rendered = args
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            if !interface.is_empty() && i + 1 == arity {
+                rt_call_location(&arg.value, ctx, interface)
+            } else {
+                emit_expr_with_hoist(&arg.value, indent, ctx, pre_stmts)
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(format!("{mapped}({})", rendered.join(", ")))
 }
 
 fn is_combined_sampler_type(ty: &str) -> bool {
@@ -2283,15 +2816,32 @@ fn emit_method_call_expr_with_hoist(
 ) -> String {
     let recv_ty = infer_glsl_type(receiver, ctx);
     let recv = emit_expr_with_hoist(receiver, indent, ctx, pre_stmts);
+    if matches!(recv_ty.as_str(), "hitObjectNV" | "hitObjectEXT") {
+        return emit_hit_object_method(method, &recv, args, indent, ctx, pre_stmts);
+    }
     let rendered_args: Vec<String> = args
         .iter()
         .map(|a| emit_expr_with_hoist(&a.value, indent, ctx, pre_stmts))
         .collect();
 
-    if recv_ty == "rayQueryEXT"
-        && let Some(result) = emit_ray_query_method(method, &recv, &rendered_args)
-    {
-        return result;
+    if recv_ty == "rayQueryEXT" {
+        let arity = match method {
+            "initialize" => 7,
+            "generate_intersection" => 1,
+            _ => 0,
+        };
+        if args.len() != arity {
+            ctx.errors.push(format!(
+                "Invalid argument count for RayQuery::{method}: expected {arity}"
+            ));
+            return "_vsl_invalid_ray_query_method()".to_owned();
+        }
+        if let Some(result) = emit_ray_query_method(method, &recv, &rendered_args) {
+            return result;
+        }
+        ctx.errors
+            .push(format!("Unsupported RayQuery method {method}"));
+        return "_vsl_invalid_ray_query_method()".to_owned();
     }
 
     match method {
@@ -2390,45 +2940,121 @@ fn emit_method_call_expr_with_hoist(
     }
 }
 
+fn emit_hit_object_method(
+    method: &str,
+    recv: &str,
+    args: &[CallArg],
+    indent: usize,
+    ctx: &mut EmitCtx,
+    pre_stmts: &mut String,
+) -> String {
+    let Some(suffix) = ctx.ser_suffix else {
+        ctx.errors
+            .push("HitObject requires a GLSL SER profile".to_owned());
+        return "_vsl_invalid_hit_object_method()".to_owned();
+    };
+    let (name, arity, payload) = match method {
+        "record_empty" => ("RecordEmpty", 0, false),
+        "trace_ray" => ("TraceRay", 11, true),
+        "execute_shader" => ("ExecuteShader", 1, true),
+        "is_hit" => ("IsHit", 0, false),
+        "ray_tmax" => ("GetRayTMax", 0, false),
+        "sbt_record_index" => ("GetShaderBindingTableRecordIndex", 0, false),
+        _ => {
+            ctx.errors
+                .push(format!("Unsupported HitObject method {method}"));
+            return "_vsl_invalid_hit_object_method()".to_owned();
+        }
+    };
+    if args.len() != arity {
+        ctx.errors.push(format!(
+            "Invalid argument count for HitObject::{method}: expected {arity}"
+        ));
+        return "_vsl_invalid_hit_object_method()".to_owned();
+    }
+    let mut rendered = vec![recv.to_owned()];
+    for (i, arg) in args.iter().enumerate() {
+        rendered.push(if payload && i + 1 == arity {
+            rt_call_location(
+                &arg.value,
+                ctx,
+                &[
+                    RayInterfaceKind::RayPayload,
+                    RayInterfaceKind::IncomingRayPayload,
+                ],
+            )
+        } else {
+            emit_expr_with_hoist(&arg.value, indent, ctx, pre_stmts)
+        });
+    }
+    format!("hitObject{name}{suffix}({})", rendered.join(", "))
+}
+
+fn ray_query_getter(method: &str) -> Option<(&'static str, &'static str, Option<bool>, bool)> {
+    let (committed, getter) = if let Some(name) = method.strip_prefix("committed_") {
+        (Some(true), name)
+    } else if let Some(name) = method.strip_prefix("candidate_") {
+        (Some(false), name)
+    } else {
+        (None, method)
+    };
+    if let Some(committed) = committed {
+        let (builtin, ty, cast) = match getter {
+            "type" => ("GetIntersectionType", "uint", false),
+            "t" => ("GetIntersectionT", "float", false),
+            "instance_custom_index" => ("GetIntersectionInstanceCustomIndex", "uint", true),
+            "instance_id" => ("GetIntersectionInstanceId", "uint", true),
+            "primitive_index" => ("GetIntersectionPrimitiveIndex", "uint", true),
+            "geometry_index" => ("GetIntersectionGeometryIndex", "uint", true),
+            "sbt_record_offset" => (
+                "GetIntersectionInstanceShaderBindingTableRecordOffset",
+                "uint",
+                false,
+            ),
+            "object_to_world" => ("GetIntersectionObjectToWorld", "mat4x3", false),
+            "world_to_object" => ("GetIntersectionWorldToObject", "mat4x3", false),
+            "front_face" => ("GetIntersectionFrontFace", "bool", false),
+            "barycentrics" => ("GetIntersectionBarycentrics", "vec2", false),
+            "object_ray_origin" => ("GetIntersectionObjectRayOrigin", "vec3", false),
+            "object_ray_direction" => ("GetIntersectionObjectRayDirection", "vec3", false),
+            "aabb_opaque" if !committed => {
+                return Some(("GetIntersectionCandidateAABBOpaque", "bool", None, false));
+            }
+            _ => return None,
+        };
+        Some((builtin, ty, Some(committed), cast))
+    } else {
+        let (builtin, ty) = match getter {
+            "ray_flags" => ("GetRayFlags", "uint"),
+            "ray_tmin" => ("GetRayTMin", "float"),
+            "world_ray_origin" => ("GetWorldRayOrigin", "vec3"),
+            "world_ray_direction" => ("GetWorldRayDirection", "vec3"),
+            _ => return None,
+        };
+        Some((builtin, ty, None, false))
+    }
+}
+
 fn emit_ray_query_method(method: &str, recv: &str, rendered_args: &[String]) -> Option<String> {
+    if let Some((builtin, _, committed, cast)) = ray_query_getter(method) {
+        let call = committed.map_or_else(
+            || format!("rayQuery{builtin}EXT({recv})"),
+            |selector| format!("rayQuery{builtin}EXT({recv}, {selector})"),
+        );
+        return Some(if cast { format!("uint({call})") } else { call });
+    }
     Some(match method {
         "initialize" => format!(
             "rayQueryInitializeEXT({recv}, {})",
             rendered_args.join(", ")
         ),
         "proceed" => format!("rayQueryProceedEXT({recv})"),
-        "committed_type" => format!("rayQueryGetIntersectionTypeEXT({recv}, true)"),
-        "candidate_type" => format!("rayQueryGetIntersectionTypeEXT({recv}, false)"),
         "confirm_intersection" => format!("rayQueryConfirmIntersectionEXT({recv})"),
         "terminate" => format!("rayQueryTerminateEXT({recv})"),
         "generate_intersection" => format!(
             "rayQueryGenerateIntersectionEXT({recv}, {})",
             rendered_args.join(", ")
         ),
-        "committed_t" => format!("rayQueryGetIntersectionTEXT({recv}, true)"),
-        "candidate_t" => format!("rayQueryGetIntersectionTEXT({recv}, false)"),
-        "committed_instance_id" => {
-            format!("uint(rayQueryGetIntersectionInstanceIdEXT({recv}, true))")
-        }
-        "committed_primitive_index" => {
-            format!("uint(rayQueryGetIntersectionPrimitiveIndexEXT({recv}, true))")
-        }
-        "committed_geometry_index" => {
-            format!("uint(rayQueryGetIntersectionGeometryIndexEXT({recv}, true))")
-        }
-        "committed_object_to_world" => {
-            format!("rayQueryGetIntersectionObjectToWorldEXT({recv}, true)")
-        }
-        "committed_world_to_object" => {
-            format!("rayQueryGetIntersectionWorldToObjectEXT({recv}, true)")
-        }
-        "committed_front_face" => format!("rayQueryGetIntersectionFrontFaceEXT({recv}, true)"),
-        "committed_instance_custom_index" => {
-            format!("uint(rayQueryGetIntersectionInstanceCustomIndexEXT({recv}, true))")
-        }
-        "committed_barycentrics" => {
-            format!("rayQueryGetIntersectionBarycentricsEXT({recv}, true)")
-        }
         "committed_triangle_vertex_positions" | "candidate_triangle_vertex_positions" => {
             format!("_vsl_ray_query_{method}({recv})")
         }
@@ -2450,7 +3076,7 @@ fn type_to_glsl_with_subst(
             let (elem_ty, inner_suffix) = type_to_glsl_with_subst(element, generic_subst);
             let empty_ctx = EmitCtx::new(EmitOptions::default());
             let len_str = emit_expr_const(len, &empty_ctx);
-            (elem_ty, format!("{inner_suffix}[{len_str}]"))
+            (elem_ty, format!("[{len_str}]{inner_suffix}"))
         }
         TypeExpr::Named {
             path,
@@ -2606,25 +3232,20 @@ fn resolve_struct_lit_name(path: &Path, fields: &[(Ident, Expr)], ctx: &EmitCtx)
 }
 
 fn ray_query_method_type(method: &str) -> Option<String> {
-    Some(match method {
-        "committed_type"
-        | "candidate_type"
-        | "committed_instance_custom_index"
-        | "committed_instance_id"
-        | "committed_primitive_index"
-        | "committed_geometry_index" => "uint".to_owned(),
-        "committed_object_to_world" | "committed_world_to_object" => "mat4x3".to_owned(),
-        "committed_t" | "candidate_t" => "float".to_owned(),
-        "initialize" | "confirm_intersection" | "terminate" | "generate_intersection" => {
-            "void".to_owned()
+    if let Some((_, ty, _, _)) = ray_query_getter(method) {
+        return Some(ty.to_owned());
+    }
+    Some(
+        match method {
+            "initialize" | "confirm_intersection" | "terminate" | "generate_intersection" => "void",
+            "proceed" => "bool",
+            "committed_triangle_vertex_positions" | "candidate_triangle_vertex_positions" => {
+                "vec3[3]"
+            }
+            _ => return None,
         }
-        "committed_barycentrics" => "vec2".to_owned(),
-        "proceed" | "committed_front_face" => "bool".to_owned(),
-        "committed_triangle_vertex_positions" | "candidate_triangle_vertex_positions" => {
-            "vec3[3]".to_owned()
-        }
-        _ => return None,
-    })
+        .to_owned(),
+    )
 }
 
 fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
@@ -2691,7 +3312,17 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
             if let Some(fields) = ctx.struct_fields.get(struct_key)
                 && let Some(f_ty) = fields.get(&field.name)
             {
-                return f_ty.clone();
+                let mut ty = f_ty.clone();
+                if let Some(dims) = ctx
+                    .struct_field_dims
+                    .get(struct_key)
+                    .and_then(|fields| fields.get(&field.name))
+                {
+                    for dim in dims {
+                        let _ = write!(ty, "[{dim}]");
+                    }
+                }
+                return ty;
             }
             "float".to_owned()
         }
@@ -2701,6 +3332,15 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
                 && let Some((_, rest)) = suffix.split_once(']')
             {
                 return format!("{base}{rest}");
+            }
+            if let Some(scalar) = swizzle_result_type(&ty, "x") {
+                return scalar;
+            }
+            if let Some(dims) = ty.strip_prefix("mat") {
+                let rows = dims.split_once('x').map_or(dims, |(_, rows)| rows);
+                if matches!(rows, "2" | "3" | "4") {
+                    return format!("vec{rows}");
+                }
             }
             ty
         }
@@ -2716,6 +3356,15 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
                 && let Some(ty) = ray_query_method_type(&method.name)
             {
                 return ty;
+            }
+            if matches!(recv_ty.as_str(), "hitObjectNV" | "hitObjectEXT") {
+                return match method.name.as_str() {
+                    "is_hit" => "bool",
+                    "ray_tmax" => "float",
+                    "sbt_record_index" => "uint",
+                    _ => "void",
+                }
+                .to_owned();
             }
             match method.name.as_str() {
                 "offset" => recv_ty,
@@ -2752,6 +3401,13 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
                     }
                 }
                 match name.as_str() {
+                    "report_intersection" => return "bool".to_owned(),
+                    "trace_ray"
+                    | "execute_callable"
+                    | "terminate_ray"
+                    | "ignore_intersection"
+                    | "reorder_thread_with_hit_object"
+                    | "reorder_thread_with_hint" => return "void".to_owned(),
                     "atomic_cas" => {
                         if let Some(val_arg) = args.get(2).or_else(|| args.get(1)) {
                             return infer_glsl_type(&val_arg.value, ctx);
@@ -2841,10 +3497,15 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
 fn infer_range_type(start: &Expr, end: &Expr, ctx: &EmitCtx) -> &'static str {
     let s = infer_glsl_type(start, ctx);
     let e = infer_glsl_type(end, ctx);
-    if s == "int" && e == "int" {
-        "int"
-    } else {
-        "uint"
+    let unsigned =
+        matches!(s.as_str(), "uint" | "uint64_t") || matches!(e.as_str(), "uint" | "uint64_t");
+    let wide = matches!(s.as_str(), "int64_t" | "uint64_t")
+        || matches!(e.as_str(), "int64_t" | "uint64_t");
+    match (wide, unsigned) {
+        (true, true) => "uint64_t",
+        (true, false) => "int64_t",
+        (false, true) => "uint",
+        (false, false) => "int",
     }
 }
 
@@ -2950,6 +3611,12 @@ fn map_call_name(name: &str) -> String {
         "workgroup_barrier" => "barrier".to_owned(),
         "atomic_add" => "atomicAdd".to_owned(),
         "atomic_cas" => "atomicCompSwap".to_owned(),
+        "atomic_min" => "atomicMin".to_owned(),
+        "atomic_max" => "atomicMax".to_owned(),
+        "atomic_and" => "atomicAnd".to_owned(),
+        "atomic_or" => "atomicOr".to_owned(),
+        "atomic_xor" => "atomicXor".to_owned(),
+        "atomic_exchange" => "atomicExchange".to_owned(),
         "subgroup_ballot" => "subgroupBallot".to_owned(),
         "subgroup_ballot_bit_count" => "subgroupBallotBitCount".to_owned(),
         "subgroup_ballot_exclusive_bit_count" => "subgroupBallotExclusiveBitCount".to_owned(),
@@ -3026,6 +3693,27 @@ fn map_builtin_var(name: &str) -> Option<&'static str> {
         "frag_coord" => Some("gl_FragCoord"),
         "front_facing" => Some("gl_FrontFacing"),
         "point_coord" => Some("gl_PointCoord"),
+        "frag_depth" => Some("gl_FragDepth"),
+        "launch_id" => Some("gl_LaunchIDEXT"),
+        "launch_size" => Some("gl_LaunchSizeEXT"),
+        "world_ray_origin" => Some("gl_WorldRayOriginEXT"),
+        "world_ray_direction" => Some("gl_WorldRayDirectionEXT"),
+        "object_ray_origin" => Some("gl_ObjectRayOriginEXT"),
+        "object_ray_direction" => Some("gl_ObjectRayDirectionEXT"),
+        "ray_tmin" => Some("gl_RayTminEXT"),
+        "ray_tmax" => Some("gl_RayTmaxEXT"),
+        "instance_custom_index" => Some("gl_InstanceCustomIndexEXT"),
+        "object_to_world" => Some("gl_ObjectToWorldEXT"),
+        "world_to_object" => Some("gl_WorldToObjectEXT"),
+        "hit_kind" => Some("gl_HitKindEXT"),
+        "incoming_ray_flags" => Some("gl_IncomingRayFlagsEXT"),
+        "ray_geometry_index" => Some("gl_GeometryIndexEXT"),
+        "primitive_id" => Some("gl_PrimitiveID"),
+        "hit_triangle_vertex_positions" => Some("gl_HitTriangleVertexPositionsEXT"),
+        "sample_id" => Some("gl_SampleID"),
+        "sample_position" => Some("gl_SamplePosition"),
+        "subgroup_local_invocation_id" => Some("gl_SubgroupInvocationID"),
+        "subgroup_size" => Some("gl_SubgroupSize"),
         _ => None,
     }
 }
@@ -3129,6 +3817,15 @@ fn extract_binding_attr(attrs: &[Attribute]) -> Option<(u32, u32)> {
 fn extract_entry_stage(attrs: &[Attribute]) -> Option<EntryStage> {
     for attr in attrs {
         for entry in &attr.entries {
+            if let Some(rt) = rt_stage(&entry.name.name) {
+                return Some(EntryStage::RayTracing(rt));
+            }
+            if matches!(
+                entry.name.name.as_str(),
+                "task" | "mesh" | "geometry" | "tess_control" | "tess_eval"
+            ) {
+                return Some(EntryStage::Unsupported);
+            }
             if entry.name.name == "stage" {
                 match entry.args.first() {
                     Some(Expr::Call { callee, args, .. }) => {
@@ -3158,10 +3855,16 @@ fn extract_entry_stage(attrs: &[Attribute]) -> Option<EntryStage> {
                     Some(Expr::Path { path, .. }) => match path.joined().as_str() {
                         "vertex" => return Some(EntryStage::Vertex),
                         "fragment" => return Some(EntryStage::Fragment),
-                        _ => {}
+                        name => {
+                            return Some(
+                                rt_stage(name)
+                                    .map_or(EntryStage::Unsupported, EntryStage::RayTracing),
+                            );
+                        }
                     },
                     _ => {}
                 }
+                return Some(EntryStage::Unsupported);
             }
         }
     }
@@ -3315,20 +4018,6 @@ fn scan_unit_with_options(unit: &SourceUnit, opts: EmitOptions, scan: &mut Featu
                 }
             }
             Item::Function(f) => {
-                if extract_entry_stage(&f.attrs).is_some() {
-                    let mut next_binding = 1u32;
-                    for p in &f.params {
-                        if extract_builtin_attr(&p.attrs).is_none()
-                            && extract_location_attr(&p.attrs).is_none()
-                            && !has_attr(&p.attrs, "push_constant")
-                            && !has_attr(&p.attrs, "pack_resource")
-                            && p.ty.is_some()
-                        {
-                            next_binding += 1;
-                        }
-                    }
-                    scan.next_per_pass_binding = scan.next_per_pass_binding.max(next_binding);
-                }
                 scan_fn_into_with_options(f, opts, scan);
             }
             _ => {}
@@ -3339,6 +4028,7 @@ fn scan_unit_with_options(unit: &SourceUnit, opts: EmitOptions, scan: &mut Featu
 fn mark_mc_global(name: &str, scan: &mut FeatureScan) {
     match name {
         "world" => {
+            scan.imported_mc_world = true;
             scan.extensions
                 .insert("GL_EXT_shader_explicit_arithmetic_types_int64");
         }
@@ -3393,7 +4083,22 @@ fn scan_fn_into_with_subst(
     scan: &mut FeatureScan,
 ) {
     scan_attrs(&f.attrs, scan);
+    if matches!(
+        extract_entry_stage(&f.attrs),
+        Some(EntryStage::RayTracing(_))
+    ) {
+        scan.extensions.insert("GL_EXT_ray_tracing");
+    }
     for p in &f.params {
+        if matches!(
+            rt_interface(&p.attrs),
+            Some((RayInterfaceKind::ShaderRecord, _))
+        ) {
+            scan.extensions.insert("GL_EXT_scalar_block_layout");
+        }
+        if extract_builtin_attr(&p.attrs) == Some("hit_triangle_vertex_positions") {
+            scan.extensions.insert("GL_EXT_ray_tracing_position_fetch");
+        }
         if let Some(ref ty) = p.ty {
             scan_type_with_subst(ty, subst, scan);
         }
@@ -3414,6 +4119,17 @@ fn scan_attrs(attrs: &[Attribute], scan: &mut FeatureScan) {
                     for arg in &entry.args {
                         if let Expr::Path { path, .. } = arg {
                             match path.joined().as_str() {
+                                "ser" | "ser_nv" | "shader_invocation_reorder" => {
+                                    scan.extensions.insert("GL_EXT_ray_tracing");
+                                    scan.extensions.insert("GL_NV_shader_invocation_reorder");
+                                }
+                                "ser_ext" | "ray_tracing_invocation_reorder" => {
+                                    scan.extensions.insert("GL_EXT_ray_tracing");
+                                    scan.extensions.insert("GL_EXT_shader_invocation_reorder");
+                                }
+                                "ray_tracing" | "ray_tracing_pipeline" => {
+                                    scan.extensions.insert("GL_EXT_ray_tracing");
+                                }
                                 "ray_query" => {
                                     scan.extensions.insert("GL_EXT_ray_query");
                                 }
@@ -3489,6 +4205,13 @@ fn scan_type_with_subst(ty: &TypeExpr, subst: &IndexMap<SmolStr, String>, scan: 
                         .insert("GL_EXT_shader_explicit_arithmetic_types_float16");
                 }
                 "RayQuery" => {
+                    scan.extensions.insert("GL_EXT_ray_query");
+                }
+                "Texture2D" | "Texture2DArray" | "Texture3D" | "TextureCube" => {
+                    scan.extensions
+                        .insert("GL_EXT_samplerless_texture_functions");
+                }
+                "AccelerationStructure" if !scan.extensions.contains("GL_EXT_ray_tracing") => {
                     scan.extensions.insert("GL_EXT_ray_query");
                 }
                 "Buffer" | "RWBuffer" => {

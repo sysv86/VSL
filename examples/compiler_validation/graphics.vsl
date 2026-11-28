@@ -1,0 +1,18 @@
+@stage(vertex)
+fn vertex_main(
+    #[location(0)] position: vec3,
+    #[location(1)] color: vec3,
+    #[builtin(position)] out clip_position: vec4,
+    #[location(0)] out interpolated_color: vec3,
+) {
+    clip_position = vec4(position, 1.0);
+    interpolated_color = color;
+}
+
+@stage(fragment)
+fn fragment_main(
+    #[location(0)] interpolated_color: vec3,
+    #[location(0)] out color: vec4,
+) {
+    color = vec4(interpolated_color, 1.0);
+}

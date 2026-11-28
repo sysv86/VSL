@@ -1096,6 +1096,7 @@ fn lower_unit_internal(
                         type_subst: &empty_subst,
                         expected_return_ty: None,
                         is_non_compute_stage: false,
+                        stage: None,
                         caps: HardwareCaps::empty(),
                         scopes: vec![IndexMap::new()],
                         local_types: &mut dummy_locals,
@@ -3031,6 +3032,15 @@ impl LowerCtx<'_> {
     ) -> Option<HirFnId> {
         let template = self.generic_fn_templates.get(fn_name)?.clone();
         if template.generic_params.len() != type_args.len() {
+            self.diags.push(Diagnostic::error(
+                "E0274",
+                format!(
+                    "`{fn_name}` expects {} generic type argument(s), but {} were supplied",
+                    template.generic_params.len(),
+                    type_args.len()
+                ),
+                call_span,
+            ));
             return None;
         }
         if type_args
@@ -3664,6 +3674,7 @@ impl LowerCtx<'_> {
                 type_subst,
                 expected_return_ty: return_ty,
                 is_non_compute_stage,
+                stage: parsed_attrs.stage,
                 caps: parsed_attrs.required_caps,
                 scopes: vec![root_scope],
                 local_types: &mut local_types,
@@ -5256,6 +5267,19 @@ fn unify_type_params(
     concrete: TypeId,
     out: &mut IndexMap<SmolStr, TypeId>,
 ) {
+    unify_type_params_inner(types, pattern, concrete, out, &mut IndexSet::new());
+}
+
+fn unify_type_params_inner(
+    types: &TypeArena,
+    pattern: TypeId,
+    concrete: TypeId,
+    out: &mut IndexMap<SmolStr, TypeId>,
+    visited: &mut IndexSet<(TypeId, TypeId)>,
+) {
+    if !visited.insert((pattern, concrete)) {
+        return;
+    }
     match (types.get(pattern), types.get(concrete)) {
         (Type::TypeParam(name), _) => {
             if !matches!(types.get(concrete), Type::Void | Type::TypeParam(_)) {
@@ -5266,13 +5290,24 @@ fn unify_type_params(
         | (Type::Buffer { element: pe }, Type::Buffer { element: ce })
         | (Type::RwBuffer { element: pe }, Type::RwBuffer { element: ce })
         | (Type::Pointer { pointee: pe, .. }, Type::Pointer { pointee: ce, .. }) => {
-            unify_type_params(types, *pe, *ce, out);
+            unify_type_params_inner(types, *pe, *ce, out, visited);
         }
-        (Type::Struct { fields: pf, .. }, Type::Struct { fields: cf, .. })
-            if pf.len() == cf.len() =>
-        {
-            for ((_, pt), (_, ct)) in pf.iter().zip(cf) {
-                unify_type_params(types, *pt, *ct, out);
+        (
+            Type::Struct {
+                name: pn,
+                fields: pf,
+                ..
+            },
+            Type::Struct {
+                name: cn,
+                fields: cf,
+                ..
+            },
+        ) if pn.split('<').next() == cn.split('<').next() && pf.len() == cf.len() => {
+            for ((pname, pt), (cname, ct)) in pf.iter().zip(cf) {
+                if pname == cname {
+                    unify_type_params_inner(types, *pt, *ct, out, visited);
+                }
             }
         }
         _ => {}
@@ -5286,6 +5321,7 @@ struct BodyScanner<'a, 'b> {
     type_subst: &'b IndexMap<SmolStr, TypeId>,
     expected_return_ty: Option<TypeId>,
     is_non_compute_stage: bool,
+    stage: Option<ShaderStage>,
     caps: HardwareCaps,
     scopes: Vec<IndexMap<SmolStr, ScopedVar>>,
     local_types: &'b mut IndexMap<SmolStr, TypeId>,
@@ -5298,10 +5334,8 @@ impl BodyScanner<'_, '_> {
     }
 
     fn is_concrete_value_ty(&self, ty_id: TypeId) -> bool {
-        !matches!(
-            self.ctx.module.types.get(ty_id),
-            Type::Void | Type::TypeParam(_)
-        )
+        !matches!(self.ctx.module.types.get(ty_id), Type::Void)
+            && !contains_type_param(&self.ctx.module.types, ty_id)
     }
 
     fn is_shadowed(&self, name: &str) -> bool {
@@ -5824,6 +5858,26 @@ impl BodyScanner<'_, '_> {
                     );
                     if let Some(ty_id) = resolved_ty {
                         self.ctx.check_buffer_struct_bool(ty_id, *span);
+                        if self.ctx.module.types.contains_ray_query(ty_id)
+                            && !matches!(self.ctx.module.types.get(ty_id), Type::RayQuery)
+                            && !type_expr_is_ray_query_array(ty_expr)
+                        {
+                            self.ctx.diags.push(Diagnostic::error(
+                                "E0211",
+                                "`RayQuery` is only supported as a standalone function-local variable",
+                                *span,
+                            ));
+                        }
+                        if self.ctx.module.types.contains_ray_query(ty_id)
+                            && !self.caps.contains(HardwareCaps::RAY_QUERY)
+                            && !type_expr_contains_ident(ty_expr, "RayQuery")
+                        {
+                            self.ctx.diags.push(Diagnostic::error(
+                                "E0233",
+                                "`RayQuery` requires `#[cap(ray_query)]` on the enclosing function",
+                                *span,
+                            ));
+                        }
                         if self.ctx.module.types.contains_hit_object(ty_id) {
                             if !matches!(self.ctx.module.types.get(ty_id), Type::HitObject) {
                                 self.ctx.diags.push(Diagnostic::error(
@@ -6234,29 +6288,368 @@ impl BodyScanner<'_, '_> {
         }
     }
 
+    fn check_ray_method_args(
+        &mut self,
+        label: &str,
+        expected: &[Option<Type>],
+        args: &[HirCallArg],
+        span: Span,
+    ) {
+        if args.len() != expected.len() {
+            self.ctx.diags.push(Diagnostic::error(
+                "E0274",
+                format!(
+                    "`{label}` requires exactly {} argument{}",
+                    expected.len(),
+                    if expected.len() == 1 { "" } else { "s" }
+                ),
+                span,
+            ));
+        }
+        for (index, (arg, expected)) in args.iter().zip(expected).enumerate() {
+            if arg.name.is_some() {
+                self.ctx.diags.push(Diagnostic::error(
+                    "E0274",
+                    format!("`{label}` requires positional arguments"),
+                    arg.span,
+                ));
+            }
+            if let Some(expected) = expected
+                && self.is_concrete_value_ty(arg.value.ty)
+                && self.ctx.module.types.get(arg.value.ty) != expected
+                && !(matches!(expected, Type::Scalar(ScalarKind::U32))
+                    && matches!(
+                        self.ctx.module.types.get(arg.value.ty),
+                        Type::Scalar(ScalarKind::I32)
+                    ))
+            {
+                if matches!(expected, Type::AccelStruct) {
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0274",
+                        format!("`{label}` requires a bound acceleration structure"),
+                        arg.span,
+                    ));
+                    continue;
+                }
+                if matches!(expected, Type::HitObject) {
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0274",
+                        format!("`{label}` requires a HitObject variable"),
+                        arg.span,
+                    ));
+                    continue;
+                }
+                let expected_id = self.ctx.module.types.alloc(expected.clone());
+                let expected_name = format_type_name(&self.ctx.module.types, expected_id);
+                let actual_name = format_type_name(&self.ctx.module.types, arg.value.ty);
+                self.ctx.diags.push(Diagnostic::error(
+                    "E0274",
+                    format!("argument {} of `{label}`: expected `{expected_name}`, found `{actual_name}`", index + 1),
+                    arg.span,
+                ));
+            }
+        }
+    }
+
+    fn check_rt_intrinsic(&mut self, name: &str, args: &[HirCallArg], span: Span) {
+        let u32_ty = Type::Scalar(ScalarKind::U32);
+        let f32_ty = Type::Scalar(ScalarKind::F32);
+        let vec3_ty = Type::Vector {
+            scalar: ScalarKind::F32,
+            len: 3,
+        };
+        let (signature, stages, ser): (Vec<Option<Type>>, &[ShaderStage], bool) = match name {
+            "trace_ray" => (
+                vec![
+                    Some(Type::AccelStruct),
+                    Some(u32_ty.clone()),
+                    Some(u32_ty.clone()),
+                    Some(u32_ty.clone()),
+                    Some(u32_ty.clone()),
+                    Some(u32_ty),
+                    Some(vec3_ty.clone()),
+                    Some(f32_ty.clone()),
+                    Some(vec3_ty),
+                    Some(f32_ty),
+                    None,
+                ],
+                &[
+                    ShaderStage::RayGen,
+                    ShaderStage::ClosestHit,
+                    ShaderStage::Miss,
+                ],
+                false,
+            ),
+            "execute_callable" => (
+                vec![Some(u32_ty), None],
+                &[
+                    ShaderStage::RayGen,
+                    ShaderStage::ClosestHit,
+                    ShaderStage::Miss,
+                    ShaderStage::Callable,
+                ],
+                false,
+            ),
+            "ignore_intersection" | "terminate_ray" => (vec![], &[ShaderStage::AnyHit], false),
+            "report_intersection" => (
+                vec![Some(f32_ty), Some(u32_ty)],
+                &[ShaderStage::Intersection],
+                false,
+            ),
+            "reorder_thread_with_hint" => (
+                vec![Some(u32_ty.clone()), Some(u32_ty)],
+                &[ShaderStage::RayGen],
+                true,
+            ),
+            "reorder_thread_with_hit_object" => {
+                if !matches!(args.len(), 1 | 3) {
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0274",
+                        "`reorder_thread_with_hit_object` requires 1 or 3 arguments",
+                        span,
+                    ));
+                    return;
+                }
+                let mut signature = vec![Some(Type::HitObject)];
+                if args.len() == 3 {
+                    signature.extend([Some(u32_ty.clone()), Some(u32_ty)]);
+                }
+                (signature, &[ShaderStage::RayGen], true)
+            }
+            _ => return,
+        };
+        self.check_ray_method_args(name, &signature, args, span);
+        if let Some(stage) = self.stage
+            && !stages.contains(&stage)
+        {
+            self.ctx.diags.push(Diagnostic::error(
+                "E0274",
+                format!("`{name}` is not allowed in the {stage:?} shader stage"),
+                span,
+            ));
+        }
+        if ser
+            && !self.caps.intersects(
+                HardwareCaps::SHADER_INVOCATION_REORDER
+                    | HardwareCaps::SHADER_INVOCATION_REORDER_EXT,
+            )
+        {
+            self.ctx.diags.push(Diagnostic::error(
+                "E0233",
+                format!("`{name}` requires `#[cap(ser_nv)]` or `#[cap(ser_ext)]`"),
+                span,
+            ));
+        }
+    }
+
+    fn check_math_intrinsic(
+        &mut self,
+        name: &str,
+        args: &[HirCallArg],
+        span: Span,
+    ) -> Option<TypeId> {
+        let (arity, splat, floating) = match name {
+            "abs" => (1, false, false),
+            "min" | "max" => (2, true, false),
+            "clamp" => (3, true, false),
+            "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sqrt" | "inversesqrt" | "sign"
+            | "floor" | "ceil" | "trunc" | "round" | "fract" | "exp" | "exp2" | "log" | "log2"
+            | "saturate" | "length" | "normalize" => (1, false, true),
+            "dot" | "distance" | "cross" | "reflect" => (2, false, true),
+            "pow" | "atan2" | "mod" | "step" => (2, true, true),
+            "mix" | "smoothstep" | "fma" => (3, true, true),
+            "refract" => (3, false, true),
+            _ => return None,
+        };
+        if args.len() != arity {
+            self.ctx.diags.push(Diagnostic::error(
+                "E0274",
+                format!("`{name}` requires exactly {arity} argument(s)"),
+                span,
+            ));
+            return None;
+        }
+        if args.iter().any(|a| a.name.is_some()) {
+            self.ctx.diags.push(Diagnostic::error(
+                "E0274",
+                format!("`{name}` requires positional arguments"),
+                span,
+            ));
+        }
+        if args.iter().any(|a| !self.is_concrete_value_ty(a.value.ty)) {
+            return None;
+        }
+        let shapes: Option<Vec<(ScalarKind, u8)>> = args
+            .iter()
+            .map(|arg| match self.ctx.module.types.get(arg.value.ty) {
+                Type::Scalar(s) => Some((*s, 1)),
+                Type::Vector { scalar, len } => Some((*scalar, *len)),
+                _ => None,
+            })
+            .collect();
+        let Some(shapes) = shapes else {
+            self.ctx.diags.push(Diagnostic::error(
+                "E0274",
+                format!("`{name}` requires scalar or vector operands"),
+                span,
+            ));
+            return None;
+        };
+        let (scalar, first_len) = shapes[0];
+        let len = if splat {
+            shapes.iter().map(|(_, n)| *n).max().unwrap_or(1)
+        } else {
+            first_len
+        };
+        let valid = shapes.iter().enumerate().all(|(i, (s, n))| {
+            *s == scalar
+                && if name == "refract" && i == 2 {
+                    *n == 1
+                } else {
+                    *n == len || (splat && *n == 1)
+                }
+        }) && if floating {
+            matches!(scalar, ScalarKind::F16 | ScalarKind::F32)
+        } else {
+            is_numeric_scalar(scalar)
+        } && (name != "abs" || !matches!(scalar, ScalarKind::U32 | ScalarKind::U64))
+            && (!matches!(name, "dot" | "normalize" | "reflect" | "refract") || len > 1)
+            && (name != "cross" || len == 3);
+        if !valid {
+            self.ctx.diags.push(Diagnostic::error(
+                "E0274",
+                format!("invalid operand types or dimensions for `{name}`"),
+                span,
+            ));
+            return None;
+        }
+        let result_len = if matches!(name, "dot" | "length" | "distance") {
+            1
+        } else {
+            len
+        };
+        Some(self.ctx.module.types.alloc(if result_len == 1 {
+            Type::Scalar(scalar)
+        } else {
+            Type::Vector {
+                scalar,
+                len: result_len,
+            }
+        }))
+    }
+
+    fn check_subgroup_signature(&mut self, name: &str, args: &[HirCallArg], span: Span) {
+        let bool_ty = Type::Scalar(ScalarKind::Bool);
+        let ballot_ty = Type::Vector {
+            scalar: ScalarKind::U32,
+            len: 4,
+        };
+        let u32_ty = Type::Scalar(ScalarKind::U32);
+        let signature = match name {
+            "workgroup_barrier" | "memory_barrier" | "subgroup_elect" => vec![],
+            "subgroup_ballot"
+            | "subgroup_any"
+            | "subgroup_all"
+            | "subgroup_logical_and"
+            | "subgroup_logical_or"
+            | "subgroup_logical_xor" => vec![Some(bool_ty)],
+            "subgroup_ballot_bit_count"
+            | "subgroup_ballot_exclusive_bit_count"
+            | "subgroup_ballot_inclusive_bit_count"
+            | "subgroup_ballot_find_lsb"
+            | "subgroup_ballot_find_msb" => vec![Some(ballot_ty)],
+            "subgroup_ballot_bit_extract" => vec![Some(ballot_ty), Some(u32_ty)],
+            "subgroup_broadcast"
+            | "subgroup_shuffle"
+            | "subgroup_shuffle_xor"
+            | "subgroup_shuffle_up"
+            | "subgroup_shuffle_down"
+            | "quad_broadcast"
+            | "subgroup_clustered_add"
+            | "subgroup_clustered_mul"
+            | "subgroup_clustered_min"
+            | "subgroup_clustered_max"
+            | "subgroup_clustered_and"
+            | "subgroup_clustered_or"
+            | "subgroup_clustered_xor" => vec![None, Some(u32_ty)],
+            "subgroup_broadcast_first"
+            | "subgroup_add"
+            | "subgroup_mul"
+            | "subgroup_min"
+            | "subgroup_max"
+            | "subgroup_exclusive_add"
+            | "subgroup_inclusive_add"
+            | "subgroup_exclusive_mul"
+            | "subgroup_inclusive_mul"
+            | "subgroup_exclusive_min"
+            | "subgroup_inclusive_min"
+            | "subgroup_exclusive_max"
+            | "subgroup_inclusive_max"
+            | "subgroup_bit_and"
+            | "subgroup_bit_or"
+            | "subgroup_bit_xor"
+            | "quad_swap_horizontal"
+            | "quad_swap_vertical"
+            | "quad_swap_diagonal"
+            | "nonuniform" => vec![None],
+            _ => return,
+        };
+        self.check_ray_method_args(name, &signature, args, span);
+    }
+
+    fn lower_int_literal(
+        &mut self,
+        raw: &SmolStr,
+        span: Span,
+        negated: bool,
+    ) -> (HirExpr, Option<TypeId>) {
+        let scalar = if raw.ends_with("u64") {
+            ScalarKind::U64
+        } else if raw.ends_with("i64") {
+            ScalarKind::I64
+        } else if raw.ends_with("u32") || raw.ends_with('u') {
+            ScalarKind::U32
+        } else {
+            ScalarKind::I32
+        };
+        let radix_literal = raw.starts_with("0x")
+            || raw.starts_with("0X")
+            || raw.starts_with("0b")
+            || raw.starts_with("0B")
+            || raw.starts_with("0o")
+            || raw.starts_with("0O");
+        // Nondecimal integer literals can express the full bit pattern of a signed type.
+        // Decimal signed minima are only representable when directly negated.
+        let max = match scalar {
+            ScalarKind::U64 => i128::from(u64::MAX),
+            ScalarKind::U32 => i128::from(u32::MAX),
+            ScalarKind::I64 if radix_literal => i128::from(u64::MAX),
+            ScalarKind::I32 if radix_literal => i128::from(u32::MAX),
+            ScalarKind::I64 => i128::from(i64::MAX) + i128::from(negated),
+            _ => i128::from(i32::MAX) + i128::from(negated),
+        };
+        if eval_const_int_expr(&Expr::IntLit(raw.clone(), span)).is_none_or(|value| value > max) {
+            self.ctx.diags.push(Diagnostic::error(
+                "E0270",
+                format!("integer literal `{raw}` is out of range for `{scalar:?}`"),
+                span,
+            ));
+        }
+        let ty = self.ctx.module.types.alloc(Type::Scalar(scalar));
+        (
+            HirExpr {
+                kind: HirExprKind::IntLit(raw.clone()),
+                ty,
+                symbol: None,
+                span,
+            },
+            Some(ty),
+        )
+    }
+
     fn lower_expr(&mut self, expr: &Expr, is_write_target: bool) -> (HirExpr, Option<TypeId>) {
         match expr {
-            Expr::IntLit(raw, span) => {
-                let scalar = if raw.ends_with("u64") {
-                    ScalarKind::U64
-                } else if raw.ends_with("i64") {
-                    ScalarKind::I64
-                } else if raw.ends_with("u32") || raw.ends_with('u') {
-                    ScalarKind::U32
-                } else {
-                    ScalarKind::I32
-                };
-                let ty = self.ctx.module.types.alloc(Type::Scalar(scalar));
-                (
-                    HirExpr {
-                        kind: HirExprKind::IntLit(raw.clone()),
-                        ty,
-                        symbol: None,
-                        span: *span,
-                    },
-                    Some(ty),
-                )
-            }
+            Expr::IntLit(raw, span) => self.lower_int_literal(raw, *span, false),
             Expr::FloatLit(raw, span) => {
                 let scalar = if raw.ends_with("f16") {
                     if !self.caps.contains(HardwareCaps::FLOAT16) {
@@ -6270,6 +6663,20 @@ impl BodyScanner<'_, '_> {
                 } else {
                     ScalarKind::F32
                 };
+                let clean = raw
+                    .trim_end_matches("f16")
+                    .trim_end_matches("f32")
+                    .trim_end_matches('f')
+                    .replace('_', "");
+                if !clean.parse::<f32>().is_ok_and(|value| {
+                    value.is_finite() && (scalar != ScalarKind::F16 || value.abs() < 65_520.0)
+                }) {
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0270",
+                        format!("floating-point literal `{raw}` is out of range for `{scalar:?}`"),
+                        *span,
+                    ));
+                }
                 let ty = self.ctx.module.types.alloc(Type::Scalar(scalar));
                 (
                     HirExpr {
@@ -6548,8 +6955,52 @@ impl BodyScanner<'_, '_> {
                 }
 
                 let mut lowered_turbofish = Vec::new();
+                let is_atomic_option_call = path.segments.last().is_some_and(|last| {
+                    last.name.starts_with("atomic_")
+                        || matches!(
+                            last.name.as_str(),
+                            "barrier" | "memory_barrier" | "control_barrier"
+                        )
+                });
+                let mut has_scope = false;
+                let mut has_order = false;
                 for arg in turbofish {
                     if let TypeArg::Type(ty_expr) = arg {
+                        if is_atomic_option_call
+                            && let TypeExpr::Named {
+                                path,
+                                args,
+                                unsized_array,
+                                ..
+                            } = ty_expr
+                        {
+                            let option = path.joined();
+                            let seen = match option.as_str() {
+                                "Scope::Device" | "Device" | "Scope::Workgroup" | "Workgroup"
+                                | "Scope::Subgroup" | "Subgroup" => Some(&mut has_scope),
+                                "Order::Relaxed" | "Relaxed" | "Order::Acquire" | "Acquire"
+                                | "Order::Release" | "Release" | "Order::AcqRel" | "AcqRel" => {
+                                    Some(&mut has_order)
+                                }
+                                _ => None,
+                            };
+                            if let Some(seen) = seen
+                                && args.is_empty()
+                                && !unsized_array
+                            {
+                                if *seen {
+                                    self.ctx.diags.push(Diagnostic::error(
+                                        "E0274",
+                                        format!(
+                                            "duplicate atomic scope or order option `{option}`"
+                                        ),
+                                        *span,
+                                    ));
+                                }
+                                *seen = true;
+                                continue;
+                            }
+                        }
                         if type_expr_contains_bda(ty_expr) {
                             self.scan.set(FLAG_BDA);
                         }
@@ -6651,8 +7102,26 @@ impl BodyScanner<'_, '_> {
 
                 let (hir_callee, _) = self.lower_expr(callee, false);
                 let (hir_args, arg_types) = self.lower_call_args(args);
+                let mut checked_builtin_ty = None;
 
                 if let Some(ref fn_name) = callee_name {
+                    if callee_path.as_deref() == Some(fn_name.as_str())
+                        && !self.ctx.fn_sigs.contains_key(fn_name.as_str())
+                    {
+                        self.check_rt_intrinsic(fn_name.as_str(), &hir_args, *span);
+                    }
+                    if callee_path
+                        .as_deref()
+                        .is_some_and(|p| p == fn_name.as_str() || p.starts_with("std::"))
+                        && !self.ctx.fn_sigs.contains_key(fn_name.as_str())
+                        && !callee_path
+                            .as_deref()
+                            .is_some_and(|p| self.ctx.fn_sigs.contains_key(p))
+                    {
+                        checked_builtin_ty =
+                            self.check_math_intrinsic(fn_name.as_str(), &hir_args, *span);
+                        self.check_subgroup_signature(fn_name.as_str(), &hir_args, *span);
+                    }
                     if matches!(fn_name.as_str(), "f16" | "f16vec2" | "f16vec3" | "f16vec4")
                         && !self.caps.contains(HardwareCaps::FLOAT16)
                     {
@@ -6680,8 +7149,21 @@ impl BodyScanner<'_, '_> {
                 if let Some(ref cp) = callee_path
                     && let Some(template) = self.ctx.generic_fn_templates.get(cp.as_str()).cloned()
                 {
-                    let explicit_targs = match &hir_callee.kind {
-                        HirExprKind::Path { turbofish, .. } if !turbofish.is_empty() => {
+                    let explicit_targs = match (callee.as_ref(), &hir_callee.kind) {
+                        (
+                            Expr::Path {
+                                turbofish: ast_args,
+                                ..
+                            },
+                            HirExprKind::Path { turbofish, .. },
+                        ) if !ast_args.is_empty() => {
+                            if ast_args.len() != turbofish.len() {
+                                self.ctx.diags.push(Diagnostic::error(
+                                    "E0274",
+                                    format!("invalid generic type arguments for `{cp}`"),
+                                    *span,
+                                ));
+                            }
                             Some(turbofish.clone())
                         }
                         _ => None,
@@ -6689,13 +7171,18 @@ impl BodyScanner<'_, '_> {
                     let inferred_targs = explicit_targs.or_else(|| {
                         let base_sig = self.ctx.fn_sigs.get(cp.as_str())?.clone();
                         let mut inferred_map: IndexMap<SmolStr, TypeId> = IndexMap::new();
-                        for ((_, _, param_ty_opt), arg_ty_opt) in
-                            base_sig.params.iter().zip(arg_types.iter())
+                        for (index, (arg, arg_ty_opt)) in
+                            hir_args.iter().zip(&arg_types).enumerate()
                         {
-                            if let (Some(pt), Some(at)) = (*param_ty_opt, *arg_ty_opt) {
+                            let param = if let Some(name) = &arg.name {
+                                base_sig.params.iter().find(|(p, _, _)| p == name)
+                            } else {
+                                base_sig.params.get(index)
+                            };
+                            if let (Some((_, _, Some(pt))), Some(at)) = (param, *arg_ty_opt) {
                                 unify_type_params(
                                     &self.ctx.module.types,
-                                    pt,
+                                    *pt,
                                     at,
                                     &mut inferred_map,
                                 );
@@ -6707,6 +7194,13 @@ impl BodyScanner<'_, '_> {
                         }
                         Some(ordered)
                     });
+                    if inferred_targs.is_none() && self.generic_params.is_empty() {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0274",
+                            format!("cannot infer all generic type arguments for `{cp}`"),
+                            *span,
+                        ));
+                    }
                     if let Some(targs) = inferred_targs
                         && let Some(mono_id) =
                             self.ctx.monomorphize_function(cp.as_str(), &targs, *span)
@@ -6731,7 +7225,7 @@ impl BodyScanner<'_, '_> {
                     .and_then(|n| infer_builtin_constructor_type(n, &mut self.ctx.module.types))
                     .is_some();
 
-                let mut ret_ty: Option<TypeId> = mc_param_ty.or(mc_spec_ty);
+                let mut ret_ty: Option<TypeId> = mc_param_ty.or(mc_spec_ty).or(checked_builtin_ty);
                 if let Some(sig) = mono_sig {
                     let label = callee_path.as_deref().unwrap_or("<fn>");
                     self.check_call_against_sig(label, &sig.params, &hir_args, &arg_types, *span);
@@ -6759,10 +7253,22 @@ impl BodyScanner<'_, '_> {
                             *span,
                         );
                         ret_ty = sig.return_ty;
+                        if let Expr::Path { turbofish, .. } = callee.as_ref()
+                            && !turbofish.is_empty()
+                            && !callee_path
+                                .as_deref()
+                                .is_some_and(|p| self.ctx.generic_fn_templates.contains_key(p))
+                        {
+                            self.ctx.diags.push(Diagnostic::error(
+                                "E0274",
+                                format!("`{label}` does not accept generic type arguments"),
+                                *span,
+                            ));
+                        }
                     }
                 }
 
-                if ret_ty.is_none() {
+                if ret_ty.is_none() && resolved_fn.is_none() {
                     ret_ty = callee_name
                         .as_deref()
                         .and_then(|name| {
@@ -6843,8 +7349,43 @@ impl BodyScanner<'_, '_> {
                 let mut resolved_fn: Option<HirFnId> = None;
                 let mut ret_ty: Option<TypeId> = None;
 
-                if method.name == "offset" || method.name == "step_by" {
+                if method.name == "step_by"
+                    && recv_ty.is_some_and(|ty| {
+                        matches!(self.ctx.module.types.get(ty), Type::Scalar(s) if is_integer_scalar(*s))
+                    })
+                {
                     ret_ty = recv_ty;
+                } else if let Some(Type::Pointer { pointee, mutable, .. }) =
+                    recv_ty.map(|ty| self.ctx.module.types.get(ty).clone())
+                    && matches!(method.name.as_str(), "offset" | "load" | "store")
+                {
+                    let label = format!("ptr::{}", method.name);
+                    match method.name.as_str() {
+                        "offset" => {
+                            if hir_args.len() != 1 {
+                                self.ctx.diags.push(Diagnostic::error("E0274", "`ptr::offset` requires exactly 1 argument", *span));
+                            }
+                            if let Some(Some(index_ty)) = arg_types.first()
+                                && self.is_concrete_value_ty(*index_ty)
+                                && !matches!(self.ctx.module.types.get(*index_ty), Type::Scalar(s) if is_integer_scalar(*s))
+                            {
+                                self.ctx.diags.push(Diagnostic::error("E0274", "`ptr::offset` requires an integer scalar index", *span));
+                            }
+                            ret_ty = recv_ty;
+                        }
+                        "load" => {
+                            self.check_ray_method_args(&label, &[], &hir_args, *span);
+                            ret_ty = Some(pointee);
+                        }
+                        "store" => {
+                            if !mutable {
+                                self.ctx.diags.push(Diagnostic::error("E0272", "cannot store through a read-only pointer", *span));
+                            }
+                            self.check_call_against_sig(&label, &[(SmolStr::new_static("value"), ParamMode::In, Some(pointee))], &hir_args, &arg_types, *span);
+                            ret_ty = Some(self.void_ty());
+                        }
+                        _ => unreachable!(),
+                    }
                 } else if let Some(rty) = recv_ty {
                     let base_ty = match self.ctx.module.types.get(rty) {
                         Type::Pointer { pointee, .. } => *pointee,
@@ -6975,6 +7516,56 @@ impl BodyScanner<'_, '_> {
                                 method.name.as_str(),
                                 &mut self.ctx.module.types,
                             );
+                            let label = format!("RayQuery::{}", method.name);
+                            if ret_ty.is_some() {
+                                let f32_ty = Type::Scalar(ScalarKind::F32);
+                                let u32_ty = Type::Scalar(ScalarKind::U32);
+                                let vec3_ty = Type::Vector {
+                                    scalar: ScalarKind::F32,
+                                    len: 3,
+                                };
+                                let signature = match method.name.as_str() {
+                                    "initialize" => vec![
+                                        Some(Type::AccelStruct),
+                                        Some(u32_ty.clone()),
+                                        Some(u32_ty),
+                                        Some(vec3_ty.clone()),
+                                        Some(f32_ty.clone()),
+                                        Some(vec3_ty),
+                                        Some(f32_ty),
+                                    ],
+                                    "generate_intersection" => vec![Some(f32_ty)],
+                                    _ => Vec::new(),
+                                };
+                                self.check_ray_method_args(&label, &signature, &hir_args, *span);
+                                if !self.caps.contains(HardwareCaps::RAY_QUERY) {
+                                    self.ctx.diags.push(Diagnostic::error(
+                                        "E0233",
+                                        format!("`{label}` requires `#[cap(ray_query)]`"),
+                                        *span,
+                                    ));
+                                }
+                                if matches!(
+                                    method.name.as_str(),
+                                    "committed_triangle_vertex_positions"
+                                        | "candidate_triangle_vertex_positions"
+                                ) && !self
+                                    .caps
+                                    .contains(HardwareCaps::RAY_TRACING_POSITION_FETCH)
+                                {
+                                    self.ctx.diags.push(Diagnostic::error(
+                                        "E0233",
+                                        format!("`{label}` requires `#[cap(position_fetch)]`"),
+                                        *span,
+                                    ));
+                                }
+                            } else {
+                                self.ctx.diags.push(Diagnostic::error(
+                                    "E0274",
+                                    format!("unknown method `{label}`"),
+                                    *span,
+                                ));
+                            }
                         }
                         Type::HitObject => {
                             ret_ty = match method.name.as_str() {
@@ -6987,8 +7578,50 @@ impl BodyScanner<'_, '_> {
                                 "sbt_record_index" => {
                                     Some(self.ctx.module.types.alloc(Type::Scalar(ScalarKind::U32)))
                                 }
-                                _ => Some(self.ctx.module.types.alloc(Type::Void)),
+                                "trace_ray" | "execute_shader" | "record_empty" => {
+                                    Some(self.ctx.module.types.alloc(Type::Void))
+                                }
+                                _ => None,
                             };
+                            let label = format!("HitObject::{}", method.name);
+                            if ret_ty.is_some() {
+                                let u32_ty = Type::Scalar(ScalarKind::U32);
+                                let f32_ty = Type::Scalar(ScalarKind::F32);
+                                let vec3_ty = Type::Vector {
+                                    scalar: ScalarKind::F32,
+                                    len: 3,
+                                };
+                                let signature = match method.name.as_str() {
+                                    "trace_ray" => vec![
+                                        Some(Type::AccelStruct),
+                                        Some(u32_ty.clone()),
+                                        Some(u32_ty.clone()),
+                                        Some(u32_ty.clone()),
+                                        Some(u32_ty.clone()),
+                                        Some(u32_ty),
+                                        Some(vec3_ty.clone()),
+                                        Some(f32_ty.clone()),
+                                        Some(vec3_ty),
+                                        Some(f32_ty),
+                                        None,
+                                    ],
+                                    "execute_shader" => vec![None],
+                                    _ => Vec::new(),
+                                };
+                                self.check_ray_method_args(&label, &signature, &hir_args, *span);
+                                if !self.caps.intersects(
+                                    HardwareCaps::SHADER_INVOCATION_REORDER
+                                        | HardwareCaps::SHADER_INVOCATION_REORDER_EXT,
+                                ) {
+                                    self.ctx.diags.push(Diagnostic::error("E0233", format!("`{label}` requires `#[cap(ser_nv)]` or `#[cap(ser_ext)]`"), *span));
+                                }
+                            } else {
+                                self.ctx.diags.push(Diagnostic::error(
+                                    "E0274",
+                                    format!("unknown method `{label}`"),
+                                    *span,
+                                ));
+                            }
                         }
                         Type::Texture2D { sample_scalar, .. }
                         | Type::Texture2DArray { sample_scalar }
@@ -7150,14 +7783,28 @@ impl BodyScanner<'_, '_> {
                                 }
                             }
                         }
-                        Type::Struct { fields, .. } => {
+                        Type::Struct { name, fields, .. } => {
                             let found = fields
                                 .iter()
                                 .enumerate()
                                 .find(|(_, (name, _))| *name == field.name);
                             let (field_ty_opt, field_index) = match found {
                                 Some((idx, (_, ty_id))) => (Some(*ty_id), Some(idx as u32)),
-                                None => (pack_field_ty, None),
+                                None => {
+                                    if pack_field_ty.is_none()
+                                        && !self.ctx.builtin_struct_types.contains_key(&name)
+                                    {
+                                        self.ctx.diags.push(Diagnostic::error(
+                                            "E0270",
+                                            format!(
+                                                "unknown field `{}` on struct `{name}`",
+                                                field.name
+                                            ),
+                                            *span,
+                                        ));
+                                    }
+                                    (pack_field_ty, None)
+                                }
                             };
                             let ty = field_ty_opt.unwrap_or_else(|| self.void_ty());
                             return (
@@ -7199,8 +7846,8 @@ impl BodyScanner<'_, '_> {
                     let (v, _) = self.lower_expr(fval, false);
                     hir_fields.push((fname.name.clone(), v));
                 }
-                let struct_name = SmolStr::new(path.joined());
-                let resolved_ty = self
+                let mut struct_name = SmolStr::new(path.joined());
+                let mut resolved_ty = self
                     .ctx
                     .struct_types
                     .get(struct_name.as_str())
@@ -7211,6 +7858,96 @@ impl BodyScanner<'_, '_> {
                             .get(struct_name.as_str())
                             .copied()
                     });
+                if let Some(base_ty) = resolved_ty
+                    && let Some(&sid) = self.ctx.struct_ids.get(&struct_name)
+                    && !self.ctx.module.structs[sid].generic_params.is_empty()
+                {
+                    let params = self.ctx.module.structs[sid].generic_params.clone();
+                    let mut inferred = IndexMap::new();
+                    if let Type::Struct {
+                        fields: declared, ..
+                    } = self.ctx.module.types.get(base_ty)
+                    {
+                        for (name, value) in &hir_fields {
+                            if let Some((_, pattern)) =
+                                declared.iter().find(|(field, _)| field == name)
+                            {
+                                unify_type_params(
+                                    &self.ctx.module.types,
+                                    *pattern,
+                                    value.ty,
+                                    &mut inferred,
+                                );
+                            }
+                        }
+                    }
+                    let args = params
+                        .iter()
+                        .map(|p| inferred.get(p).copied())
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(args) = args {
+                        let mut type_ctx = self.ctx.type_ctx();
+                        if let Some(ty) =
+                            monomorphize_struct_with_args(&struct_name, args, &mut type_ctx, *span)
+                        {
+                            resolved_ty = Some(ty);
+                            if let Type::Struct { name, .. } = self.ctx.module.types.get(ty) {
+                                struct_name = name.clone();
+                            }
+                        }
+                    } else if self.generic_params.is_empty() {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0274",
+                            format!("cannot infer all generic type arguments for struct literal `{struct_name}`"),
+                            *span,
+                        ));
+                    }
+                }
+                if let Some(resolved_ty) = resolved_ty
+                    && let Type::Struct {
+                        fields: declared_fields,
+                        ..
+                    } = self.ctx.module.types.get(resolved_ty)
+                {
+                    let mut seen = IndexSet::new();
+                    for (name, value) in &hir_fields {
+                        if !seen.insert(name.clone()) {
+                            self.ctx.diags.push(Diagnostic::error(
+                                "E0270",
+                                format!(
+                                    "duplicate field `{name}` in struct literal `{struct_name}`"
+                                ),
+                                value.span,
+                            ));
+                            continue;
+                        }
+                        if let Some((_, expected)) =
+                            declared_fields.iter().find(|(field, _)| field == name)
+                        {
+                            if self.is_concrete_value_ty(*expected)
+                                && self.is_concrete_value_ty(value.ty)
+                                && *expected != value.ty
+                            {
+                                self.ctx.diags.push(Diagnostic::error("E0270", format!("mismatched type for field `{name}` in struct literal `{struct_name}`"), value.span));
+                            }
+                        } else {
+                            self.ctx.diags.push(Diagnostic::error(
+                                "E0270",
+                                format!("unknown field `{name}` in struct literal `{struct_name}`"),
+                                value.span,
+                            ));
+                        }
+                    }
+                    for (name, _) in declared_fields {
+                        if !seen.contains(name) {
+                            self.ctx.diags.push(Diagnostic::error(
+                                "E0270",
+                                format!("missing field `{name}` in struct literal `{struct_name}`"),
+                                *span,
+                            ));
+                        }
+                    }
+                }
                 let ty = resolved_ty.unwrap_or_else(|| self.void_ty());
                 (
                     HirExpr {
@@ -7226,7 +7963,13 @@ impl BodyScanner<'_, '_> {
                 )
             }
             Expr::Unary { op, operand, span } => {
-                let (hir_op, inner_ty) = self.lower_expr(operand, false);
+                let (hir_op, inner_ty) = if *op == UnaryOp::Neg
+                    && let Expr::IntLit(raw, operand_span) = operand.as_ref()
+                {
+                    self.lower_int_literal(raw, *operand_span, true)
+                } else {
+                    self.lower_expr(operand, false)
+                };
                 let result_ty = match op {
                     UnaryOp::Not => {
                         let mut res =
@@ -7551,10 +8294,38 @@ impl BodyScanner<'_, '_> {
                 let mut elem_ty = None;
                 for el in elements {
                     let (he, t) = self.lower_expr(el, false);
+                    if let Some(t) = t
+                        && (self.ctx.module.types.contains_ray_query(t)
+                            || self.ctx.module.types.contains_hit_object(t))
+                    {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0211",
+                            "opaque ray handles cannot appear in array literals",
+                            he.span,
+                        ));
+                    }
+                    if let (Some(expected), Some(actual)) = (elem_ty, t)
+                        && self.is_concrete_value_ty(expected)
+                        && self.is_concrete_value_ty(actual)
+                        && expected != actual
+                    {
+                        self.ctx.diags.push(Diagnostic::error(
+                            "E0270",
+                            "array literal elements must have the same type",
+                            he.span,
+                        ));
+                    }
                     if elem_ty.is_none() {
                         elem_ty = t;
                     }
                     hir_elems.push(he);
+                }
+                if elements.is_empty() {
+                    self.ctx.diags.push(Diagnostic::error(
+                        "E0205",
+                        "array literals cannot be empty",
+                        *span,
+                    ));
                 }
                 let arr_ty = elem_ty.and_then(|e| {
                     u32::try_from(elements.len())
@@ -7622,22 +8393,43 @@ impl BodyScanner<'_, '_> {
 fn infer_rayquery_method_return(method: &str, types: &mut TypeArena) -> Option<TypeId> {
     let ty = match method {
         "initialize" | "confirm_intersection" | "terminate" | "generate_intersection" => Type::Void,
-        "proceed" | "committed_front_face" => Type::Scalar(ScalarKind::Bool),
+        "proceed" | "committed_front_face" | "candidate_front_face" | "candidate_aabb_opaque" => {
+            Type::Scalar(ScalarKind::Bool)
+        }
         "committed_type"
         | "candidate_type"
         | "committed_instance_custom_index"
         | "committed_instance_id"
         | "committed_primitive_index"
-        | "committed_geometry_index" => Type::Scalar(ScalarKind::U32),
-        "committed_t" | "candidate_t" => Type::Scalar(ScalarKind::F32),
-        "committed_object_to_world" | "committed_world_to_object" => Type::Matrix {
+        | "committed_geometry_index"
+        | "candidate_instance_custom_index"
+        | "candidate_instance_id"
+        | "candidate_primitive_index"
+        | "candidate_geometry_index"
+        | "candidate_sbt_record_offset"
+        | "committed_sbt_record_offset"
+        | "ray_flags" => Type::Scalar(ScalarKind::U32),
+        "committed_t" | "candidate_t" | "ray_tmin" => Type::Scalar(ScalarKind::F32),
+        "committed_object_to_world"
+        | "committed_world_to_object"
+        | "candidate_object_to_world"
+        | "candidate_world_to_object" => Type::Matrix {
             scalar: ScalarKind::F32,
             cols: 4,
             rows: 3,
         },
-        "committed_barycentrics" => Type::Vector {
+        "committed_barycentrics" | "candidate_barycentrics" => Type::Vector {
             scalar: ScalarKind::F32,
             len: 2,
+        },
+        "world_ray_origin"
+        | "world_ray_direction"
+        | "candidate_object_ray_origin"
+        | "candidate_object_ray_direction"
+        | "committed_object_ray_origin"
+        | "committed_object_ray_direction" => Type::Vector {
+            scalar: ScalarKind::F32,
+            len: 3,
         },
         "committed_triangle_vertex_positions" | "candidate_triangle_vertex_positions" => {
             let v3 = types.alloc(Type::Vector {
@@ -8776,6 +9568,68 @@ fn lower_type_expr(
             if let Some(&id) = ctx.builtin_struct_types.get(name.as_str()) {
                 return Some(id);
             }
+            if matches!(
+                name.as_str(),
+                "Texture2D"
+                    | "Texture2DArray"
+                    | "Texture3D"
+                    | "TextureCube"
+                    | "Texture1D"
+                    | "Texture2DMS"
+                    | "BufferView"
+                    | "TextureBuffer"
+                    | "SubpassInput"
+                    | "SubpassInputMS"
+            ) && !args.is_empty()
+                && (args.len() != 1
+                    || !matches!(
+                        first_type_arg_scalar(args),
+                        Some(ScalarKind::F32 | ScalarKind::I32 | ScalarKind::U32)
+                    ))
+            {
+                if let Some(diags) = ctx.diags.as_deref_mut() {
+                    diags.push(Diagnostic::error(
+                        "E0205",
+                        format!("`{name}` requires a sample type of `f32`, `i32`, or `u32`"),
+                        *span,
+                    ));
+                }
+                return None;
+            }
+            if matches!(
+                name.as_str(),
+                "RWImage1D"
+                    | "RwImage1D"
+                    | "RWImage2D"
+                    | "RWBufferView"
+                    | "RwBufferView"
+                    | "RWTextureBuffer"
+                    | "RwTextureBuffer"
+                    | "RWImage2DArray"
+                    | "RWImage3D"
+            ) && (args.len() != 1 || first_type_arg_image_format(args).is_none())
+            {
+                if let Some(diags) = ctx.diags.as_deref_mut() {
+                    diags.push(Diagnostic::error(
+                        "E0205",
+                        format!("`{name}` requires exactly one supported storage image format"),
+                        *span,
+                    ));
+                }
+                return None;
+            }
+            if matches!(name.as_str(), "Buffer" | "RWBuffer")
+                && (args.len() != 1 || !matches!(args.first(), Some(TypeArg::Type(_))))
+            {
+                if let Some(diags) = ctx.diags.as_deref_mut() {
+                    diags.push(Diagnostic::error(
+                        "E0205",
+                        format!("`{name}` requires exactly one element type"),
+                        *span,
+                    ));
+                }
+                return None;
+            }
             let resolved = match name.as_str() {
                 "bool" => Type::Scalar(ScalarKind::Bool),
                 "i32" => Type::Scalar(ScalarKind::I32),
@@ -8934,27 +9788,21 @@ fn lower_type_expr(
                 "Sampler" => Type::Sampler,
                 "SamplerShadow" => Type::SamplerShadow,
                 "Buffer" => {
-                    let element = args
-                        .iter()
-                        .find_map(|arg| match arg {
-                            TypeArg::Type(inner) => {
-                                lower_type_expr(inner, ctx, generic_params, type_subst)
-                            }
-                            TypeArg::NamedExpr { .. } => None,
-                        })
-                        .unwrap_or_else(|| ctx.types.alloc(Type::Void));
+                    let element = args.iter().find_map(|arg| match arg {
+                        TypeArg::Type(inner) => {
+                            lower_type_expr(inner, ctx, generic_params, type_subst)
+                        }
+                        TypeArg::NamedExpr { .. } => None,
+                    })?;
                     Type::Buffer { element }
                 }
                 "RWBuffer" => {
-                    let element = args
-                        .iter()
-                        .find_map(|arg| match arg {
-                            TypeArg::Type(inner) => {
-                                lower_type_expr(inner, ctx, generic_params, type_subst)
-                            }
-                            TypeArg::NamedExpr { .. } => None,
-                        })
-                        .unwrap_or_else(|| ctx.types.alloc(Type::Void));
+                    let element = args.iter().find_map(|arg| match arg {
+                        TypeArg::Type(inner) => {
+                            lower_type_expr(inner, ctx, generic_params, type_subst)
+                        }
+                        TypeArg::NamedExpr { .. } => None,
+                    })?;
                     Type::RwBuffer { element }
                 }
                 "AccelerationStructure" | "AccelStruct" => Type::AccelStruct,
@@ -9011,13 +9859,31 @@ fn lower_type_expr(
                         use_kind,
                     }
                 }
-                _ => return None,
+                _ => {
+                    if let Some(diags) = ctx.diags.as_deref_mut() {
+                        diags.push(Diagnostic::error(
+                            "E0205",
+                            format!("unknown type `{name}`"),
+                            *span,
+                        ));
+                    }
+                    return None;
+                }
             };
             Some(ctx.types.alloc(resolved))
         }
         TypeExpr::Array { element, len, span } => {
             let elem_id = lower_type_expr(element, ctx, generic_params, type_subst)?;
-            let count = parse_u32_lit(Some(len))?;
+            let Some(count) = parse_u32_lit(Some(len)) else {
+                if let Some(diags) = ctx.diags.as_deref_mut() {
+                    diags.push(Diagnostic::error(
+                        "E0205",
+                        "array length must be an integer literal representable as u32",
+                        len.span(),
+                    ));
+                }
+                return None;
+            };
             if count == 0 {
                 if let Some(diags) = ctx.diags.as_deref_mut() {
                     diags.push(Diagnostic::error(
@@ -11009,6 +11875,389 @@ mod tests {
         let codes: Vec<&str> = diags.as_slice().iter().map(|d| d.code.as_str()).collect();
         assert!(codes.contains(&"E0263"), "expected E0263: {diags:?}");
         assert!(codes.contains(&"E0265"), "expected E0265: {diags:?}");
+    }
+
+    #[test]
+    fn validates_ray_handle_method_signatures_and_accessor_types() {
+        let source = r"
+            #[cap(ray_query, position_fetch)]
+            @stage(compute(1, 1, 1))
+            fn accessors(scene: AccelerationStructure) {
+                let mut rq: RayQuery;
+                rq.initialize(scene, 0u, 255u, vec3(0.0), 0.01, vec3(1.0), 10.0);
+                let id: u32 = rq.candidate_instance_id();
+                let custom: u32 = rq.candidate_instance_custom_index();
+                let primitive: u32 = rq.candidate_primitive_index();
+                let geometry: u32 = rq.candidate_geometry_index();
+                let sbt: u32 = rq.candidate_sbt_record_offset();
+                let committed_sbt: u32 = rq.committed_sbt_record_offset();
+                let transform: mat4x3 = rq.candidate_object_to_world();
+                let inverse: mat4x3 = rq.candidate_world_to_object();
+                let front: bool = rq.candidate_front_face();
+                let bary: vec2 = rq.candidate_barycentrics();
+                let opaque: bool = rq.candidate_aabb_opaque();
+                let flags: u32 = rq.ray_flags();
+                let tmin: f32 = rq.ray_tmin();
+                let origin: vec3 = rq.world_ray_origin();
+                let direction: vec3 = rq.world_ray_direction();
+                let candidate_origin: vec3 = rq.candidate_object_ray_origin();
+                let candidate_direction: vec3 = rq.candidate_object_ray_direction();
+                let committed_origin: vec3 = rq.committed_object_ray_origin();
+                let committed_direction: vec3 = rq.committed_object_ray_direction();
+                let positions: [vec3; 3] = rq.committed_triangle_vertex_positions();
+            }
+        ";
+        let parsed = parse_source(FileId(0), source);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (_, diags) = lower_unit(
+            &parsed.unit,
+            RenderTier::Tier3PathTracing,
+            HardwareCaps::all(),
+        );
+        assert!(!diags.has_errors(), "{diags:?}");
+
+        let invalid = [
+            (
+                "#[cap(ray_query)] fn bad() { let mut rq: RayQuery; rq.proceed(1u); }",
+                "requires exactly 0 arguments",
+            ),
+            (
+                "#[cap(ray_query)] fn bad() { let mut rq: RayQuery; rq.generate_intersection(true); }",
+                "expected `f32`",
+            ),
+            (
+                "#[cap(ray_query)] fn bad() { let mut rq: RayQuery; rq.missing(); }",
+                "unknown method",
+            ),
+            (
+                "#[cap(ray_query)] fn bad() { let mut rq: RayQuery; rq.committed_triangle_vertex_positions(); }",
+                "requires `#[cap(position_fetch)]`",
+            ),
+            (
+                "#[cap(ser_nv)] fn bad() { let ho: HitObject; ho.record_empty(1u); }",
+                "requires exactly 0 arguments",
+            ),
+            (
+                "#[cap(ser_nv)] fn bad() { let ho: HitObject; ho.unknown(); }",
+                "unknown method",
+            ),
+        ];
+        for (source, expected) in invalid {
+            let parsed = parse_source(FileId(0), source);
+            assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+            let (_, diags) = lower_unit(
+                &parsed.unit,
+                RenderTier::Tier3PathTracing,
+                HardwareCaps::all(),
+            );
+            assert!(
+                diags
+                    .as_slice()
+                    .iter()
+                    .any(|d| d.message.contains(expected)),
+                "{source}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_composites_and_resource_types() {
+        let cases = [
+            (
+                "fn bad() { let a = [1u, 2.0]; }",
+                "array literal elements must have the same type",
+            ),
+            (
+                "struct S { a: u32, b: f32 } fn bad() { let a = S { a: 1u }; }",
+                "missing field `b`",
+            ),
+            (
+                "struct S { a: u32 } fn bad() { let a = S { a: 1u, a: 2u }; }",
+                "duplicate field `a`",
+            ),
+            (
+                "struct S { a: u32 } fn bad() { let a = S { a: 1.0 }; }",
+                "mismatched type for field",
+            ),
+            (
+                "struct S { a: u32 } fn bad(s: S) { let a = s.unknown; }",
+                "unknown field",
+            ),
+            ("fn bad(x: UnknownType) {}", "unknown type"),
+            ("fn bad(x: Texture2D<vec3>) {}", "requires a sample type"),
+            (
+                "fn bad(x: RWImage2D<unknown_format>) {}",
+                "supported storage image format",
+            ),
+            ("fn bad(x: Buffer) {}", "requires exactly one element type"),
+            (
+                "#[cap(ray_query)] fn bad() { let x: ptr<RayQuery>; }",
+                "standalone function-local variable",
+            ),
+            ("fn bad(p: ptr<u32>) { p.store(1u); }", "read-only pointer"),
+            (
+                "fn bad(p: ptr_mut<u32>) { p.store(1.0); }",
+                "argument type mismatch",
+            ),
+            (
+                "fn bad(p: ptr<u32>) { p.offset(1.0); }",
+                "requires an integer scalar index",
+            ),
+            (
+                "fn bad(p: ptr<u32>) { p.load(1u); }",
+                "requires exactly 0 arguments",
+            ),
+        ];
+        for (source, expected) in cases {
+            let parsed = parse_source(FileId(0), source);
+            assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+            let (_, diags) = lower_unit(
+                &parsed.unit,
+                RenderTier::Tier3PathTracing,
+                HardwareCaps::all(),
+            );
+            assert!(
+                diags
+                    .as_slice()
+                    .iter()
+                    .any(|d| d.message.contains(expected)),
+                "{source}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_generic_type_inference_and_explicit_arity() {
+        let cases = [
+            (
+                "fn take<T>(x: u32) {} fn bad() { take(1u); }",
+                "cannot infer all generic type arguments",
+            ),
+            (
+                "fn take<T>(x: T) {} fn bad() { take::<u32, f32>(1u); }",
+                "expects 1 generic type argument",
+            ),
+        ];
+        for (source, expected) in cases {
+            let parsed = parse_source(FileId(0), source);
+            assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+            let (_, diags) = lower_unit(
+                &parsed.unit,
+                RenderTier::Tier3PathTracing,
+                HardwareCaps::all(),
+            );
+            assert!(
+                diags
+                    .as_slice()
+                    .iter()
+                    .any(|d| d.message.contains(expected)),
+                "{source}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_rt_intrinsics_and_atomic_options() {
+        let cases = [
+            (
+                "@stage(compute(1, 1, 1)) fn bad() { terminate_ray(); }",
+                "not allowed",
+            ),
+            (
+                "@intersection fn bad() { report_intersection(true, 0u); }",
+                "expected `f32`",
+            ),
+            (
+                "@any_hit fn bad() { ignore_intersection(0u); }",
+                "requires exactly 0 arguments",
+            ),
+            (
+                "@raygen fn bad() { reorder_thread_with_hint(0u, 1u); }",
+                "requires `#[cap(ser_nv)]`",
+            ),
+            (
+                "#[cap(ser_ext)] @raygen fn bad() { reorder_thread_with_hit_object(0u); }",
+                "requires a HitObject variable",
+            ),
+            (
+                "fn bad(p: ptr_mut<u32>) { atomic_add::<Scope::Device, Scope::Workgroup>(p, 1u); }",
+                "duplicate atomic scope or order",
+            ),
+        ];
+        for (source, expected) in cases {
+            let parsed = parse_source(FileId(0), source);
+            assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+            let (_, diags) = lower_unit(
+                &parsed.unit,
+                RenderTier::Tier3PathTracing,
+                HardwareCaps::all(),
+            );
+            assert!(
+                diags
+                    .as_slice()
+                    .iter()
+                    .any(|d| d.message.contains(expected)),
+                "{source}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_shader_numeric_literal_ranges() {
+        let good = r"
+            const MIN_I32: i32 = -2147483648;
+            const MIN_I64: i64 = -9223372036854775808i64;
+            #[cap(float16)]
+            fn good() {
+                let a: i32 = 2147483647;
+                let b: i32 = 0xffffffff;
+                let c: u32 = 4294967295u;
+                let d: u64 = 18446744073709551615u64;
+                let e: f32 = 3.4028234e38;
+                let f: f16 = 65504f16;
+            }
+        ";
+        let parsed = parse_source(FileId(0), good);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (_, diags) = lower_unit(
+            &parsed.unit,
+            RenderTier::Tier3PathTracing,
+            HardwareCaps::all(),
+        );
+        assert!(!diags.has_errors(), "{diags:?}");
+        for literal in [
+            "2147483648",
+            "4294967296",
+            "-2147483649",
+            "9223372036854775808i64",
+            "-9223372036854775809i64",
+            "0x100000000",
+            "1e39",
+            "65520f16",
+        ] {
+            let source = format!("#[cap(float16)] fn bad() {{ let x = {literal}; }}");
+            let parsed = parse_source(FileId(0), &source);
+            assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+            let (_, diags) = lower_unit(
+                &parsed.unit,
+                RenderTier::Tier3PathTracing,
+                HardwareCaps::all(),
+            );
+            assert!(
+                diags
+                    .as_slice()
+                    .iter()
+                    .any(|d| d.message.contains("out of range")),
+                "{source}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_math_and_subgroup_intrinsic_signatures_and_types() {
+        let good = r"
+            fn good(v: vec3) {
+                let a: vec3 = min(0.5, v);
+                let b: vec3 = sin(v);
+                let c: vec3 = atan2(0.5, v);
+                let d: f32 = dot(v, v);
+                let e: uvec4 = subgroup_ballot(true);
+                let f: u32 = subgroup_ballot_bit_count(e);
+                let g: bool = subgroup_any(true);
+            }
+        ";
+        let parsed = parse_source(FileId(0), good);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (_, diags) = lower_unit(
+            &parsed.unit,
+            RenderTier::Tier3PathTracing,
+            HardwareCaps::all(),
+        );
+        assert!(!diags.has_errors(), "{diags:?}");
+        for expression in [
+            "sin()",
+            "sqrt(1u)",
+            "cross(vec2(1.0), vec2(1.0))",
+            "dot(vec2(1.0), vec3(1.0))",
+            "min(vec2(1.0), vec3(1.0))",
+            "subgroup_ballot(1u)",
+            "subgroup_elect(true)",
+            "subgroup_ballot_bit_extract(uvec4(1u))",
+        ] {
+            let source = format!("fn bad() {{ let x = {expression}; }}");
+            let parsed = parse_source(FileId(0), &source);
+            assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+            let (_, diags) = lower_unit(
+                &parsed.unit,
+                RenderTier::Tier3PathTracing,
+                HardwareCaps::all(),
+            );
+            assert!(
+                diags.as_slice().iter().any(|d| d.code == "E0274"),
+                "{source}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn infers_generic_struct_literals_and_checks_generic_arguments() {
+        let good = r"
+            struct Box<T> { value: T }
+            fn make() -> Box<u32> { Box { value: 1u } }
+        ";
+        let parsed = parse_source(FileId(0), good);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let (hir, diags) = lower_unit(
+            &parsed.unit,
+            RenderTier::Tier3PathTracing,
+            HardwareCaps::all(),
+        );
+        assert!(!diags.has_errors(), "{diags:?}");
+        let value = hir
+            .find_function("make")
+            .unwrap()
+            .body_hir
+            .as_ref()
+            .unwrap()
+            .tail_expr
+            .as_ref()
+            .unwrap();
+        assert!(
+            matches!(&value.kind, HirExprKind::StructLit { struct_name, .. } if struct_name == "Box<u32>")
+        );
+        for (source, expected) in [
+            (
+                "struct Box<T> { value: T } fn bad() -> Box<u32> { Box { value: 1.0 } }",
+                "return type mismatch",
+            ),
+            (
+                "fn take<T>(x: T) {} fn bad() { take::<wrong = 1>(1u); }",
+                "invalid generic type arguments",
+            ),
+            (
+                "fn take(x: u32) {} fn bad() { take::<u32>(1u); }",
+                "does not accept generic type arguments",
+            ),
+            (
+                "fn bad() { let x: [u32; 4294967296]; }",
+                "array length must be an integer literal representable as u32",
+            ),
+        ] {
+            let parsed = parse_source(FileId(0), source);
+            assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+            let (_, diags) = lower_unit(
+                &parsed.unit,
+                RenderTier::Tier3PathTracing,
+                HardwareCaps::all(),
+            );
+            assert!(
+                diags
+                    .as_slice()
+                    .iter()
+                    .any(|d| d.message.contains(expected)),
+                "{source}: {diags:?}"
+            );
+        }
     }
 
     #[test]

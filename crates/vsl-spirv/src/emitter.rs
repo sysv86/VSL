@@ -3,8 +3,8 @@ use vsl_ir::{
     AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixScalar, GlslStd450Op, InstData, InstId,
     IrDescriptorVar, IrFunction, IrInterlockMode, IrInterpolation, IrModule, IrPushConstantBlock,
     IrStorageClass, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology, IrType,
-    IrWorkgroupVar, LayoutKind, ScalarIrTy, SpecConstantOpKind, StructuredStmt,
-    SubgroupClusteredOp,
+    IrWorkgroupVar, LayoutKind, RayQueryIntersectionProperty, RayQueryRead, ScalarIrTy,
+    SpecConstantOpKind, StructuredStmt, SubgroupClusteredOp,
 };
 use vsl_mc::{
     DescriptorAccess, DescriptorKind, HardwareCaps, ImageFormat, SampleScalar, ShaderStage,
@@ -1705,7 +1705,8 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
                 | InstData::RayQueryCommittedObjectToWorld(_)
                 | InstData::RayQueryCommittedWorldToObject(_)
                 | InstData::RayQueryCommittedFrontFace(_)
-                | InstData::RayQueryCommittedBarycentrics(_) => {
+                | InstData::RayQueryCommittedBarycentrics(_)
+                | InstData::RayQueryRead { .. } => {
                     uses_ray_query = true;
                 }
                 _ => {}
@@ -3216,6 +3217,9 @@ struct LoopFrame {
     merge_phis: Vec<InstId>,
     next_break_tag: u32,
     break_preds: Vec<(u32, u32)>,
+    continue_phis: Vec<InstId>,
+    next_continue_tag: u32,
+    continue_preds: Vec<(u32, u32)>,
 }
 
 struct FnLowerCtx<'a> {
@@ -6988,6 +6992,9 @@ impl FnLowerCtx<'_> {
                     (self.emitter.emit_constant_bool(bool_ty, false), bool_ty)
                 }
             }
+            InstData::RayQueryRead { ray_query_id, read } => {
+                self.emit_ray_query_read(ray_query_id, read)
+            }
             InstData::RayQueryCommittedType(rq_id) => {
                 self.emit_ray_query_u32(rq_id, spirv::Op::RayQueryGetIntersectionTypeKHR, 1)
             }
@@ -7843,6 +7850,55 @@ impl FnLowerCtx<'_> {
         spv_id
     }
 
+    fn emit_ray_query_read(&mut self, rq_id: u32, read: RayQueryRead) -> (u32, u32) {
+        use RayQueryIntersectionProperty as P;
+        use spirv::Op;
+        let (op, intersection) = match read {
+            RayQueryRead::RayTMin => (Op::RayQueryGetRayTMinKHR, None),
+            RayQueryRead::RayFlags => (Op::RayQueryGetRayFlagsKHR, None),
+            RayQueryRead::WorldRayOrigin => (Op::RayQueryGetWorldRayOriginKHR, None),
+            RayQueryRead::WorldRayDirection => (Op::RayQueryGetWorldRayDirectionKHR, None),
+            RayQueryRead::CandidateAabbOpaque => {
+                (Op::RayQueryGetIntersectionCandidateAABBOpaqueKHR, None)
+            }
+            RayQueryRead::Intersection {
+                intersection,
+                property,
+            } => (
+                match property {
+                    P::Type => Op::RayQueryGetIntersectionTypeKHR,
+                    P::T => Op::RayQueryGetIntersectionTKHR,
+                    P::InstanceId => Op::RayQueryGetIntersectionInstanceIdKHR,
+                    P::InstanceCustomIndex => Op::RayQueryGetIntersectionInstanceCustomIndexKHR,
+                    P::SbtRecordOffset => {
+                        Op::RayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetKHR
+                    }
+                    P::GeometryIndex => Op::RayQueryGetIntersectionGeometryIndexKHR,
+                    P::PrimitiveIndex => Op::RayQueryGetIntersectionPrimitiveIndexKHR,
+                    P::Barycentrics => Op::RayQueryGetIntersectionBarycentricsKHR,
+                    P::FrontFace => Op::RayQueryGetIntersectionFrontFaceKHR,
+                    P::ObjectRayOrigin => Op::RayQueryGetIntersectionObjectRayOriginKHR,
+                    P::ObjectRayDirection => Op::RayQueryGetIntersectionObjectRayDirectionKHR,
+                    P::ObjectToWorld => Op::RayQueryGetIntersectionObjectToWorldKHR,
+                    P::WorldToObject => Op::RayQueryGetIntersectionWorldToObjectKHR,
+                },
+                Some(intersection.spirv_value()),
+            ),
+        };
+        let ty = self.emitter.emit_ir_type(&read.result_type());
+        // Every handle used by a getter is registered before function emission.
+        // Do not fabricate a zero when a lowering invariant is broken.
+        let rq_var = self.ray_query_vars[&rq_id];
+        let res = self.emitter.alloc_id();
+        let mut operands = vec![ty, res, rq_var];
+        if let Some(intersection) = intersection {
+            let u32_ty = self.u32_ty();
+            operands.push(self.emitter.emit_constant_32(u32_ty, intersection));
+        }
+        self.emitter.emit_fn_inst(op, &operands);
+        (res, ty)
+    }
+
     fn emit_ray_query_u32(&mut self, rq_id: u32, op: spirv::Op, intersection: u32) -> (u32, u32) {
         let u32_ty = self.u32_ty();
         if let Some(&rq_var) = self.ray_query_vars.get(&rq_id) {
@@ -8596,9 +8652,14 @@ impl FnLowerCtx<'_> {
     ) -> Vec<InstId> {
         let mut continuing_refs: IndexSet<InstId> = IndexSet::new();
         self.collect_all_stmt_insts(continuing, &mut continuing_refs);
-        if continuing_refs.is_empty() {
-            return Vec::new();
-        }
+        // Mem2Reg places loop header phis at the beginning of the body.
+        // A while-loop may update its carried value in the body and have an
+        // empty continuing block; requiring a reference in the latter loses
+        // the back edge and freezes the loop variable.
+        let explicit_headers: IndexSet<InstId> = body.iter()
+            .take_while(|stmt| matches!(stmt, StructuredStmt::Eval(id) if matches!(self.func.insts[*id].data, InstData::Phi { .. })))
+            .filter_map(|stmt| match stmt { StructuredStmt::Eval(id) => Some(*id), _ => None })
+            .collect();
         let mut candidate_phis = Vec::new();
         let mut seen_phis = IndexSet::new();
         let mut visited = IndexSet::new();
@@ -8628,7 +8689,7 @@ impl FnLowerCtx<'_> {
                             !self.inst_ids.contains_key(&back_inst)
                                 && continuing_refs.contains(&back_inst)
                         });
-                has_init && back_in_continuing
+                has_init && (explicit_headers.contains(&phi_id) || back_in_continuing)
             })
             .collect()
     }
@@ -9126,10 +9187,12 @@ impl FnLowerCtx<'_> {
 
         let arg_target_ty = vec_ty_hint.unwrap_or(scalar_target_ty);
         let mut spv_args = Vec::with_capacity(raw_spv_args.len());
-        for (raw, src_ty) in raw_spv_args {
+        for (index, (raw, src_ty)) in raw_spv_args.into_iter().enumerate() {
             if op == GlslStd450Op::Cross {
                 let v3_ty = self.emitter.emit_type_vector(f32_ty, 3);
                 spv_args.push(self.coerce_to_ty(raw, src_ty, v3_ty));
+            } else if op == GlslStd450Op::Refract && index == 2 {
+                spv_args.push(self.coerce_to_ty(raw, src_ty, scalar_target_ty));
             } else {
                 spv_args.push(self.coerce_to_ty(raw, src_ty, arg_target_ty));
             }
@@ -9197,6 +9260,7 @@ impl FnLowerCtx<'_> {
             GlslStd450Op::Cross => 68,
             GlslStd450Op::Normalize => 69,
             GlslStd450Op::Reflect => 71,
+            GlslStd450Op::Refract => 72,
             GlslStd450Op::FindILsb => 73,
             GlslStd450Op::FindSMsb => 74,
             GlslStd450Op::FindUMsb => 75,
@@ -9631,18 +9695,38 @@ impl FnLowerCtx<'_> {
                         merge_phis: merge_phis.clone(),
                         next_break_tag: 0,
                         break_preds: Vec::new(),
+                        continue_phis: continuing.iter().take_while(|stmt| matches!(stmt, StructuredStmt::Eval(id) if matches!(self.func.insts[*id].data, InstData::Phi { .. }))).filter_map(|stmt| match stmt { StructuredStmt::Eval(id) => Some(*id), _ => None }).collect(),
+                        next_continue_tag: 1,
+                        continue_preds: Vec::new(),
                     });
 
                     self.current_label = body_label;
                     self.current_block_preds = vec![(0, header_label)];
                     self.emitter.emit_fn_inst(spirv::Op::Label, &[body_label]);
                     if !self.emit_stmts(body) {
+                        let phis = self
+                            .loop_stack
+                            .last()
+                            .expect("loop frame")
+                            .continue_phis
+                            .clone();
+                        self.prematerialize_phi_inputs(&phis, 0);
+                        self.loop_stack
+                            .last_mut()
+                            .expect("loop frame")
+                            .continue_preds
+                            .push((0, self.current_label));
                         self.emitter
                             .emit_fn_inst(spirv::Op::Branch, &[continue_label]);
                     }
 
                     self.current_label = continue_label;
-                    self.current_block_preds = vec![(0, body_label)];
+                    self.current_block_preds = self
+                        .loop_stack
+                        .last()
+                        .expect("loop frame")
+                        .continue_preds
+                        .clone();
                     self.emitter
                         .emit_fn_inst(spirv::Op::Label, &[continue_label]);
                     if self.emit_stmts(continuing) {
@@ -9714,8 +9798,17 @@ impl FnLowerCtx<'_> {
                     }
                 }
                 StructuredStmt::Continue => {
-                    if let Some(frame) = self.loop_stack.last() {
+                    if let Some(frame) = self.loop_stack.last_mut() {
                         let continue_label = frame.continue_label;
+                        let tag = frame.next_continue_tag;
+                        frame.next_continue_tag += 1;
+                        let phis = frame.continue_phis.clone();
+                        self.prematerialize_phi_inputs(&phis, tag);
+                        self.loop_stack
+                            .last_mut()
+                            .expect("loop frame")
+                            .continue_preds
+                            .push((tag, self.current_label));
                         self.emitter
                             .emit_fn_inst(spirv::Op::Branch, &[continue_label]);
                         terminated = true;
@@ -9875,7 +9968,8 @@ fn emit_function_body(
             | InstData::RayQueryCommittedWorldToObject(ray_query_id)
             | InstData::RayQueryCommittedFrontFace(ray_query_id)
             | InstData::RayQueryCommittedBarycentrics(ray_query_id)
-            | InstData::RayQueryTriangleVertexPositions { ray_query_id, .. } => {
+            | InstData::RayQueryTriangleVertexPositions { ray_query_id, .. }
+            | InstData::RayQueryRead { ray_query_id, .. } => {
                 rq_ids.insert(ray_query_id);
             }
             _ => {}
