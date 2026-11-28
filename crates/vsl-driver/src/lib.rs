@@ -2435,6 +2435,38 @@ mod tests {
     }
 
     #[test]
+    fn ray_query_inferred_intersection_types_validate() {
+        compile_standalone_and_validate(
+            "ray_query_inferred_types",
+            r"
+            #[cap(ray_query)]
+            @stage(compute(1, 1, 1))
+            fn query_main(
+                #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+            ) {
+                let rq: RayQuery;
+                rq.initialize(tlas, 0u, 255u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0);
+                while rq.proceed() {
+                    let candidate = rq.candidate_type();
+                    if candidate == 0u {
+                        rq.confirm_intersection();
+                    }
+                }
+                if rq.committed_type() == 1u {
+                    let front = rq.committed_front_face();
+                    let distance = rq.committed_t();
+                    let transform = rq.committed_object_to_world();
+                    if front && distance > 0.0 && transform[0].x > 0.0 {
+                        rq.terminate();
+                    }
+                }
+            }
+            ",
+            false,
+        );
+    }
+
+    #[test]
     fn e2e_vulkan14_stages_rt_mesh_task_geom_tess() {
         // 1. RT Pipeline stages: raygen, closest_hit, any_hit, miss, intersection, callable
         compile_standalone_and_validate(

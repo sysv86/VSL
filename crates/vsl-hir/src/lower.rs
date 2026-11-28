@@ -7542,13 +7542,20 @@ impl BodyScanner<'_, '_> {
 
 fn infer_rayquery_method_return(method: &str, types: &mut TypeArena) -> Option<TypeId> {
     let ty = match method {
-        "proceed" => Type::Scalar(ScalarKind::Bool),
+        "initialize" | "confirm_intersection" | "terminate" | "generate_intersection" => Type::Void,
+        "proceed" | "committed_front_face" => Type::Scalar(ScalarKind::Bool),
         "committed_type"
+        | "candidate_type"
         | "committed_instance_custom_index"
         | "committed_instance_id"
         | "committed_primitive_index"
         | "committed_geometry_index" => Type::Scalar(ScalarKind::U32),
-        "committed_t" => Type::Scalar(ScalarKind::F32),
+        "committed_t" | "candidate_t" => Type::Scalar(ScalarKind::F32),
+        "committed_object_to_world" | "committed_world_to_object" => Type::Matrix {
+            scalar: ScalarKind::F32,
+            cols: 4,
+            rows: 3,
+        },
         "committed_barycentrics" => Type::Vector {
             scalar: ScalarKind::F32,
             len: 2,

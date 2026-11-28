@@ -2325,8 +2325,33 @@ fn emit_method_call_expr_with_hoist(
         ),
         "proceed" => format!("rayQueryProceedEXT({recv})"),
         "committed_type" => format!("rayQueryGetIntersectionTypeEXT({recv}, true)"),
+        "candidate_type" => format!("rayQueryGetIntersectionTypeEXT({recv}, false)"),
+        "confirm_intersection" => format!("rayQueryConfirmIntersectionEXT({recv})"),
+        "terminate" => format!("rayQueryTerminateEXT({recv})"),
+        "generate_intersection" => format!(
+            "rayQueryGenerateIntersectionEXT({recv}, {})",
+            rendered_args.join(", ")
+        ),
+        "committed_t" => format!("rayQueryGetIntersectionTEXT({recv}, true)"),
+        "candidate_t" => format!("rayQueryGetIntersectionTEXT({recv}, false)"),
+        "committed_instance_id" => {
+            format!("uint(rayQueryGetIntersectionInstanceIdEXT({recv}, true))")
+        }
+        "committed_primitive_index" => {
+            format!("uint(rayQueryGetIntersectionPrimitiveIndexEXT({recv}, true))")
+        }
+        "committed_geometry_index" => {
+            format!("uint(rayQueryGetIntersectionGeometryIndexEXT({recv}, true))")
+        }
+        "committed_object_to_world" => {
+            format!("rayQueryGetIntersectionObjectToWorldEXT({recv}, true)")
+        }
+        "committed_world_to_object" => {
+            format!("rayQueryGetIntersectionWorldToObjectEXT({recv}, true)")
+        }
+        "committed_front_face" => format!("rayQueryGetIntersectionFrontFaceEXT({recv}, true)"),
         "committed_instance_custom_index" => {
-            format!("rayQueryGetIntersectionInstanceCustomIndexEXT({recv}, true)")
+            format!("uint(rayQueryGetIntersectionInstanceCustomIndexEXT({recv}, true))")
         }
         "committed_barycentrics" => {
             format!("rayQueryGetIntersectionBarycentricsEXT({recv}, true)")
@@ -2592,9 +2617,19 @@ fn infer_glsl_type(expr: &Expr, ctx: &EmitCtx) -> String {
                     .get(&recv_ty)
                     .map_or_else(|| "vec4".to_owned(), |b| b.elem_glsl.clone()),
                 "fetch" | "sample" | "sample_lod" => "vec4".to_owned(),
-                "committed_type" | "committed_instance_custom_index" => "uint".to_owned(),
+                "committed_type"
+                | "candidate_type"
+                | "committed_instance_custom_index"
+                | "committed_instance_id"
+                | "committed_primitive_index"
+                | "committed_geometry_index" => "uint".to_owned(),
+                "committed_object_to_world" | "committed_world_to_object" => "mat4x3".to_owned(),
+                "committed_t" | "candidate_t" => "float".to_owned(),
+                "initialize" | "confirm_intersection" | "terminate" | "generate_intersection" => {
+                    "void".to_owned()
+                }
                 "committed_barycentrics" => "vec2".to_owned(),
-                "proceed" => "bool".to_owned(),
+                "proceed" | "committed_front_face" => "bool".to_owned(),
                 other => {
                     let mangled = format!("{recv_ty}_{other}");
                     ctx.fn_returns
