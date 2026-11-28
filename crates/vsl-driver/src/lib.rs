@@ -2435,6 +2435,74 @@ mod tests {
     }
 
     #[test]
+    fn rt_calls_require_matching_interface_storage_classes() {
+        let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
+        opts.abi = AbiProfile::Standalone;
+        opts.active_caps = HardwareCaps::all();
+        let cases = [
+            (
+                "trace_wrong_payload",
+                "trace_ray(tlas, 0u, 255u, 0u, 0u, 0u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0, data);",
+                "requires a ray payload stage variable",
+            ),
+            (
+                "trace_wrong_acceleration_structure",
+                "trace_ray(0u, 0u, 255u, 0u, 0u, 0u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0, payload);",
+                "requires a bound acceleration structure",
+            ),
+            (
+                "callable_wrong_payload",
+                "execute_callable(0u, payload);",
+                "requires a callable data stage variable",
+            ),
+            (
+                "callable_missing_payload",
+                "execute_callable(0u);",
+                "requires exactly 2 arguments",
+            ),
+            (
+                "hit_object_wrong_payload",
+                "let ho: HitObject; ho.execute_shader(data);",
+                "requires a ray payload stage variable",
+            ),
+        ];
+        for (label, body, message) in cases {
+            let src = format!(
+                r"#[cap(shader_invocation_reorder)]
+                @raygen
+                fn rgen(
+                    #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+                    #[ray_payload(0)] payload: vec4,
+                    #[callable_data(1)] data: vec4,
+                ) {{ {body} }}"
+            );
+            let mut compiler = VslCompiler::new();
+            let out = compiler.compile_shader_source(format!("{label}.vsl"), &src, &opts);
+            assert!(out.has_errors(), "{label} unexpectedly compiled");
+            assert!(
+                out.diagnostics.iter().any(|d| d.message.contains(message)),
+                "{label}: {:?}",
+                out.diagnostics
+            );
+        }
+
+        compile_standalone_and_validate(
+            "callable_valid_storage",
+            r"
+            @raygen
+            fn rgen(#[ray_payload(0)] payload: vec4, #[callable_data(1)] data: vec4) {
+                execute_callable(0u, data);
+            }
+            @callable
+            fn callee(#[incoming_callable_data(1)] data: vec4) {
+                execute_callable(1u, data);
+            }
+            ",
+            false,
+        );
+    }
+
+    #[test]
     fn ray_query_inferred_intersection_types_validate() {
         compile_standalone_and_validate(
             "ray_query_inferred_types",

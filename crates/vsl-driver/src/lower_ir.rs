@@ -3664,6 +3664,29 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             .copied()
     }
 
+    fn resolve_rt_acceleration_structure(&self, expr: &HirExpr) -> Option<u32> {
+        let HirExprKind::Path { path, .. } = &expr.kind else {
+            return None;
+        };
+        let index = self.resolve_descriptor_path(path).or_else(|| {
+            (path == "mc::tlas")
+                .then_some(self.tlas_descriptor_index)
+                .flatten()
+        })?;
+        (self.ir_fn.descriptors.get(index as usize)?.kind == DescriptorKind::AccelerationStructure)
+            .then_some(index)
+    }
+
+    fn resolve_rt_stage_variable(&self, expr: &HirExpr, storage: &[IrStorageClass]) -> Option<u32> {
+        let HirExprKind::Path { path, .. } = &expr.kind else {
+            return None;
+        };
+        let index = *self.stage_var_indices.get(path.as_str())?;
+        storage
+            .contains(&self.ir_fn.stage_vars.get(index as usize)?.storage)
+            .then_some(index)
+    }
+
     /// Emits `DescriptorAccessChain` + typed `DescriptorLoad` (and `CompositeConstruct` for
     /// vectors/matrices) using exact [`BuiltinStructDesc`] field index and byte offset.
     fn emit_builtin_struct_field_load(
@@ -4523,17 +4546,33 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 return Ok(id);
             }
             "trace_ray" => {
-                let tlas_desc = args
-                    .first()
-                    .and_then(|a| {
-                        if let HirExprKind::Path { path, .. } = &a.value.kind {
-                            self.descriptor_indices.get(path.as_str()).copied()
-                        } else {
-                            None
-                        }
-                    })
-                    .or(self.tlas_descriptor_index)
-                    .unwrap_or(0);
+                if args.len() != 11 {
+                    return Err(self.emit_diag(
+                        "E0528",
+                        "`trace_ray` requires exactly 11 arguments",
+                        span,
+                    ));
+                }
+                let Some(tlas_desc) = self.resolve_rt_acceleration_structure(&args[0].value) else {
+                    return Err(self.emit_diag(
+                        "E0525",
+                        "`trace_ray` requires a bound acceleration structure",
+                        span,
+                    ));
+                };
+                let Some(payload_var_index) = self.resolve_rt_stage_variable(
+                    &args[10].value,
+                    &[
+                        IrStorageClass::RayPayloadKhr,
+                        IrStorageClass::IncomingRayPayloadKhr,
+                    ],
+                ) else {
+                    return Err(self.emit_diag(
+                        "E0525",
+                        "`trace_ray` requires a ray payload stage variable",
+                        span,
+                    ));
+                };
                 let ray_flags = self.require_arg(args, 1, joined, span, out)?;
                 let cull_mask = self.require_arg(args, 2, joined, span, out)?;
                 let sbt_offset = self.require_arg(args, 3, joined, span, out)?;
@@ -4543,16 +4582,6 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let t_min = self.require_arg(args, 7, joined, span, out)?;
                 let direction = self.require_arg(args, 8, joined, span, out)?;
                 let t_max = self.require_arg(args, 9, joined, span, out)?;
-                let payload_var_index = args
-                    .get(10)
-                    .and_then(|a| {
-                        if let HirExprKind::Path { path, .. } = &a.value.kind {
-                            self.stage_var_indices.get(path.as_str()).copied()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
                 let id = self.ir_fn.emit_typed(
                     IrType::Void,
                     InstData::TraceRayKhr {
@@ -4597,17 +4626,27 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 return Ok(id);
             }
             "execute_callable" => {
+                if args.len() != 2 {
+                    return Err(self.emit_diag(
+                        "E0528",
+                        "`execute_callable` requires exactly 2 arguments",
+                        span,
+                    ));
+                }
+                let Some(callable_var_index) = self.resolve_rt_stage_variable(
+                    &args[1].value,
+                    &[
+                        IrStorageClass::CallableDataKhr,
+                        IrStorageClass::IncomingCallableDataKhr,
+                    ],
+                ) else {
+                    return Err(self.emit_diag(
+                        "E0525",
+                        "`execute_callable` requires a callable data stage variable",
+                        span,
+                    ));
+                };
                 let sbt_index = self.require_arg(args, 0, joined, span, out)?;
-                let callable_var_index = args
-                    .get(1)
-                    .and_then(|a| {
-                        if let HirExprKind::Path { path, .. } = &a.value.kind {
-                            self.stage_var_indices.get(path.as_str()).copied()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
                 let id = self.ir_fn.emit_typed(
                     IrType::Void,
                     InstData::ExecuteCallableKhr {
@@ -6673,19 +6712,35 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         let hit_object_id = self.hit_object_id_for_receiver(receiver);
         let id = match method {
             "trace_ray" => {
-                if args.len() < 11 {
+                if args.len() != 11 {
                     return Some(self.emit_diag(
                         "E0528",
                         "`HitObject::trace_ray` requires 11 arguments",
                         span,
                     ));
                 }
-                let tlas_descriptor_index = match &args[0].value.kind {
-                    HirExprKind::Path { path, .. } => self.resolve_descriptor_path(path),
-                    _ => None,
-                }
-                .or(self.tlas_descriptor_index)
-                .unwrap_or(0);
+                let Some(tlas_descriptor_index) =
+                    self.resolve_rt_acceleration_structure(&args[0].value)
+                else {
+                    return Some(self.emit_diag(
+                        "E0525",
+                        "`HitObject::trace_ray` requires a bound acceleration structure",
+                        span,
+                    ));
+                };
+                let Some(payload_var_index) = self.resolve_rt_stage_variable(
+                    &args[10].value,
+                    &[
+                        IrStorageClass::RayPayloadKhr,
+                        IrStorageClass::IncomingRayPayloadKhr,
+                    ],
+                ) else {
+                    return Some(self.emit_diag(
+                        "E0525",
+                        "`HitObject::trace_ray` requires a ray payload stage variable",
+                        span,
+                    ));
+                };
                 let ray_flags = self.lower_expr(&args[1].value, out);
                 let cull_mask = self.lower_expr(&args[2].value, out);
                 let sbt_offset = self.lower_expr(&args[3].value, out);
@@ -6695,13 +6750,6 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 let t_min = self.lower_expr(&args[7].value, out);
                 let direction = self.lower_expr(&args[8].value, out);
                 let t_max = self.lower_expr(&args[9].value, out);
-                let payload_var_index = match &args[10].value.kind {
-                    HirExprKind::Path { path, .. } => {
-                        self.stage_var_indices.get(path.as_str()).copied()
-                    }
-                    _ => None,
-                }
-                .unwrap_or(0);
                 let id = self.ir_fn.emit_typed(
                     IrType::Void,
                     InstData::HitObjectTraceRay {
@@ -6742,16 +6790,26 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 InstData::HitObjectGetSbtRecordIndex(hit_object_id),
             ),
             "execute_shader" => {
-                let payload_var_index = args
-                    .first()
-                    .and_then(|a| {
-                        if let HirExprKind::Path { path, .. } = &a.value.kind {
-                            self.stage_var_indices.get(path.as_str()).copied()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
+                if args.len() != 1 {
+                    return Some(self.emit_diag(
+                        "E0528",
+                        "`HitObject::execute_shader` requires exactly 1 argument",
+                        span,
+                    ));
+                }
+                let Some(payload_var_index) = self.resolve_rt_stage_variable(
+                    &args[0].value,
+                    &[
+                        IrStorageClass::RayPayloadKhr,
+                        IrStorageClass::IncomingRayPayloadKhr,
+                    ],
+                ) else {
+                    return Some(self.emit_diag(
+                        "E0525",
+                        "`HitObject::execute_shader` requires a ray payload stage variable",
+                        span,
+                    ));
+                };
                 let id = self.ir_fn.emit_typed(
                     IrType::Void,
                     InstData::HitObjectExecuteShader {
@@ -6784,18 +6842,16 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
         let ray_query_id = self.ray_query_id_for_receiver(receiver);
         let id = match method {
             "initialize" => {
-                if args.len() < 7 {
+                if args.len() != 7 {
                     return Some(self.emit_diag(
                         "E0528",
                         "`RayQuery::initialize` requires 7 arguments",
                         span,
                     ));
                 }
-                let Some(tlas_descriptor_index) = match &args[0].value.kind {
-                    HirExprKind::Path { path, .. } => self.resolve_descriptor_path(path),
-                    _ => None,
-                }
-                .or(self.tlas_descriptor_index) else {
+                let Some(tlas_descriptor_index) =
+                    self.resolve_rt_acceleration_structure(&args[0].value)
+                else {
                     return Some(self.emit_diag(
                         "E0525",
                         "`RayQuery::initialize` requires a bound acceleration structure (`mc::tlas`)",
