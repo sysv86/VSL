@@ -1,0 +1,22 @@
+
+@raygen
+fn rgen(
+    #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+    #[binding(set = 0, binding = 1)] result: RWBuffer<u32>,
+    #[builtin(launch_id)] lid: uvec3,
+    #[ray_payload(0)] inout payload: u32,
+) {
+    payload = 999u;
+    let origin = vec3(f32(lid.x) * 4.0, 0.0, 0.0);
+    let direction = vec3(0.0, 0.0, 1.0);
+    trace_ray(tlas, 0u, 255u, 0u, 0u, 0u, origin, 0.001, direction, 100.0, payload);
+    result[lid.x] = payload;
+}
+@closest_hit
+fn rchit(#[incoming_ray_payload(0)] inout payload: u32, #[builtin(ray_tmax)] t: f32) {
+    payload = u32(t * 100.0) + 1u;
+}
+@miss
+fn rmiss(#[incoming_ray_payload(0)] inout payload: u32) {
+    payload = 0u;
+}

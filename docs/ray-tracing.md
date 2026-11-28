@@ -134,10 +134,28 @@ triangle coordinates (1531 for a hit and 0 for a miss). This regression
 exposed a local-array read incorrectly hoisted ahead of its guarded store;
 the emitter now treats local loads as order-sensitive.
 
-Those host programs were temporary development fixtures, not part of the
-compiler or the example validation script. Actual micromap construction and
-traversal and performance benchmarking were not covered by those GPU tests.
-OMM shader generation was checked through SPIRV-Tools and the GLSL oracle.
+KHR opacity micromap execution was checked with actual micromap acceleration
+structures, using the KHR extension without enabling the legacy EXT extension.
+A two-state, level-zero micromap produced `[0, 0]` for transparent geometry
+and `[501, 0]` for opaque geometry in both the native and GLSL backends.
+
+Slang 2026.23 was also used as an independent compiler for equivalent inline
+ray-query and ray-tracing-pipeline shaders. Both Slang outputs produced the
+same `[501, 0]` result as VSL on the same GPU and scene.
+
+The differential shader sources are retained under
+`examples/rt_validation/differential`. To regenerate and validate their SPIR-V:
+
+```sh
+SLANGC=/path/to/slangc bash examples/rt_validation/differential/validate.sh
+```
+
+The optional script requires Slang, glslangValidator and SPIRV-Tools. It
+validates binaries but does not execute GPU dispatches. The development host
+programs were temporary fixtures outside the compiler workspace. Hardware
+results cover the tested RTX 3050 and scenes, not every driver, micromap
+format, subdivision level, or shader configuration. Legacy EXT micromap
+execution and performance benchmarking were not covered by these tests.
 
 ## Scope and references
 

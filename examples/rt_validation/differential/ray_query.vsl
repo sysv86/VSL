@@ -1,0 +1,18 @@
+#[cap(ray_query)]
+@stage(compute(1, 1, 1))
+fn query_main(
+    #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+    #[binding(set = 0, binding = 1)] result: RWBuffer<u32>,
+    #[builtin(global_invocation_id)] gid: uvec3,
+) {
+    let rq: RayQuery;
+    rq.initialize(tlas, 0u, 255u, vec3(f32(gid.x) * 4.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0);
+    while rq.proceed() {
+        if rq.candidate_type() == 0u { rq.confirm_intersection(); }
+    }
+    let mut value = 0u;
+    if rq.committed_type() == 1u {
+        value = u32(rq.committed_t() * 100.0) + rq.committed_primitive_index() + 1u;
+    }
+    result[gid.x] = value;
+}
