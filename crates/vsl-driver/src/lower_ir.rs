@@ -6979,6 +6979,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             }
             _ => return None,
         };
+        if self.ir_fn.insts[id].data.is_order_sensitive_read() {
+            out.push(StructuredStmt::Eval(id));
+        }
         Some(id)
     }
 
@@ -7163,6 +7166,9 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             ),
             _ => return None,
         };
+        if self.ir_fn.insts[id].data.is_order_sensitive_read() {
+            out.push(StructuredStmt::Eval(id));
+        }
         Some(id)
     }
 

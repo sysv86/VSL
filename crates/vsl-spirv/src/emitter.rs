@@ -8363,7 +8363,10 @@ impl FnLowerCtx<'_> {
             return false;
         }
         let inst = &self.func.insts[id];
-        if matches!(inst.data, InstData::Phi { .. }) || inst.has_side_effects() {
+        if matches!(inst.data, InstData::Phi { .. })
+            || inst.has_side_effects()
+            || inst.data.is_order_sensitive_read()
+        {
             return true;
         }
         for op in inst.data.operands() {

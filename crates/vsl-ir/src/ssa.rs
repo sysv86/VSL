@@ -1465,6 +1465,30 @@ pub enum InstData {
 }
 
 impl InstData {
+    /// Reads whose result depends on mutable ray traversal or shader interface state.
+    /// These may be eliminated when unused, but must not be speculated across control flow.
+    pub const fn is_order_sensitive_read(&self) -> bool {
+        matches!(
+            self,
+            Self::RayQueryCommittedType(_)
+                | Self::RayQueryCandidateType(_)
+                | Self::RayQueryCommittedT(_)
+                | Self::RayQueryCandidateT(_)
+                | Self::RayQueryCommittedInstanceId(_)
+                | Self::RayQueryCommittedInstanceCustomIndex(_)
+                | Self::RayQueryCommittedPrimitiveIndex(_)
+                | Self::RayQueryCommittedGeometryIndex(_)
+                | Self::RayQueryCommittedObjectToWorld(_)
+                | Self::RayQueryCommittedWorldToObject(_)
+                | Self::RayQueryCommittedFrontFace(_)
+                | Self::RayQueryCommittedBarycentrics(_)
+                | Self::RayQueryTriangleVertexPositions { .. }
+                | Self::HitObjectIsHit(_)
+                | Self::HitObjectGetRayTMax(_)
+                | Self::HitObjectGetSbtRecordIndex(_)
+                | Self::LoadStageVar { .. }
+        )
+    }
     /// Constructs a [`Self::ConstF32`] from an `f32` value using its IEEE-754 bit pattern.
     pub const fn const_f32(value: f32) -> Self {
         Self::ConstF32(value.to_bits())

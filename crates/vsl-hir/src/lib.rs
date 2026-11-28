@@ -15,5 +15,5 @@ pub use hir::{
 pub use lower::{PackSchema, lower_unit, lower_unit_with_schema, lower_unit_with_schema_and_abi};
 pub use module::{L1ModuleHash, L2ArtifactHash, ModuleGraph, ModuleGraphError, ModuleId};
 pub use ty::{CoopMatScalar, LayoutKind, ScalarKind, StructLayout, Type, TypeArena, TypeId};
-pub use validate::{ValidationSummary, validate_unit};
+pub use validate::{ValidationSummary, validate_unit, validate_unit_with_abi};
 pub use vsl_mc::AbiProfile;

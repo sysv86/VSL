@@ -4,7 +4,7 @@ use crate::lower::lower_unit_for_validation;
 use indexmap::IndexMap;
 use smol_str::SmolStr;
 use vsl_diagnostics::DiagnosticBag;
-use vsl_mc::{HardwareCaps, HookStage, MAX_PUSH_CONSTANT_BYTES, ShaderStage};
+use vsl_mc::{AbiProfile, HardwareCaps, HookStage, MAX_PUSH_CONSTANT_BYTES, ShaderStage};
 use vsl_syntax::ast::SourceUnit;
 
 /// Summary of validated items, entry points, hooks, and required capabilities for a [`SourceUnit`].
@@ -22,7 +22,15 @@ pub struct ValidationSummary {
 /// all device capabilities enabled so per-function capability gates and SPIR-V legality rules
 /// are checked identically with zero drift).
 pub fn validate_unit(unit: &SourceUnit) -> (ValidationSummary, DiagnosticBag) {
-    let (hir, diags) = lower_unit_for_validation(unit);
+    validate_unit_with_abi(unit, AbiProfile::Hyaloclast)
+}
+
+/// Validates all tiers using the descriptor ABI selected by the caller.
+pub fn validate_unit_with_abi(
+    unit: &SourceUnit,
+    abi: AbiProfile,
+) -> (ValidationSummary, DiagnosticBag) {
+    let (hir, diags) = lower_unit_for_validation(unit, abi);
     let mut summary = ValidationSummary::default();
 
     for (_, st) in hir.structs.iter() {

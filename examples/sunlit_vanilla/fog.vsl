@@ -7,7 +7,7 @@ pub fn froxel_march(
     #[builtin(global_invocation_id)] gid: uvec3,
     prev_fog: Texture2DArray<f32>,
     out_fog: RWImage2DArray<rgba16f>,
-    noise: Texture2D<f32>,
+    #[pack_resource(0)] noise: Texture2D<f32>,
 ) {
     let coord = ivec3(i32(gid.x), i32(gid.y), i32(gid.z));
     let jitter = noise.fetch(ivec2(gid.xy) & ivec2(63, 63), 0).r;

@@ -2428,6 +2428,7 @@ fn type_to_glsl_with_subst(
                 "u64" => "uint64_t".to_owned(),
                 "bool" => "bool".to_owned(),
                 "RayQuery" => "rayQueryEXT".to_owned(),
+                "AccelerationStructure" => "accelerationStructureEXT".to_owned(),
                 "Texture2D" => "texture2D".to_owned(),
                 "Texture3D" => "texture3D".to_owned(),
                 "Texture2DArray" => "texture2DArray".to_owned(),

@@ -208,14 +208,11 @@ pub fn lower_unit_with_schema_and_abi(
 /// Internal entry point used by [`crate::validate::validate_unit`] to run the exact same
 /// lowering and legality checks across all tiers without pruning functions or rejecting
 /// valid device-gated capabilities.
-pub(crate) fn lower_unit_for_validation(unit: &SourceUnit) -> (HirModule, DiagnosticBag) {
-    lower_unit_internal(
-        unit,
-        None,
-        HardwareCaps::all(),
-        None,
-        AbiProfile::Hyaloclast,
-    )
+pub(crate) fn lower_unit_for_validation(
+    unit: &SourceUnit,
+    abi: AbiProfile,
+) -> (HirModule, DiagnosticBag) {
+    lower_unit_internal(unit, None, HardwareCaps::all(), None, abi)
 }
 
 struct PendingStruct<'a> {

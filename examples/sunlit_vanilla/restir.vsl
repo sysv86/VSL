@@ -40,6 +40,7 @@ impl<S: ResampleTarget> Reservoir<S> {
 }
 
 #[maximally_reconverges]
+#[tier(2..=3)]
 #[cap(maximal_reconvergence)]
 pub fn append_active_pixels(
     is_active: bool,

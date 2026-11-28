@@ -24,7 +24,7 @@ use vsl_glsl::{
 use vsl_hir::module::{L1ModuleHash, ModuleGraph, compute_l2_artifact_hash};
 use vsl_hir::{
     HirFunction, HirModule, PackSchema, ValidationSummary, lower_unit_with_schema_and_abi,
-    validate_unit,
+    validate_unit_with_abi,
 };
 use vsl_ir::PassPipeline;
 pub use vsl_mc::AbiProfile;
@@ -804,7 +804,7 @@ impl VslCompiler {
         let parsed = parse_source(file, source);
         let mut diagnostics = parsed.diagnostics;
 
-        let (_, val_diags) = validate_unit(&parsed.unit);
+        let (_, val_diags) = validate_unit_with_abi(&parsed.unit, abi);
         diagnostics.extend(val_diags.into_vec());
 
         let glsl = if diagnostics.iter().any(Diagnostic::is_error) {
@@ -2358,19 +2358,6 @@ mod tests {
         let pack_src = include_str!("../../../examples/sunlit_vanilla/pack.vsl");
         let pack_parsed = parse_source(FileId(0), pack_src);
         assert!(!pack_parsed.has_errors(), "{:?}", pack_parsed.diagnostics);
-        let (pipeline, eval_diags) = vsl_pack::evaluate_pack_vsl(
-            &pack_parsed.unit,
-            &vsl_pack::EvalConfig {
-                tier: RenderTier::Tier2RayQuery,
-                ..vsl_pack::EvalConfig::default()
-            },
-        );
-        assert!(!eval_diags.has_errors(), "{eval_diags:?}");
-        let schema = pack_schema_from_pipeline(&pipeline);
-
-        let mut opts = CompileOptions::for_tier(RenderTier::Tier2RayQuery);
-        opts.pack_schema = Some(schema);
-
         let files = vec![
             (
                 "gi_cache.vsl".to_owned(),
@@ -2402,12 +2389,36 @@ mod tests {
             ),
         ];
 
-        let mut compiler = VslCompiler::new();
-        let out = compiler.compile_project(&files, &opts);
-        assert!(!out.has_errors(), "{:?}", out.diagnostics);
-        assert!(!out.units.is_empty(), "expected compiled shader units");
-        for unit in &out.units {
-            validate_spirv_with_spirv_val(&unit.entry_point, &unit.spirv);
+        for tier in [
+            RenderTier::Tier0Raster,
+            RenderTier::Tier1ComputeGi,
+            RenderTier::Tier2RayQuery,
+            RenderTier::Tier3PathTracing,
+        ] {
+            let (pipeline, eval_diags) = vsl_pack::evaluate_pack_vsl(
+                &pack_parsed.unit,
+                &vsl_pack::EvalConfig {
+                    tier,
+                    ..vsl_pack::EvalConfig::default()
+                },
+            );
+            assert!(!eval_diags.has_errors(), "{tier:?}: {eval_diags:?}");
+            let mut opts = CompileOptions::for_tier(tier);
+            opts.pack_schema = Some(pack_schema_from_pipeline(&pipeline));
+            let out = VslCompiler::new().compile_project(&files, &opts);
+            assert!(!out.has_errors(), "{tier:?}: {:?}", out.diagnostics);
+            assert!(
+                !out.units.is_empty(),
+                "{tier:?}: expected compiled shader units"
+            );
+            let binding_errors = validate_pack_shader_bindings(&pipeline, &out.units);
+            assert!(binding_errors.is_empty(), "{tier:?}: {binding_errors:?}");
+            for unit in &out.units {
+                validate_spirv_with_spirv_val(
+                    &format!("{tier:?}_{}", unit.entry_point),
+                    &unit.spirv,
+                );
+            }
         }
     }
 
@@ -2626,6 +2637,69 @@ mod tests {
             let units = compile_standalone_and_validate(cap, &src, false);
             assert_rt_payload_reloaded(&units[0].spirv, &[trace_op, execute_op]);
         }
+    }
+
+    #[test]
+    fn ray_query_guarded_reads_and_standalone_glsl_abi() {
+        let src = r"
+            #[cap(ray_query)]
+            @stage(compute(1, 1, 1))
+            fn query_main(
+                #[binding(set = 0, binding = 0)] tlas: AccelerationStructure,
+                #[binding(set = 0, binding = 1)] output_image: RWImage2D<rgba16f>,
+            ) {
+                let rq: RayQuery;
+                rq.initialize(tlas, 0u, 255u, vec3(0.0, 0.0, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0);
+                while rq.proceed() {
+                    if rq.candidate_type() == 0u { rq.confirm_intersection(); }
+                }
+                let mut value = vec4(0.0);
+                if rq.committed_type() == 1u {
+                    value = vec4(rq.committed_t(), f32(rq.committed_primitive_index()), 0.0, 1.0);
+                }
+                output_image.store(ivec2(0, 0), value);
+            }
+        ";
+        let units = compile_standalone_and_validate("guarded_ray_query", src, false);
+        let words = &units[0].spirv;
+        let mut offset = 5;
+        let mut block = 0;
+        let mut true_target = 0;
+        let mut committed_type_result = 0;
+        let mut comparison_result = 0;
+        let mut guarded_reads = 0;
+        while offset < words.len() {
+            let count = (words[offset] >> 16) as usize;
+            let operands = &words[offset + 1..offset + count];
+            match words[offset] & 0xffff {
+                248 => block = operands[0],
+                4479 => committed_type_result = operands[1],
+                170 if operands[2] == committed_type_result => comparison_result = operands[1],
+                250 if operands[0] == comparison_result => true_target = operands[1],
+                6018 | 6023 => {
+                    assert_ne!(true_target, 0);
+                    assert_eq!(
+                        block, true_target,
+                        "intersection read escaped the hit guard"
+                    );
+                    guarded_reads += 1;
+                }
+                _ => {}
+            }
+            offset += count;
+        }
+        assert_eq!(guarded_reads, 2);
+        let glsl = VslCompiler::new().compile_shader_to_glsl_with_abi(
+            "guarded_ray_query.vsl",
+            src,
+            AbiProfile::Standalone,
+        );
+        assert!(!glsl.has_errors(), "{:?}", glsl.diagnostics);
+        assert!(
+            glsl.glsl
+                .contains("layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;")
+        );
+        assert!(!glsl.glsl.contains("WorldUBO"));
     }
 
     #[test]
