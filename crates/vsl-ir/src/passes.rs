@@ -515,6 +515,10 @@ impl IrPass for ConstFoldPass {
                     | InstData::ReorderThreadWithHint { .. }
                     | InstData::ReorderThreadWithHitObject { .. }
                     | InstData::RayQueryTriangleVertexPositions { .. }
+                    | InstData::CoopMatrixLoad { .. }
+                    | InstData::CoopMatrixStore { .. }
+                    | InstData::CoopMatrixMulAdd { .. }
+                    | InstData::CoopMatrixLength { .. }
                     | InstData::Nop => None,
                 };
                 if let Some(new_data) = folded {
@@ -2577,6 +2581,40 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             ray_query_id: *ray_query_id,
             committed: *committed,
         },
+        InstData::CoopMatrixLoad {
+            ptr,
+            layout,
+            stride,
+        } => InstData::CoopMatrixLoad {
+            ptr: remap_id(*ptr, remap),
+            layout: *layout,
+            stride: stride.map(|s| remap_id(s, remap)),
+        },
+        InstData::CoopMatrixStore {
+            ptr,
+            value,
+            layout,
+            stride,
+        } => InstData::CoopMatrixStore {
+            ptr: remap_id(*ptr, remap),
+            value: remap_id(*value, remap),
+            layout: *layout,
+            stride: stride.map(|s| remap_id(s, remap)),
+        },
+        InstData::CoopMatrixMulAdd {
+            a,
+            b,
+            c,
+            operands_mask,
+        } => InstData::CoopMatrixMulAdd {
+            a: remap_id(*a, remap),
+            b: remap_id(*b, remap),
+            c: remap_id(*c, remap),
+            operands_mask: *operands_mask,
+        },
+        InstData::CoopMatrixLength { mat_ty } => InstData::CoopMatrixLength {
+            mat_ty: mat_ty.clone(),
+        },
         InstData::Nop => InstData::Nop,
     }
 }
@@ -3157,6 +3195,10 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::ReorderThreadWithHint { .. }
                     | InstData::ReorderThreadWithHitObject { .. }
                     | InstData::RayQueryTriangleVertexPositions { .. }
+                    | InstData::CoopMatrixLoad { .. }
+                    | InstData::CoopMatrixStore { .. }
+                    | InstData::CoopMatrixMulAdd { .. }
+                    | InstData::CoopMatrixLength { .. }
                     | InstData::Nop => false,
                 };
                 if tainted {
@@ -4924,6 +4966,7 @@ fn is_licm_hoistable(func: &IrFunction, id: InstId) -> bool {
             | InstData::HitObjectGetRayTMax(_)
             | InstData::HitObjectGetSbtRecordIndex(_)
             | InstData::RayQueryTriangleVertexPositions { .. }
+            | InstData::CoopMatrixLoad { .. }
     )
 }
 

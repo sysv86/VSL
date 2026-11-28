@@ -14,7 +14,8 @@ use vsl_hir::{
     LayoutKind, PackSchema, Type, TypeId,
 };
 use vsl_ir::{
-    AtomicOrder, AtomicScope, BuiltinKind, GlslStd450Op, InstData, InstId, IrDescriptorVar,
+    AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixLayout, GlslStd450Op, InstData, InstId,
+    IrDescriptorVar,
     IrFunction, IrInterpolation, IrLocalVar, IrModule, IrParam, IrPushConstantBlock,
     IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
     IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,
@@ -4591,6 +4592,70 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     },
                 );
                 out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "coop_mat_load" => {
+                let ptr = self.require_arg(args, 0, joined, span, out)?;
+                let stride = if args.len() >= 2 {
+                    Some(self.require_arg(args, 1, joined, span, out)?)
+                } else {
+                    None
+                };
+                let id = self.ir_fn.emit_typed(
+                    expr_ir_ty.clone(),
+                    InstData::CoopMatrixLoad {
+                        ptr,
+                        layout: CoopMatrixLayout::RowMajor,
+                        stride,
+                    },
+                );
+                return Ok(id);
+            }
+            "coop_mat_store" => {
+                let ptr = self.require_arg(args, 0, joined, span, out)?;
+                let value = self.require_arg(args, 1, joined, span, out)?;
+                let stride = if args.len() >= 3 {
+                    Some(self.require_arg(args, 2, joined, span, out)?)
+                } else {
+                    None
+                };
+                let id = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::CoopMatrixStore {
+                        ptr,
+                        value,
+                        layout: CoopMatrixLayout::RowMajor,
+                        stride,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "coop_mat_mul_add" => {
+                let a = self.require_arg(args, 0, joined, span, out)?;
+                let b = self.require_arg(args, 1, joined, span, out)?;
+                let c = self.require_arg(args, 2, joined, span, out)?;
+                let ty = self.inst_ty(c).clone();
+                let id = self.ir_fn.emit_typed(
+                    ty,
+                    InstData::CoopMatrixMulAdd {
+                        a,
+                        b,
+                        c,
+                        operands_mask: 0,
+                    },
+                );
+                return Ok(id);
+            }
+            "coop_mat_length" => {
+                let mat_ty = args
+                    .first()
+                    .map(|a| IrType::from_hir_type(&self.hir.types, a.value.ty))
+                    .unwrap_or(IrType::Void);
+                let id = self.ir_fn.emit_typed(
+                    IrType::Scalar(ScalarIrTy::U32),
+                    InstData::CoopMatrixLength { mat_ty },
+                );
                 return Ok(id);
             }
             "nonuniform" => {

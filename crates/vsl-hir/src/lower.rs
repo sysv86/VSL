@@ -7498,6 +7498,8 @@ fn infer_builtin_call_return_type(
 ) -> Option<TypeId> {
     match name {
         "report_intersection" => Some(types.alloc(Type::Scalar(ScalarKind::Bool))),
+        "coop_mat_length" => Some(types.alloc(Type::Scalar(ScalarKind::U32))),
+        "coop_mat_mul_add" => arg_types.get(2).copied().flatten(),
         "subgroup_ballot" => Some(types.alloc(Type::Vector {
             scalar: ScalarKind::U32,
             len: 4,
@@ -8083,6 +8085,12 @@ fn format_type_name(types: &TypeArena, id: TypeId) -> String {
         Type::AccelStruct => "AccelStruct".to_owned(),
         Type::RayQuery => "RayQuery".to_owned(),
         Type::HitObject => "HitObject".to_owned(),
+        Type::CoopMatrix {
+            scalar,
+            rows,
+            cols,
+            ..
+        } => format!("CoopMat<{scalar:?}, {rows}, {cols}>"),
         Type::TypeParam(p) => p.to_string(),
     }
 }
@@ -8698,6 +8706,48 @@ fn lower_type_expr(
                 "AccelerationStructure" | "AccelStruct" => Type::AccelStruct,
                 "RayQuery" => Type::RayQuery,
                 "HitObject" => Type::HitObject,
+                "CoopMat" | "CoopMatA" | "CoopMatB" | "CoopMatAcc" => {
+                    let scalar = args
+                        .first()
+                        .and_then(|a| match a {
+                            TypeArg::Type(TypeExpr::Named { path, .. }) => {
+                                match path.joined().as_str() {
+                                    "f16" | "bf16" => Some(ScalarKind::F16),
+                                    "f32" => Some(ScalarKind::F32),
+                                    "i32" | "i8" => Some(ScalarKind::I32),
+                                    "u32" | "u8" => Some(ScalarKind::U32),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(ScalarKind::F16);
+                    let rows = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            TypeArg::Const(Expr::IntLit { value, .. }) => value.parse::<u32>().ok(),
+                            _ => None,
+                        })
+                        .unwrap_or(16);
+                    let cols = args
+                        .get(2)
+                        .and_then(|a| match a {
+                            TypeArg::Const(Expr::IntLit { value, .. }) => value.parse::<u32>().ok(),
+                            _ => None,
+                        })
+                        .unwrap_or(16);
+                    let use_kind = match joined.as_str() {
+                        "CoopMatA" => 0,
+                        "CoopMatB" => 1,
+                        _ => 2,
+                    };
+                    Type::CoopMatrix {
+                        scalar,
+                        rows,
+                        cols,
+                        use_kind,
+                    }
+                }
                 _ => return None,
             };
             Some(ctx.types.alloc(resolved))

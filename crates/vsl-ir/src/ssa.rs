@@ -185,6 +185,44 @@ pub enum IrType {
         align: u32,
         storage: IrStorageClass,
     },
+    /// Cooperative matrix type (`OpTypeCooperativeMatrixKHR`).
+    CoopMatrix {
+        component: CoopMatrixScalar,
+        scope: AtomicScope,
+        rows: u32,
+        cols: u32,
+        use_kind: CoopMatrixUse,
+    },
+}
+
+/// Element scalar type for `VK_KHR_cooperative_matrix` / Coop Matrix 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoopMatrixScalar {
+    F16,
+    Bf16,
+    F32,
+    I8,
+    U8,
+    I32,
+    U32,
+}
+
+/// Cooperative matrix role (`CooperativeMatrixUse` SPIR-V operand).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoopMatrixUse {
+    MatrixA = 0,
+    MatrixB = 1,
+    Accumulator = 2,
+}
+
+/// Cooperative matrix memory layout (`CooperativeMatrixLayout` SPIR-V operand).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoopMatrixLayout {
+    RowMajor = 0,
+    ColumnMajor = 1,
 }
 
 impl IrType {
@@ -279,7 +317,29 @@ impl IrType {
             | Type::SamplerShadow
             | Type::AccelStruct
             | Type::RayQuery
+            | Type::HitObject
             | Type::TypeParam(_) => Self::Void,
+            Type::CoopMatrix {
+                scalar,
+                rows,
+                cols,
+                use_kind,
+            } => Self::CoopMatrix {
+                component: match scalar {
+                    ScalarKind::F16 => CoopMatrixScalar::F16,
+                    ScalarKind::F32 => CoopMatrixScalar::F32,
+                    ScalarKind::I32 => CoopMatrixScalar::I32,
+                    _ => CoopMatrixScalar::U32,
+                },
+                scope: AtomicScope::Subgroup,
+                rows: *rows,
+                cols: *cols,
+                use_kind: match use_kind {
+                    0 => CoopMatrixUse::MatrixA,
+                    1 => CoopMatrixUse::MatrixB,
+                    _ => CoopMatrixUse::Accumulator,
+                },
+            },
             Type::Scalar(s) => Self::Scalar(ScalarIrTy::from_hir_scalar(*s)),
             Type::Vector { scalar, len } => Self::Vector {
                 scalar: ScalarIrTy::from_hir_scalar(*scalar),
@@ -1262,6 +1322,30 @@ pub enum InstData {
         ray_query_id: u32,
         committed: bool,
     },
+    /// Cooperative matrix load (`OpCooperativeMatrixLoadKHR`).
+    CoopMatrixLoad {
+        ptr: InstId,
+        layout: CoopMatrixLayout,
+        stride: Option<InstId>,
+    },
+    /// Cooperative matrix store (`OpCooperativeMatrixStoreKHR`).
+    CoopMatrixStore {
+        ptr: InstId,
+        value: InstId,
+        layout: CoopMatrixLayout,
+        stride: Option<InstId>,
+    },
+    /// Cooperative matrix multiply-accumulate (`OpCooperativeMatrixMulAddKHR`).
+    CoopMatrixMulAdd {
+        a: InstId,
+        b: InstId,
+        c: InstId,
+        operands_mask: u32,
+    },
+    /// Cooperative matrix element count per invocation (`OpCooperativeMatrixLengthKHR`).
+    CoopMatrixLength {
+        mat_ty: IrType,
+    },
     Nop,
 }
 
@@ -1537,7 +1621,25 @@ impl InstData {
             | Self::HitObjectGetSbtRecordIndex(_)
             | Self::HitObjectExecuteShader { .. }
             | Self::RayQueryTriangleVertexPositions { .. }
+            | Self::CoopMatrixLength { .. }
             | Self::Nop => Vec::new(),
+            Self::CoopMatrixLoad { ptr, stride, .. } => {
+                let mut ops = vec![*ptr];
+                if let Some(s) = stride {
+                    ops.push(*s);
+                }
+                ops
+            }
+            Self::CoopMatrixStore {
+                ptr, value, stride, ..
+            } => {
+                let mut ops = vec![*ptr, *value];
+                if let Some(s) = stride {
+                    ops.push(*s);
+                }
+                ops
+            }
+            Self::CoopMatrixMulAdd { a, b, c, .. } => vec![*a, *b, *c],
             Self::HitObjectTraceRay {
                 ray_flags,
                 cull_mask,
@@ -1653,7 +1755,8 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
         | InstData::RayQueryCommittedInstanceCustomIndex(_)
         | InstData::RayQueryCommittedPrimitiveIndex(_)
         | InstData::RayQueryCommittedGeometryIndex(_)
-        | InstData::HitObjectGetSbtRecordIndex(_) => IrType::Scalar(ScalarIrTy::U32),
+        | InstData::HitObjectGetSbtRecordIndex(_)
+        | InstData::CoopMatrixLength { .. } => IrType::Scalar(ScalarIrTy::U32),
         InstData::ConstF32(_)
         | InstData::FAdd32(_, _)
         | InstData::FSub32(_, _)
@@ -1827,6 +1930,7 @@ impl Inst {
                 | InstData::HitObjectExecuteShader { .. }
                 | InstData::ReorderThreadWithHint { .. }
                 | InstData::ReorderThreadWithHitObject { .. }
+                | InstData::CoopMatrixStore { .. }
         )
     }
 }

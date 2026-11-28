@@ -1,6 +1,7 @@
 use indexmap::{IndexMap, IndexSet};
 use vsl_ir::{
-    AtomicOrder, AtomicScope, BuiltinKind, GlslStd450Op, InstData, InstId, IrDescriptorVar,
+    AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixScalar, GlslStd450Op, InstData, InstId,
+    IrDescriptorVar,
     IrFunction, IrInterpolation, IrModule, IrPushConstantBlock, IrStorageClass, IrStructLayout,
     IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology, IrType, IrWorkgroupVar, ScalarIrTy,
     SpecConstantOpKind, StructuredStmt,
@@ -43,6 +44,13 @@ enum TypeKey {
     AccelerationStructureKhr,
     RayQueryKhr,
     HitObject(bool),
+    CoopMatrix {
+        comp_ty: u32,
+        scope_id: u32,
+        rows_id: u32,
+        cols_id: u32,
+        use_id: u32,
+    },
 }
 
 /// Deduplication key for SPIR-V constants emitted into `types_globals`.
@@ -615,6 +623,64 @@ impl SpirvEmitter {
                     self.emit_ir_type_with_layout(pointee, false)
                 };
                 self.emit_type_pointer(sc, pointee_ty)
+            }
+            IrType::CoopMatrix {
+                component,
+                scope,
+                rows,
+                cols,
+                use_kind,
+            } => {
+                let comp_ty = match component {
+                    CoopMatrixScalar::F16 => self.emit_type_float(16),
+                    CoopMatrixScalar::Bf16 => {
+                        self.emit_capability_raw(5116); // BFloat16TypeKHR
+                        self.emit_extension("SPV_KHR_bfloat16");
+                        let key = TypeKey::Float(0xBF16);
+                        if let Some(&id) = self.type_cache.get(&key) {
+                            id
+                        } else {
+                            let id = self.alloc_id();
+                            push_inst(&mut self.types_globals, spirv::Op::TypeFloat, &[id, 16, 0]);
+                            self.type_cache.insert(key, id);
+                            id
+                        }
+                    }
+                    CoopMatrixScalar::F32 => self.emit_type_float(32),
+                    CoopMatrixScalar::I8 => {
+                        self.emit_capability(spirv::Capability::Int8);
+                        self.emit_type_int(8, 1)
+                    }
+                    CoopMatrixScalar::U8 => {
+                        self.emit_capability(spirv::Capability::Int8);
+                        self.emit_type_int(8, 0)
+                    }
+                    CoopMatrixScalar::I32 => self.emit_type_int(32, 1),
+                    CoopMatrixScalar::U32 => self.emit_type_int(32, 0),
+                };
+                let u32_ty = self.emit_type_int(32, 0);
+                let scope_id = self.emit_constant_32(u32_ty, map_atomic_scope(*scope));
+                let rows_id = self.emit_constant_32(u32_ty, *rows);
+                let cols_id = self.emit_constant_32(u32_ty, *cols);
+                let use_id = self.emit_constant_32(u32_ty, *use_kind as u32);
+                let key = TypeKey::CoopMatrix {
+                    comp_ty,
+                    scope_id,
+                    rows_id,
+                    cols_id,
+                    use_id,
+                };
+                if let Some(&id) = self.type_cache.get(&key) {
+                    return id;
+                }
+                let id = self.alloc_id();
+                push_raw_inst(
+                    &mut self.types_globals,
+                    4456, // OpTypeCooperativeMatrixKHR
+                    &[id, comp_ty, scope_id, rows_id, cols_id, use_id],
+                );
+                self.type_cache.insert(key, id);
+                id
             }
         }
     }
@@ -1692,11 +1758,32 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
         emitter.emit_extension("SPV_EXT_demote_to_helper_invocation");
     }
 
+    let uses_coop_matrix = caps.contains(HardwareCaps::COOPERATIVE_MATRIX)
+        || module.functions.iter().any(|f| {
+            f.insts.iter().any(|(_, inst)| {
+                matches!(
+                    inst.data,
+                    InstData::CoopMatrixLoad { .. }
+                        | InstData::CoopMatrixStore { .. }
+                        | InstData::CoopMatrixMulAdd { .. }
+                        | InstData::CoopMatrixLength { .. }
+                ) || matches!(inst.ir_ty, IrType::CoopMatrix { .. })
+            })
+        });
+    if uses_coop_matrix {
+        emitter.emit_capability_raw(6022); // CooperativeMatrixKHR
+        emitter.emit_extension("SPV_KHR_cooperative_matrix");
+        emitter.emit_capability(spirv::Capability::VulkanMemoryModel);
+        emitter.emit_extension("SPV_KHR_vulkan_memory_model");
+    }
+
     if uses_bda {
         emitter.emit_memory_model(
             spirv::AddressingModel::PhysicalStorageBuffer64,
             spirv::MemoryModel::Vulkan,
         );
+    } else if uses_coop_matrix {
+        emitter.emit_memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::Vulkan);
     } else {
         emitter.emit_memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
     }
@@ -6866,6 +6953,77 @@ impl FnLowerCtx<'_> {
                 } else {
                     (self.emitter.emit_constant_null(arr_ty), arr_ty)
                 }
+            }
+            InstData::CoopMatrixLoad {
+                ptr,
+                layout,
+                stride,
+            } => {
+                let u32_ty = self.u32_ty();
+                let ptr_id = self.ensure_inst(ptr);
+                let mat_ir_ty = self.func.insts[id].ir_ty.clone();
+                let mat_ty = self.emitter.emit_ir_type(&mat_ir_ty);
+                let layout_id = self.emitter.emit_constant_32(u32_ty, layout as u32);
+                let res = self.emitter.alloc_id();
+                let mut ops = vec![mat_ty, res, ptr_id, layout_id];
+                if let Some(s_inst) = stride {
+                    let raw_s = self.ensure_inst(s_inst);
+                    let s_ty = self.inst_types.get(&s_inst).copied().unwrap_or(u32_ty);
+                    let s_u32 = self.coerce_to_ty(raw_s, s_ty, u32_ty);
+                    ops.push(s_u32);
+                }
+                self.emitter.emit_fn_inst_raw(4457, &ops); // OpCooperativeMatrixLoadKHR
+                (res, mat_ty)
+            }
+            InstData::CoopMatrixStore {
+                ptr,
+                value,
+                layout,
+                stride,
+            } => {
+                let u32_ty = self.u32_ty();
+                let ptr_id = self.ensure_inst(ptr);
+                let val_id = self.ensure_inst(value);
+                let layout_id = self.emitter.emit_constant_32(u32_ty, layout as u32);
+                let mut ops = vec![ptr_id, val_id, layout_id];
+                if let Some(s_inst) = stride {
+                    let raw_s = self.ensure_inst(s_inst);
+                    let s_ty = self.inst_types.get(&s_inst).copied().unwrap_or(u32_ty);
+                    let s_u32 = self.coerce_to_ty(raw_s, s_ty, u32_ty);
+                    ops.push(s_u32);
+                }
+                self.emitter.emit_fn_inst_raw(4458, &ops); // OpCooperativeMatrixStoreKHR
+                (0, self.void_ty)
+            }
+            InstData::CoopMatrixMulAdd {
+                a,
+                b,
+                c,
+                operands_mask,
+            } => {
+                let a_id = self.ensure_inst(a);
+                let b_id = self.ensure_inst(b);
+                let c_id = self.ensure_inst(c);
+                let c_ty = self
+                    .inst_types
+                    .get(&c)
+                    .copied()
+                    .unwrap_or_else(|| self.emitter.emit_ir_type(&self.func.insts[id].ir_ty));
+                let res = self.emitter.alloc_id();
+                let mut ops = vec![c_ty, res, a_id, b_id, c_id];
+                if operands_mask != 0 {
+                    ops.push(operands_mask);
+                }
+                self.emitter.emit_fn_inst_raw(4459, &ops); // OpCooperativeMatrixMulAddKHR
+                (res, c_ty)
+            }
+            InstData::CoopMatrixLength { mat_ty } => {
+                let u32_ty = self.u32_ty();
+                let spv_mat_ty = self.emitter.emit_ir_type(&mat_ty);
+                let res = self.emitter.alloc_id();
+                self.emitter
+                    .emit_fn_inst_raw(4460, &[u32_ty, res, spv_mat_ty]); // OpCooperativeMatrixLengthKHR
+                (res, u32_ty)
             }
             InstData::Nop => (0, self.void_ty),
         };

@@ -10,7 +10,8 @@ pub use passes::{
     SroaPass, UnrollLoopsPass,
 };
 pub use ssa::{
-    AtomicOrder, AtomicScope, BuiltinKind, GlslStd450Op, Inst, InstData, InstId, IrDescriptorVar,
+    AtomicOrder, AtomicScope, BuiltinKind, CoopMatrixLayout, CoopMatrixScalar, CoopMatrixUse,
+    GlslStd450Op, Inst, InstData, InstId, IrDescriptorVar,
     IrFunction, IrInterpolation, IrLocalVar, IrModule, IrParam, IrPushConstantBlock,
     IrPushConstantField, IrStageExecMeta, IrStageIoVar, IrStageVar, IrStorageClass,
     IrStructFieldLayout, IrStructLayout, IrTessDomain, IrTessOrder, IrTessSpacing, IrTopology,

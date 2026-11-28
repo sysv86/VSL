@@ -114,6 +114,13 @@ pub enum Type {
     RayQuery,
     /// Opaque SER hit object handle (`OpTypeHitObjectNV` / `OpTypeHitObjectEXT`).
     HitObject,
+    /// Cooperative Matrix value type (`VK_KHR_cooperative_matrix`, `use_kind`: 0=A, 1=B, 2=Acc).
+    CoopMatrix {
+        scalar: ScalarKind,
+        rows: u32,
+        cols: u32,
+        use_kind: u32,
+    },
     /// Uninstantiated generic type parameter (for example `S` in `struct Reservoir<S>`).
     TypeParam(SmolStr),
 }

@@ -91,6 +91,7 @@ bitflags! {
         const SHADER_INVOCATION_REORDER_EXT = 1 << 11;
         const OPACITY_MICROMAP              = 1 << 12;
         const RAY_TRACING_POSITION_FETCH    = 1 << 13;
+        const COOPERATIVE_MATRIX            = 1 << 14;
     }
 }
 
@@ -116,6 +117,9 @@ impl HardwareCaps {
             "opacity_micromap" | "omm" => Some(Self::OPACITY_MICROMAP),
             "ray_tracing_position_fetch" | "position_fetch" => {
                 Some(Self::RAY_TRACING_POSITION_FETCH)
+            }
+            "cooperative_matrix" | "coop_matrix" | "coop_matrix_2" => {
+                Some(Self::COOPERATIVE_MATRIX)
             }
             _ => None,
         }
