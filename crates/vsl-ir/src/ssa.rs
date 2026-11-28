@@ -72,6 +72,7 @@ pub enum BuiltinKind {
     TessCoord,
     PrimitiveId,
     Layer,
+    HitTriangleVertexPositionsKhr,
 }
 
 /// Memory qualifiers lowered onto SPIR-V BDA pointer loads/stores.
@@ -1217,6 +1218,50 @@ pub enum InstData {
         var_index: u32,
         value: InstId,
     },
+    /// SER `OpHitObjectTraceRayNV` / `OpHitObjectTraceRayEXT`.
+    HitObjectTraceRay {
+        hit_object_id: u32,
+        tlas_descriptor_index: u32,
+        ray_flags: InstId,
+        cull_mask: InstId,
+        sbt_offset: InstId,
+        sbt_stride: InstId,
+        miss_index: InstId,
+        origin: InstId,
+        t_min: InstId,
+        direction: InstId,
+        t_max: InstId,
+        payload_var_index: u32,
+    },
+    /// SER `OpHitObjectRecordEmptyNV` / `OpHitObjectRecordEmptyEXT`.
+    HitObjectRecordEmpty(u32),
+    /// SER `OpHitObjectIsHitNV` / `OpHitObjectIsHitEXT`.
+    HitObjectIsHit(u32),
+    /// SER `OpHitObjectGetRayTMaxNV` / `OpHitObjectGetRayTMaxEXT`.
+    HitObjectGetRayTMax(u32),
+    /// SER `OpHitObjectGetShaderBindingTableRecordIndexNV` / `EXT`.
+    HitObjectGetSbtRecordIndex(u32),
+    /// SER `OpHitObjectExecuteShaderNV` / `OpHitObjectExecuteShaderEXT`.
+    HitObjectExecuteShader {
+        hit_object_id: u32,
+        payload_var_index: u32,
+    },
+    /// SER `OpReorderThreadWithHintNV` / `OpReorderThreadWithHintEXT`.
+    ReorderThreadWithHint {
+        hint: InstId,
+        bits: InstId,
+    },
+    /// SER `OpReorderThreadWithHitObjectNV` / `OpReorderThreadWithHitObjectEXT`.
+    ReorderThreadWithHitObject {
+        hit_object_id: u32,
+        hint: Option<InstId>,
+        bits: Option<InstId>,
+    },
+    /// Position Fetch `OpRayQueryGetIntersectionTriangleVertexPositionsKHR` returning `[vec3; 3]`.
+    RayQueryTriangleVertexPositions {
+        ray_query_id: u32,
+        committed: bool,
+    },
     Nop,
 }
 
@@ -1486,7 +1531,46 @@ impl InstData {
             | Self::EmitVertex
             | Self::EndPrimitive
             | Self::LoadStageVar { .. }
+            | Self::HitObjectRecordEmpty(_)
+            | Self::HitObjectIsHit(_)
+            | Self::HitObjectGetRayTMax(_)
+            | Self::HitObjectGetSbtRecordIndex(_)
+            | Self::HitObjectExecuteShader { .. }
+            | Self::RayQueryTriangleVertexPositions { .. }
             | Self::Nop => Vec::new(),
+            Self::HitObjectTraceRay {
+                ray_flags,
+                cull_mask,
+                sbt_offset,
+                sbt_stride,
+                miss_index,
+                origin,
+                t_min,
+                direction,
+                t_max,
+                ..
+            } => vec![
+                *ray_flags,
+                *cull_mask,
+                *sbt_offset,
+                *sbt_stride,
+                *miss_index,
+                *origin,
+                *t_min,
+                *direction,
+                *t_max,
+            ],
+            Self::ReorderThreadWithHint { hint, bits } => vec![*hint, *bits],
+            Self::ReorderThreadWithHitObject { hint, bits, .. } => {
+                let mut ops = Vec::new();
+                if let Some(h) = hint {
+                    ops.push(*h);
+                }
+                if let Some(b) = bits {
+                    ops.push(*b);
+                }
+                ops
+            }
             Self::TraceRayKhr {
                 ray_flags,
                 cull_mask,
@@ -1553,7 +1637,8 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
         | InstData::SubgroupElect
         | InstData::RayQueryProceed(_)
         | InstData::RayQueryCommittedFrontFace(_)
-        | InstData::ReportIntersectionKhr { .. } => IrType::Scalar(ScalarIrTy::Bool),
+        | InstData::ReportIntersectionKhr { .. }
+        | InstData::HitObjectIsHit(_) => IrType::Scalar(ScalarIrTy::Bool),
         InstData::ConstI32(_) | InstData::CastToI32(_) => IrType::Scalar(ScalarIrTy::I32),
         InstData::ConstU32(_)
         | InstData::CastToU32(_)
@@ -1567,7 +1652,8 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
         | InstData::RayQueryCommittedInstanceId(_)
         | InstData::RayQueryCommittedInstanceCustomIndex(_)
         | InstData::RayQueryCommittedPrimitiveIndex(_)
-        | InstData::RayQueryCommittedGeometryIndex(_) => IrType::Scalar(ScalarIrTy::U32),
+        | InstData::RayQueryCommittedGeometryIndex(_)
+        | InstData::HitObjectGetSbtRecordIndex(_) => IrType::Scalar(ScalarIrTy::U32),
         InstData::ConstF32(_)
         | InstData::FAdd32(_, _)
         | InstData::FSub32(_, _)
@@ -1576,6 +1662,7 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
         | InstData::CastToF32(_)
         | InstData::ImageSampleDrefExplicitLod { .. }
         | InstData::RayQueryCommittedT(_)
+        | InstData::HitObjectGetRayTMax(_)
         | InstData::RayQueryCandidateT(_) => IrType::Scalar(ScalarIrTy::F32),
         InstData::ConstF16(_) => IrType::Scalar(ScalarIrTy::F16),
         InstData::ConstI64(_) | InstData::CastToI64(_) => IrType::Scalar(ScalarIrTy::I64),
@@ -1595,6 +1682,13 @@ fn infer_static_ir_type(data: &InstData) -> IrType {
         InstData::RayQueryCommittedBarycentrics(_) => IrType::Vector {
             scalar: ScalarIrTy::F32,
             len: 2,
+        },
+        InstData::RayQueryTriangleVertexPositions { .. } => IrType::Array {
+            element: Box::new(IrType::Vector {
+                scalar: ScalarIrTy::F32,
+                len: 3,
+            }),
+            len: 3,
         },
         InstData::RayQueryCommittedObjectToWorld(_)
         | InstData::RayQueryCommittedWorldToObject(_) => IrType::Matrix {
@@ -1728,6 +1822,11 @@ impl Inst {
                 | InstData::EmitVertex
                 | InstData::EndPrimitive
                 | InstData::StoreStageVar { .. }
+                | InstData::HitObjectTraceRay { .. }
+                | InstData::HitObjectRecordEmpty(_)
+                | InstData::HitObjectExecuteShader { .. }
+                | InstData::ReorderThreadWithHint { .. }
+                | InstData::ReorderThreadWithHitObject { .. }
         )
     }
 }

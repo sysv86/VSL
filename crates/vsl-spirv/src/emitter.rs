@@ -42,6 +42,7 @@ enum TypeKey {
     RuntimeArray(u32, Option<u32>),
     AccelerationStructureKhr,
     RayQueryKhr,
+    HitObject(bool),
 }
 
 /// Deduplication key for SPIR-V constants emitted into `types_globals`.
@@ -881,6 +882,18 @@ impl SpirvEmitter {
         id
     }
 
+    pub fn emit_type_hit_object(&mut self, use_ext: bool) -> u32 {
+        let key = TypeKey::HitObject(use_ext);
+        if let Some(&id) = self.type_cache.get(&key) {
+            return id;
+        }
+        let id = self.alloc_id();
+        let opcode: u16 = if use_ext { 5313 } else { 5281 };
+        push_raw_inst(&mut self.types_globals, opcode, &[id]);
+        self.type_cache.insert(key, id);
+        id
+    }
+
     pub fn emit_constant_bool(&mut self, bool_ty: u32, value: bool) -> u32 {
         let key = ConstKey::Bool(bool_ty, value);
         if let Some(&id) = self.const_cache.get(&key) {
@@ -1586,7 +1599,63 @@ pub fn emit_module_spirv(module: &IrModule) -> Vec<u32> {
     if uses_geometry {
         emitter.emit_capability(spirv::Capability::Geometry);
     }
+    let uses_ser_ops = module.functions.iter().any(|f| {
+        f.insts.iter().any(|(_, inst)| {
+            matches!(
+                inst.data,
+                InstData::HitObjectTraceRay { .. }
+                    | InstData::HitObjectRecordEmpty(_)
+                    | InstData::HitObjectIsHit(_)
+                    | InstData::HitObjectGetRayTMax(_)
+                    | InstData::HitObjectGetSbtRecordIndex(_)
+                    | InstData::HitObjectExecuteShader { .. }
+                    | InstData::ReorderThreadWithHint { .. }
+                    | InstData::ReorderThreadWithHitObject { .. }
+            )
+        })
+    });
+    let uses_ser_ext = caps.contains(HardwareCaps::SHADER_INVOCATION_REORDER_EXT);
+    let uses_ser_nv =
+        !uses_ser_ext && (uses_ser_ops || caps.contains(HardwareCaps::SHADER_INVOCATION_REORDER));
+    if uses_ser_ext {
+        emitter.emit_capability_raw(5388); // ShaderInvocationReorderEXT
+        emitter.emit_extension("SPV_EXT_shader_invocation_reorder");
+    } else if uses_ser_nv {
+        emitter.emit_capability_raw(5383); // ShaderInvocationReorderNV
+        emitter.emit_extension("SPV_NV_shader_invocation_reorder");
+    }
+    if caps.contains(HardwareCaps::OPACITY_MICROMAP) {
+        emitter.emit_capability_raw(5381); // RayTracingOpacityMicromapEXT
+        emitter.emit_extension("SPV_EXT_opacity_micromap");
+    }
+    let uses_rq_pos_fetch = module.functions.iter().any(|f| {
+        f.insts
+            .iter()
+            .any(|(_, inst)| matches!(inst.data, InstData::RayQueryTriangleVertexPositions { .. }))
+    });
+    let uses_rt_pos_fetch = module.functions.iter().any(|f| {
+        f.insts.iter().any(|(_, inst)| {
+            matches!(
+                inst.data,
+                InstData::LoadBuiltin {
+                    kind: BuiltinKind::HitTriangleVertexPositionsKhr,
+                    ..
+                }
+            )
+        })
+    });
+    if uses_rq_pos_fetch {
+        emitter.emit_capability_raw(5391); // RayQueryPositionFetchKHR
+        emitter.emit_extension("SPV_KHR_ray_tracing_position_fetch");
+    }
+    if uses_rt_pos_fetch
+        || (caps.contains(HardwareCaps::RAY_TRACING_POSITION_FETCH) && uses_rt_pipeline)
+    {
+        emitter.emit_capability_raw(5336); // RayTracingPositionFetchKHR
+        emitter.emit_extension("SPV_KHR_ray_tracing_position_fetch");
+    }
     if uses_ray_query
+        || uses_rq_pos_fetch
         || caps.contains(HardwareCaps::RAY_QUERY)
         || (uses_accel_struct && !uses_rt_pipeline)
     {
@@ -2613,6 +2682,12 @@ fn emit_builtin_var(
         ),
         BuiltinKind::PrimitiveId => (u32_ty, u32_ty, None, 7, "gl_PrimitiveID"),
         BuiltinKind::Layer => (u32_ty, u32_ty, None, 9, "gl_Layer"),
+        BuiltinKind::HitTriangleVertexPositionsKhr => {
+            let v3_ty = emitter.emit_type_vector(f32_ty, 3);
+            let len_const = emitter.emit_constant_32(u32_ty, 3);
+            let arr_ty = emitter.emit_type_array(v3_ty, len_const);
+            (arr_ty, f32_ty, None, 5335, "gl_HitTriangleVertexPositionsEXT")
+        }
     };
     let sc = if is_output {
         spirv::StorageClass::Output
@@ -2728,6 +2803,8 @@ struct FnLowerCtx<'a> {
     push_constant: Option<&'a EmittedPushConstant>,
     default_sampler_var: Option<u32>,
     ray_query_vars: IndexMap<u32, u32>,
+    hit_object_vars: IndexMap<u32, u32>,
+    use_ser_ext: bool,
     uses_bda: bool,
     inst_ids: IndexMap<InstId, u32>,
     preallocated_ids: IndexMap<InstId, (u32, u32)>,
@@ -6581,6 +6658,215 @@ impl FnLowerCtx<'_> {
                 }
                 (0, self.void_ty)
             }
+            InstData::HitObjectTraceRay {
+                hit_object_id,
+                tlas_descriptor_index,
+                ray_flags,
+                cull_mask,
+                sbt_offset,
+                sbt_stride,
+                miss_index,
+                origin,
+                t_min,
+                direction,
+                t_max,
+                payload_var_index,
+            } => {
+                let u32_ty = self.u32_ty();
+                let f32_ty = self.f32_ty();
+                let flags_u32 = self.coerce_to_ty(
+                    self.ensure_inst(ray_flags),
+                    self.inst_types.get(&ray_flags).copied().unwrap_or(u32_ty),
+                    u32_ty,
+                );
+                let mask_u32 = self.coerce_to_ty(
+                    self.ensure_inst(cull_mask),
+                    self.inst_types.get(&cull_mask).copied().unwrap_or(u32_ty),
+                    u32_ty,
+                );
+                let sbt_off_u32 = self.coerce_to_ty(
+                    self.ensure_inst(sbt_offset),
+                    self.inst_types.get(&sbt_offset).copied().unwrap_or(u32_ty),
+                    u32_ty,
+                );
+                let sbt_stride_u32 = self.coerce_to_ty(
+                    self.ensure_inst(sbt_stride),
+                    self.inst_types.get(&sbt_stride).copied().unwrap_or(u32_ty),
+                    u32_ty,
+                );
+                let miss_u32 = self.coerce_to_ty(
+                    self.ensure_inst(miss_index),
+                    self.inst_types.get(&miss_index).copied().unwrap_or(u32_ty),
+                    u32_ty,
+                );
+                let raw_origin = self.ensure_inst(origin);
+                let origin_v3 = self.emit_vec3_f32(
+                    raw_origin,
+                    self.inst_types.get(&origin).copied().unwrap_or(f32_ty),
+                );
+                let tmin_f32 = self.coerce_to_ty(
+                    self.ensure_inst(t_min),
+                    self.inst_types.get(&t_min).copied().unwrap_or(f32_ty),
+                    f32_ty,
+                );
+                let raw_dir = self.ensure_inst(direction);
+                let dir_v3 = self.emit_vec3_f32(
+                    raw_dir,
+                    self.inst_types.get(&direction).copied().unwrap_or(f32_ty),
+                );
+                let tmax_f32 = self.coerce_to_ty(
+                    self.ensure_inst(t_max),
+                    self.inst_types.get(&t_max).copied().unwrap_or(f32_ty),
+                    f32_ty,
+                );
+                if let Some(&ho_var) = self.hit_object_vars.get(&hit_object_id)
+                    && let Some(desc) = self.descriptors.get(tlas_descriptor_index as usize)
+                    && desc.kind == DescriptorKind::AccelerationStructure
+                    && let Some(payload) = self.stage_vars.get(payload_var_index as usize)
+                {
+                    let tlas_val = self.emitter.alloc_id();
+                    self.emitter
+                        .emit_fn_inst(spirv::Op::Load, &[desc.element_ty, tlas_val, desc.var_id]);
+                    let op: u16 = if self.use_ser_ext { 5316 } else { 5260 };
+                    self.emitter.emit_fn_inst_raw(
+                        op,
+                        &[
+                            ho_var,
+                            tlas_val,
+                            flags_u32,
+                            mask_u32,
+                            sbt_off_u32,
+                            sbt_stride_u32,
+                            miss_u32,
+                            origin_v3,
+                            tmin_f32,
+                            dir_v3,
+                            tmax_f32,
+                            payload.var_id,
+                        ],
+                    );
+                }
+                (0, self.void_ty)
+            }
+            InstData::HitObjectRecordEmpty(ho_id) => {
+                if let Some(&ho_var) = self.hit_object_vars.get(&ho_id) {
+                    let op: u16 = if self.use_ser_ext { 5318 } else { 5259 };
+                    self.emitter.emit_fn_inst_raw(op, &[ho_var]);
+                }
+                (0, self.void_ty)
+            }
+            InstData::HitObjectIsHit(ho_id) => {
+                let bool_ty = self.bool_ty();
+                if let Some(&ho_var) = self.hit_object_vars.get(&ho_id) {
+                    let res = self.emitter.alloc_id();
+                    let op: u16 = if self.use_ser_ext { 5351 } else { 5277 };
+                    self.emitter.emit_fn_inst_raw(op, &[bool_ty, res, ho_var]);
+                    (res, bool_ty)
+                } else {
+                    (self.emitter.emit_constant_bool(bool_ty, false), bool_ty)
+                }
+            }
+            InstData::HitObjectGetRayTMax(ho_id) => {
+                let f32_ty = self.f32_ty();
+                if let Some(&ho_var) = self.hit_object_vars.get(&ho_id) {
+                    let res = self.emitter.alloc_id();
+                    let op: u16 = if self.use_ser_ext { 5333 } else { 5274 };
+                    self.emitter.emit_fn_inst_raw(op, &[f32_ty, res, ho_var]);
+                    (res, f32_ty)
+                } else {
+                    (self.emitter.emit_constant_32(f32_ty, 0), f32_ty)
+                }
+            }
+            InstData::HitObjectGetSbtRecordIndex(ho_id) => {
+                let u32_ty = self.u32_ty();
+                if let Some(&ho_var) = self.hit_object_vars.get(&ho_id) {
+                    let res = self.emitter.alloc_id();
+                    let op: u16 = if self.use_ser_ext { 5348 } else { 5258 };
+                    self.emitter.emit_fn_inst_raw(op, &[u32_ty, res, ho_var]);
+                    (res, u32_ty)
+                } else {
+                    (self.emitter.emit_constant_32(u32_ty, 0), u32_ty)
+                }
+            }
+            InstData::HitObjectExecuteShader {
+                hit_object_id,
+                payload_var_index,
+            } => {
+                if let Some(&ho_var) = self.hit_object_vars.get(&hit_object_id)
+                    && let Some(payload) = self.stage_vars.get(payload_var_index as usize)
+                {
+                    let op: u16 = if self.use_ser_ext { 5319 } else { 5264 };
+                    self.emitter.emit_fn_inst_raw(op, &[ho_var, payload.var_id]);
+                }
+                (0, self.void_ty)
+            }
+            InstData::ReorderThreadWithHint { hint, bits } => {
+                let u32_ty = self.u32_ty();
+                let h = self.coerce_to_ty(
+                    self.ensure_inst(hint),
+                    self.inst_types.get(&hint).copied().unwrap_or(u32_ty),
+                    u32_ty,
+                );
+                let b = self.coerce_to_ty(
+                    self.ensure_inst(bits),
+                    self.inst_types.get(&bits).copied().unwrap_or(u32_ty),
+                    u32_ty,
+                );
+                let op: u16 = if self.use_ser_ext { 5314 } else { 5280 };
+                self.emitter.emit_fn_inst_raw(op, &[h, b]);
+                (0, self.void_ty)
+            }
+            InstData::ReorderThreadWithHitObject {
+                hit_object_id,
+                hint,
+                bits,
+            } => {
+                let u32_ty = self.u32_ty();
+                let mut ops = Vec::new();
+                if let Some(&ho_var) = self.hit_object_vars.get(&hit_object_id) {
+                    ops.push(ho_var);
+                    if let (Some(h_inst), Some(b_inst)) = (hint, bits) {
+                        let h = self.coerce_to_ty(
+                            self.ensure_inst(h_inst),
+                            self.inst_types.get(&h_inst).copied().unwrap_or(u32_ty),
+                            u32_ty,
+                        );
+                        let b = self.coerce_to_ty(
+                            self.ensure_inst(b_inst),
+                            self.inst_types.get(&b_inst).copied().unwrap_or(u32_ty),
+                            u32_ty,
+                        );
+                        ops.push(h);
+                        ops.push(b);
+                    }
+                    let op: u16 = if self.use_ser_ext { 5315 } else { 5279 };
+                    self.emitter.emit_fn_inst_raw(op, &ops);
+                }
+                (0, self.void_ty)
+            }
+            InstData::RayQueryTriangleVertexPositions {
+                ray_query_id,
+                committed,
+            } => {
+                let f32_ty = self.f32_ty();
+                let u32_ty = self.u32_ty();
+                let v3_ty = self.emitter.emit_type_vector(f32_ty, 3);
+                let len3 = self.emitter.emit_constant_32(u32_ty, 3);
+                let arr_ty = self.emitter.emit_type_array(v3_ty, len3);
+                if let Some(&rq_var) = self.ray_query_vars.get(&ray_query_id) {
+                    let inter_const = self
+                        .emitter
+                        .emit_constant_32(u32_ty, u32::from(committed));
+                    let res = self.emitter.alloc_id();
+                    self.emitter.emit_fn_inst_raw(
+                        5340, // OpRayQueryGetIntersectionTriangleVertexPositionsKHR
+                        &[arr_ty, res, rq_var, inter_const],
+                    );
+                    (res, arr_ty)
+                } else {
+                    (self.emitter.emit_constant_null(arr_ty), arr_ty)
+                }
+            }
             InstData::Nop => (0, self.void_ty),
         };
 
@@ -8538,12 +8824,45 @@ fn emit_function_body(
             | InstData::RayQueryCommittedObjectToWorld(ray_query_id)
             | InstData::RayQueryCommittedWorldToObject(ray_query_id)
             | InstData::RayQueryCommittedFrontFace(ray_query_id)
-            | InstData::RayQueryCommittedBarycentrics(ray_query_id) => {
+            | InstData::RayQueryCommittedBarycentrics(ray_query_id)
+            | InstData::RayQueryTriangleVertexPositions { ray_query_id, .. } => {
                 rq_ids.insert(ray_query_id);
             }
             _ => {}
         }
     }
+    let use_ser_ext = func
+        .required_caps
+        .contains(HardwareCaps::SHADER_INVOCATION_REORDER_EXT);
+    let mut hit_object_ids: IndexSet<u32> = IndexSet::new();
+    for (_, inst) in func.insts.iter() {
+        match inst.data {
+            InstData::HitObjectTraceRay { hit_object_id, .. }
+            | InstData::HitObjectRecordEmpty(hit_object_id)
+            | InstData::HitObjectIsHit(hit_object_id)
+            | InstData::HitObjectGetRayTMax(hit_object_id)
+            | InstData::HitObjectGetSbtRecordIndex(hit_object_id)
+            | InstData::HitObjectExecuteShader { hit_object_id, .. }
+            | InstData::ReorderThreadWithHitObject { hit_object_id, .. } => {
+                hit_object_ids.insert(hit_object_id);
+            }
+            _ => {}
+        }
+    }
+    let mut hit_object_vars: IndexMap<u32, u32> = IndexMap::new();
+    if !hit_object_ids.is_empty() {
+        let ho_ty = emitter.emit_type_hit_object(use_ser_ext);
+        let ho_ptr_ty = emitter.emit_type_pointer(spirv::StorageClass::Function, ho_ty);
+        for ho_id in hit_object_ids {
+            let var_id = emitter.alloc_id();
+            emitter.emit_fn_inst(
+                spirv::Op::Variable,
+                &[ho_ptr_ty, var_id, spirv::StorageClass::Function as u32],
+            );
+            hit_object_vars.insert(ho_id, var_id);
+        }
+    }
+
     let mut ray_query_vars: IndexMap<u32, u32> = IndexMap::new();
     if !rq_ids.is_empty() {
         let rq_ty = emitter.emit_type_ray_query_khr();
@@ -8574,6 +8893,8 @@ fn emit_function_body(
         push_constant,
         default_sampler_var,
         ray_query_vars,
+        hit_object_vars,
+        use_ser_ext,
         uses_bda,
         inst_ids: IndexMap::new(),
         preallocated_ids: IndexMap::new(),

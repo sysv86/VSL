@@ -506,6 +506,15 @@ impl IrPass for ConstFoldPass {
                     | InstData::EndPrimitive
                     | InstData::LoadStageVar { .. }
                     | InstData::StoreStageVar { .. }
+                    | InstData::HitObjectTraceRay { .. }
+                    | InstData::HitObjectRecordEmpty(_)
+                    | InstData::HitObjectIsHit(_)
+                    | InstData::HitObjectGetRayTMax(_)
+                    | InstData::HitObjectGetSbtRecordIndex(_)
+                    | InstData::HitObjectExecuteShader { .. }
+                    | InstData::ReorderThreadWithHint { .. }
+                    | InstData::ReorderThreadWithHitObject { .. }
+                    | InstData::RayQueryTriangleVertexPositions { .. }
                     | InstData::Nop => None,
                 };
                 if let Some(new_data) = folded {
@@ -2510,6 +2519,64 @@ fn remap_inst_data(data: &InstData, remap: &IndexMap<InstId, InstId>) -> InstDat
             var_index: *var_index,
             value: remap_id(*value, remap),
         },
+        InstData::HitObjectTraceRay {
+            hit_object_id,
+            tlas_descriptor_index,
+            ray_flags,
+            cull_mask,
+            sbt_offset,
+            sbt_stride,
+            miss_index,
+            origin,
+            t_min,
+            direction,
+            t_max,
+            payload_var_index,
+        } => InstData::HitObjectTraceRay {
+            hit_object_id: *hit_object_id,
+            tlas_descriptor_index: *tlas_descriptor_index,
+            ray_flags: remap_id(*ray_flags, remap),
+            cull_mask: remap_id(*cull_mask, remap),
+            sbt_offset: remap_id(*sbt_offset, remap),
+            sbt_stride: remap_id(*sbt_stride, remap),
+            miss_index: remap_id(*miss_index, remap),
+            origin: remap_id(*origin, remap),
+            t_min: remap_id(*t_min, remap),
+            direction: remap_id(*direction, remap),
+            t_max: remap_id(*t_max, remap),
+            payload_var_index: *payload_var_index,
+        },
+        InstData::HitObjectRecordEmpty(id) => InstData::HitObjectRecordEmpty(*id),
+        InstData::HitObjectIsHit(id) => InstData::HitObjectIsHit(*id),
+        InstData::HitObjectGetRayTMax(id) => InstData::HitObjectGetRayTMax(*id),
+        InstData::HitObjectGetSbtRecordIndex(id) => InstData::HitObjectGetSbtRecordIndex(*id),
+        InstData::HitObjectExecuteShader {
+            hit_object_id,
+            payload_var_index,
+        } => InstData::HitObjectExecuteShader {
+            hit_object_id: *hit_object_id,
+            payload_var_index: *payload_var_index,
+        },
+        InstData::ReorderThreadWithHint { hint, bits } => InstData::ReorderThreadWithHint {
+            hint: remap_id(*hint, remap),
+            bits: remap_id(*bits, remap),
+        },
+        InstData::ReorderThreadWithHitObject {
+            hit_object_id,
+            hint,
+            bits,
+        } => InstData::ReorderThreadWithHitObject {
+            hit_object_id: *hit_object_id,
+            hint: hint.map(|h| remap_id(h, remap)),
+            bits: bits.map(|b| remap_id(b, remap)),
+        },
+        InstData::RayQueryTriangleVertexPositions {
+            ray_query_id,
+            committed,
+        } => InstData::RayQueryTriangleVertexPositions {
+            ray_query_id: *ray_query_id,
+            committed: *committed,
+        },
         InstData::Nop => InstData::Nop,
     }
 }
@@ -3081,6 +3148,15 @@ impl IrPass for PropagateNonUniformPass {
                     | InstData::EndPrimitive
                     | InstData::LoadStageVar { .. }
                     | InstData::StoreStageVar { .. }
+                    | InstData::HitObjectTraceRay { .. }
+                    | InstData::HitObjectRecordEmpty(_)
+                    | InstData::HitObjectIsHit(_)
+                    | InstData::HitObjectGetRayTMax(_)
+                    | InstData::HitObjectGetSbtRecordIndex(_)
+                    | InstData::HitObjectExecuteShader { .. }
+                    | InstData::ReorderThreadWithHint { .. }
+                    | InstData::ReorderThreadWithHitObject { .. }
+                    | InstData::RayQueryTriangleVertexPositions { .. }
                     | InstData::Nop => false,
                 };
                 if tainted {
@@ -4844,6 +4920,10 @@ fn is_licm_hoistable(func: &IrFunction, id: InstId) -> bool {
             | InstData::RayQueryCommittedFrontFace(_)
             | InstData::RayQueryCommittedBarycentrics(_)
             | InstData::LoadStageVar { .. }
+            | InstData::HitObjectIsHit(_)
+            | InstData::HitObjectGetRayTMax(_)
+            | InstData::HitObjectGetSbtRecordIndex(_)
+            | InstData::RayQueryTriangleVertexPositions { .. }
     )
 }
 
@@ -5554,6 +5634,17 @@ fn remap_inlined_resource_indices(data: &mut InstData, res: &InlineResourceRemap
             if let Some(&mapped) = res.desc_map.get(tlas_descriptor_index) {
                 *tlas_descriptor_index = mapped;
             }
+        }
+        InstData::HitObjectTraceRay {
+            tlas_descriptor_index,
+            ..
+        } => {
+            if let Some(&mapped) = res.desc_map.get(tlas_descriptor_index) {
+                *tlas_descriptor_index = mapped;
+            }
+        }
+        InstData::RayQueryTriangleVertexPositions { ray_query_id, .. } => {
+            *ray_query_id += res.rq_offset;
         }
         InstData::RayQueryGenerateIntersection { ray_query_id, .. } => {
             *ray_query_id += res.rq_offset;

@@ -85,8 +85,12 @@ bitflags! {
         const QUAD_CONTROL                = 1 << 5;
         const RAY_TRACING_PIPELINE        = 1 << 6;
         const MESH_SHADER                 = 1 << 7;
-        const TESSELLATION                = 1 << 8;
-        const GEOMETRY_SHADER             = 1 << 9;
+        const TESSELLATION                  = 1 << 8;
+        const GEOMETRY_SHADER               = 1 << 9;
+        const SHADER_INVOCATION_REORDER     = 1 << 10;
+        const SHADER_INVOCATION_REORDER_EXT = 1 << 11;
+        const OPACITY_MICROMAP              = 1 << 12;
+        const RAY_TRACING_POSITION_FETCH    = 1 << 13;
     }
 }
 
@@ -103,6 +107,16 @@ impl HardwareCaps {
             "mesh_shader" => Some(Self::MESH_SHADER),
             "tessellation" => Some(Self::TESSELLATION),
             "geometry_shader" | "geometry" => Some(Self::GEOMETRY_SHADER),
+            "shader_invocation_reorder" | "ser" | "ser_nv" => {
+                Some(Self::SHADER_INVOCATION_REORDER)
+            }
+            "ser_ext" | "ray_tracing_invocation_reorder" => {
+                Some(Self::SHADER_INVOCATION_REORDER_EXT)
+            }
+            "opacity_micromap" | "omm" => Some(Self::OPACITY_MICROMAP),
+            "ray_tracing_position_fetch" | "position_fetch" => {
+                Some(Self::RAY_TRACING_POSITION_FETCH)
+            }
             _ => None,
         }
     }

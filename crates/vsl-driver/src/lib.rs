@@ -76,6 +76,9 @@ impl CompileOptions {
                     | HardwareCaps::MAXIMAL_RECONVERGENCE
                     | HardwareCaps::RAY_TRACING_PIPELINE
                     | HardwareCaps::MESH_SHADER
+                    | HardwareCaps::SHADER_INVOCATION_REORDER
+                    | HardwareCaps::OPACITY_MICROMAP
+                    | HardwareCaps::RAY_TRACING_POSITION_FETCH
             }
         };
         Self {

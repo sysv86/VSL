@@ -917,6 +917,7 @@ fn parse_builtin_kind(name: &str) -> Option<BuiltinKind> {
         "tess_coord" => Some(BuiltinKind::TessCoord),
         "primitive_id" => Some(BuiltinKind::PrimitiveId),
         "layer" => Some(BuiltinKind::Layer),
+        "hit_triangle_vertex_positions" => Some(BuiltinKind::HitTriangleVertexPositionsKhr),
         _ => None,
     }
 }
@@ -2378,6 +2379,10 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
             "mc::RayFlags::CULL_NO_OPAQUE" => self
                 .ir_fn
                 .emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(128)),
+            "mc::RayFlags::FORCE_OPACITY_MICROMAP_2_STATE"
+            | "RayFlags::FORCE_OPACITY_MICROMAP_2_STATE" => self
+                .ir_fn
+                .emit_typed(IrType::Scalar(ScalarIrTy::U32), InstData::ConstU32(0x400)),
             _ => self.emit_diag(
                 "E0522",
                 format!("unresolved path `{path}` during typed IR lowering"),
@@ -4557,6 +4562,37 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                 out.push(StructuredStmt::Eval(id));
                 return Ok(id);
             }
+            "reorder_thread_with_hint" => {
+                let hint = self.require_arg(args, 0, joined, span, out)?;
+                let bits = self.require_arg(args, 1, joined, span, out)?;
+                let id = self
+                    .ir_fn
+                    .emit_typed(IrType::Void, InstData::ReorderThreadWithHint { hint, bits });
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
+            "reorder_thread_with_hit_object" => {
+                let hint = if args.len() >= 3 {
+                    Some(self.require_arg(args, 1, joined, span, out)?)
+                } else {
+                    None
+                };
+                let bits = if args.len() >= 3 {
+                    Some(self.require_arg(args, 2, joined, span, out)?)
+                } else {
+                    None
+                };
+                let id = self.ir_fn.emit_typed(
+                    IrType::Void,
+                    InstData::ReorderThreadWithHitObject {
+                        hit_object_id: 0,
+                        hint,
+                        bits,
+                    },
+                );
+                out.push(StructuredStmt::Eval(id));
+                return Ok(id);
+            }
             "nonuniform" => {
                 let inner = self.require_arg(args, 0, joined, span, out)?;
                 let ty = self.inst_ty(inner).clone();
@@ -6324,6 +6360,32 @@ impl<'a, 'd> LowerCtx<'a, 'd> {
                     len: 2,
                 },
                 InstData::RayQueryCommittedBarycentrics(ray_query_id),
+            ),
+            "committed_triangle_vertex_positions" => self.ir_fn.emit_typed(
+                IrType::Array {
+                    element: Box::new(IrType::Vector {
+                        scalar: ScalarIrTy::F32,
+                        len: 3,
+                    }),
+                    len: 3,
+                },
+                InstData::RayQueryTriangleVertexPositions {
+                    ray_query_id,
+                    committed: true,
+                },
+            ),
+            "candidate_triangle_vertex_positions" => self.ir_fn.emit_typed(
+                IrType::Array {
+                    element: Box::new(IrType::Vector {
+                        scalar: ScalarIrTy::F32,
+                        len: 3,
+                    }),
+                    len: 3,
+                },
+                InstData::RayQueryTriangleVertexPositions {
+                    ray_query_id,
+                    committed: false,
+                },
             ),
             _ => return None,
         };

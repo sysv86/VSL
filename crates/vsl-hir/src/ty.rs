@@ -112,6 +112,8 @@ pub enum Type {
     AccelStruct,
     /// Non-copyable local handle; prohibited inside structs, arrays, or `OpPhi`.
     RayQuery,
+    /// Opaque SER hit object handle (`OpTypeHitObjectNV` / `OpTypeHitObjectEXT`).
+    HitObject,
     /// Uninstantiated generic type parameter (for example `S` in `struct Reservoir<S>`).
     TypeParam(SmolStr),
 }

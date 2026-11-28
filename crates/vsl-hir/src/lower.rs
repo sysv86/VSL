@@ -5076,6 +5076,7 @@ const fn is_opaque_handle_type(ty: &Type) -> bool {
     matches!(
         ty,
         Type::RayQuery
+            | Type::HitObject
             | Type::AccelStruct
             | Type::Texture2D { .. }
             | Type::Texture2DArray { .. }
@@ -6851,6 +6852,20 @@ impl BodyScanner<'_, '_> {
                                 &mut self.ctx.module.types,
                             );
                         }
+                        Type::HitObject => {
+                            ret_ty = match method.name.as_str() {
+                                "is_hit" => Some(
+                                    self.ctx.module.types.alloc(Type::Scalar(ScalarKind::Bool)),
+                                ),
+                                "ray_tmax" => Some(
+                                    self.ctx.module.types.alloc(Type::Scalar(ScalarKind::F32)),
+                                ),
+                                "sbt_record_index" => Some(
+                                    self.ctx.module.types.alloc(Type::Scalar(ScalarKind::U32)),
+                                ),
+                                _ => Some(self.ctx.module.types.alloc(Type::Void)),
+                            };
+                        }
                         Type::Texture2D { sample_scalar, .. }
                         | Type::Texture2DArray { sample_scalar }
                         | Type::Texture3D { sample_scalar }
@@ -7464,6 +7479,13 @@ fn infer_rayquery_method_return(method: &str, types: &mut TypeArena) -> Option<T
             scalar: ScalarKind::F32,
             len: 2,
         },
+        "committed_triangle_vertex_positions" | "candidate_triangle_vertex_positions" => {
+            let v3 = types.alloc(Type::Vector {
+                scalar: ScalarKind::F32,
+                len: 3,
+            });
+            Type::Array { element: v3, len: 3 }
+        }
         _ => return None,
     };
     Some(types.alloc(ty))
@@ -8060,6 +8082,7 @@ fn format_type_name(types: &TypeArena, id: TypeId) -> String {
         Type::RwBuffer { element } => format!("RWBuffer<{}>", format_type_name(types, *element)),
         Type::AccelStruct => "AccelStruct".to_owned(),
         Type::RayQuery => "RayQuery".to_owned(),
+        Type::HitObject => "HitObject".to_owned(),
         Type::TypeParam(p) => p.to_string(),
     }
 }
@@ -8674,6 +8697,7 @@ fn lower_type_expr(
                 }
                 "AccelerationStructure" | "AccelStruct" => Type::AccelStruct,
                 "RayQuery" => Type::RayQuery,
+                "HitObject" => Type::HitObject,
                 _ => return None,
             };
             Some(ctx.types.alloc(resolved))
